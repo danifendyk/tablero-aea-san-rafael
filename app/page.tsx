@@ -3,14 +3,20 @@
 import { useMemo, useState } from 'react';
 import {
   AlertTriangle,
+  ArrowRight,
   CheckCircle2,
   CircuitBoard,
   Copy,
+  DollarSign,
+  ExternalLink,
   Info,
   Plus,
   Printer,
   RotateCcw,
+  ShieldCheck,
+  Sparkles,
   Trash2,
+  TrendingUp,
   Zap,
 } from 'lucide-react';
 
@@ -27,6 +33,7 @@ import { Separator } from '@/components/ui/separator';
 type Supply = 'mono' | 'tri';
 type Phase = 'L1' | 'L2' | 'L3' | '3Φ';
 type CircuitKind = 'IUG' | 'TUG' | 'TUE' | 'EMG' | 'FM';
+type Architecture = 'essential' | 'balanced' | 'continuity';
 
 type Circuit = {
   id: number;
@@ -46,6 +53,37 @@ type CircuitTemplate = Omit<Circuit, 'id' | 'name' | 'phase'> & {
   shortName: string;
 };
 
+type PriceCatalog = {
+  mcb2P: number;
+  mcb4P: number;
+  rcd2P: number;
+  rcd4P: number;
+  spd2P: number;
+  spd4P: number;
+  cabinet16: number;
+  cabinet36: number;
+  cabinet54: number;
+  cabinet72: number;
+  typeAPremium: number;
+  accessoriesPercent: number;
+  assemblyPercent: number;
+};
+
+type CostLine = { label: string; value: number };
+type CostOption = {
+  id: Architecture;
+  title: string;
+  subtitle: string;
+  modules: number;
+  cabinetLabel: string;
+  material: number;
+  total: number;
+  continuity: string;
+  protection: string;
+  score: number;
+  lines: CostLine[];
+};
+
 const STANDARD_BREAKERS = [6, 10, 16, 20, 25, 32, 40, 50, 63, 80, 100, 125];
 const CONDUCTOR_CAPACITY: Record<number, number> = {
   1.5: 16,
@@ -57,6 +95,65 @@ const CONDUCTOR_CAPACITY: Record<number, number> = {
   25: 80,
   35: 100,
 };
+
+const DEFAULT_PRICES: PriceCatalog = {
+  mcb2P: 10995,
+  mcb4P: 29995,
+  rcd2P: 41132,
+  rcd4P: 98995,
+  spd2P: 81186,
+  spd4P: 193708,
+  cabinet16: 31000,
+  cabinet36: 83000,
+  cabinet54: 124500,
+  cabinet72: 166000,
+  typeAPremium: 35,
+  accessoriesPercent: 12,
+  assemblyPercent: 20,
+};
+
+const PRICE_SOURCES = [
+  {
+    label: 'Térmica SICA 2P curva C',
+    detail: '$10.995 · 4,5 kA',
+    href: 'https://easy.com.ar/electricidad/termicas-y-diferenciales',
+  },
+  {
+    label: 'Térmica SICA 4P 40 A',
+    detail: '$29.995 · 4,5 kA',
+    href: 'https://www.easy.com.ar/interruptor-termom-4x40a-sica-4-5-ka/p',
+  },
+  {
+    label: 'Diferencial SICA 2P 40 A',
+    detail: '$41.131,50 · 30 mA · clase AC',
+    href: 'https://www.easy.com.ar/interruptor-difer-2x40a-30ma--sica/p',
+  },
+  {
+    label: 'Diferencial SICA 4P 63 A',
+    detail: '$98.995 · 30 mA',
+    href: 'https://easy.com.ar/electricidad/termicas-y-diferenciales',
+  },
+  {
+    label: 'DPS CHINT tetrapolar',
+    detail: '$193.708 · 65 kA · contado',
+    href: 'https://www.electromisiones.com.ar/183-protectores_de_tension',
+  },
+  {
+    label: 'Gabinete Genrod 36 módulos',
+    detail: '$83.000 · embutir',
+    href: 'https://easy.com.ar/gabinete-36p-p-embutir-q-energy-genrod/p',
+  },
+  {
+    label: 'Cable IMSA 2,5 mm² · 100 m',
+    detail: '$114.390 · referencia fuera del tablero',
+    href: 'https://www.easy.com.ar/unipol-2-5bl-plastix-cf--x100m/p',
+  },
+  {
+    label: 'Cable Prysmian Afumex 2,5 mm²',
+    detail: '$126.995 · baja emisión de humos/halógenos',
+    href: 'https://www.easy.com.ar/unipolar-2-5-negro-afumex-750-x-100m/p',
+  },
+];
 
 const TEMPLATES: Record<CircuitKind, CircuitTemplate> = {
   IUG: {
@@ -177,6 +274,39 @@ function formatPower(va: number) {
     : `${Math.round(va)} VA`;
 }
 
+function formatMoney(value: number) {
+  return new Intl.NumberFormat('es-AR', {
+    style: 'currency',
+    currency: 'ARS',
+    maximumFractionDigits: 0,
+  }).format(Math.max(0, value));
+}
+
+function cabinetFor(modules: number, prices: PriceCatalog) {
+  if (modules <= 16) return { label: '16 M', value: prices.cabinet16 };
+  if (modules <= 36) return { label: '36 M', value: prices.cabinet36 };
+  if (modules <= 54) return { label: '54 M', value: prices.cabinet54 };
+  if (modules <= 72) return { label: '72 M', value: prices.cabinet72 };
+  const cabinets = Math.ceil(modules / 72);
+  return { label: `${cabinets} × 72 M`, value: cabinets * prices.cabinet72 };
+}
+
+function architectureOccupiedModules(
+  architecture: Architecture,
+  supply: Supply,
+  circuits: Circuit[],
+) {
+  const poleSpan = supply === 'tri' ? 4 : 2;
+  const circuitModules = circuits.reduce((total, circuit) => total + circuit.modules, 0);
+  if (architecture === 'essential') return poleSpan * 3 + circuitModules;
+  if (architecture === 'balanced') return poleSpan * 4 + circuitModules;
+  const individualDifferentials = circuits.reduce(
+    (total, circuit) => total + (circuit.phase === '3Φ' ? 4 : 2),
+    0,
+  );
+  return poleSpan * 2 + circuitModules + individualDifferentials;
+}
+
 function circuitPower(circuit: Circuit) {
   return Math.max(0, circuit.points) * Math.max(0, circuit.unitVA);
 }
@@ -203,6 +333,9 @@ export default function Home() {
   const [reservePercent, setReservePercent] = useState(25);
   const [modulesPerRow, setModulesPerRow] = useState(18);
   const [circuits, setCircuits] = useState<Circuit[]>(INITIAL_CIRCUITS);
+  const [architecture, setArchitecture] = useState<Architecture>('balanced');
+  const [prices, setPrices] = useState<PriceCatalog>(DEFAULT_PRICES);
+  const [optimizationMessage, setOptimizationMessage] = useState('');
 
   const calculations = useMemo(() => {
     const installedVA = circuits.reduce((total, circuit) => total + circuitPower(circuit), 0);
@@ -213,8 +346,7 @@ export default function Home() {
         : demandVA / (220 * 0.9);
     const mainBreaker = nextBreaker(mainCurrent * 1.15);
     const baseModules = supply === 'tri' ? 12 : 6;
-    const circuitModules = circuits.reduce((total, circuit) => total + circuit.modules, 0);
-    const occupiedModules = baseModules + circuitModules;
+    const occupiedModules = architectureOccupiedModules(architecture, supply, circuits);
     const recommendedModules = Math.ceil(occupiedModules * (1 + reservePercent / 100));
     const rows = Math.max(1, Math.ceil(recommendedModules / modulesPerRow));
     const cabinetModules = rows * modulesPerRow;
@@ -253,7 +385,7 @@ export default function Home() {
       widthMm: modulesPerRow * 18 + 80,
       heightMm: rows * 150 + 80,
     };
-  }, [circuits, demandFactor, modulesPerRow, reservePercent, supply]);
+  }, [architecture, circuits, demandFactor, modulesPerRow, reservePercent, supply]);
 
   const warnings = useMemo(() => {
     const messages: string[] = [];
@@ -275,6 +407,102 @@ export default function Home() {
     }
     return messages;
   }, [calculations.imbalance, circuits, supply]);
+
+  const costOptions = useMemo<CostOption[]>(() => {
+    const mainCost = supply === 'tri' ? prices.mcb4P : prices.mcb2P;
+    const spdCost = supply === 'tri' ? prices.spd4P : prices.spd2P;
+    const sharedRcdCost = supply === 'tri' ? prices.rcd4P : prices.rcd2P;
+    const branchMcbCost = circuits.reduce(
+      (total, circuit) => total + (circuit.phase === '3Φ' ? prices.mcb4P : prices.mcb2P),
+      0,
+    );
+    const individualRcdCost = circuits.reduce(
+      (total, circuit) => total + (circuit.phase === '3Φ' ? prices.rcd4P : prices.rcd2P),
+      0,
+    );
+    const typeAFactor = 1 + prices.typeAPremium / 100;
+
+    const buildOption = (
+      id: Architecture,
+      title: string,
+      subtitle: string,
+      rcdCost: number,
+      continuity: string,
+      protection: string,
+      score: number,
+    ): CostOption => {
+      const occupied = architectureOccupiedModules(id, supply, circuits);
+      const modules = Math.ceil(occupied * (1 + reservePercent / 100));
+      const cabinet = cabinetFor(modules, prices);
+      const core: CostLine[] = [
+        { label: 'IGA', value: mainCost },
+        { label: 'DPS', value: spdCost },
+        { label: 'Térmicas de circuitos', value: branchMcbCost },
+        { label: 'Protección diferencial', value: rcdCost },
+        { label: `Gabinete ${cabinet.label}`, value: cabinet.value },
+      ];
+      const coreTotal = core.reduce((total, line) => total + line.value, 0);
+      const accessories = coreTotal * (prices.accessoriesPercent / 100);
+      const material = coreTotal + accessories;
+      const assembly = material * (prices.assemblyPercent / 100);
+      const lines = [
+        ...core,
+        { label: 'Barras, peines, borneras y rotulado', value: accessories },
+        { label: 'Armado, pruebas y contingencia', value: assembly },
+      ];
+      return {
+        id,
+        title,
+        subtitle,
+        modules,
+        cabinetLabel: cabinet.label,
+        material,
+        total: material + assembly,
+        continuity,
+        protection,
+        score,
+        lines,
+      };
+    };
+
+    return [
+      buildOption(
+        'essential',
+        'Esencial',
+        'Menor costo inicial',
+        sharedRcdCost,
+        'Baja: una fuga puede apagar todo el tablero',
+        '1 diferencial general de 30 mA',
+        62,
+      ),
+      buildOption(
+        'balanced',
+        'Equilibrada',
+        'Compromiso clásico',
+        sharedRcdCost * 2 * typeAFactor,
+        'Media/alta: emergencia y usos normales separados',
+        '2 grupos diferenciales · factor Tipo A cotizable',
+        88,
+      ),
+      buildOption(
+        'continuity',
+        'Alta continuidad',
+        'Mayor selectividad funcional',
+        individualRcdCost * typeAFactor,
+        'Alta: una falla afecta principalmente a su circuito',
+        'Diferencial de 30 mA por circuito + térmica',
+        94,
+      ),
+    ];
+  }, [circuits, prices, reservePercent, supply]);
+
+  const selectedCost = costOptions.find((option) => option.id === architecture) ?? costOptions[1];
+  const recommendedCost = [...costOptions].sort(
+    (a, b) => a.total / (a.score ** 2) - b.total / (b.score ** 2),
+  )[0];
+  const selectedDrivers = [...selectedCost.lines]
+    .sort((a, b) => b.value - a.value)
+    .slice(0, 4);
 
   function updateCircuit<K extends keyof Circuit>(id: number, key: K, value: Circuit[K]) {
     setCircuits((current) =>
@@ -309,6 +537,126 @@ export default function Home() {
     setCircuits((current) => [...current, { ...circuit, id, name: `${circuit.name} · copia` }]);
   }
 
+  function optimizeProject() {
+    let nextId = Math.max(0, ...circuits.map((circuit) => circuit.id)) + 1;
+    let splitCount = 0;
+    let splitCircuits = circuits.flatMap((circuit) => {
+      if ((circuit.kind !== 'IUG' && circuit.kind !== 'TUG') || circuit.points <= 15) {
+        return [circuit];
+      }
+      const count = Math.ceil(circuit.points / 15);
+      const basePoints = Math.floor(circuit.points / count);
+      const remainder = circuit.points % count;
+      splitCount += count - 1;
+      return Array.from({ length: count }, (_, index) => ({
+        ...circuit,
+        id: index === 0 ? circuit.id : nextId++,
+        name: `${circuit.name} · ${String.fromCharCode(65 + index)}`,
+        points: basePoints + (index < remainder ? 1 : 0),
+      }));
+    });
+
+    function provisionalImbalance(items: Circuit[]) {
+      if (supply !== 'tri') return 0;
+      const totals = { L1: 0, L2: 0, L3: 0 };
+      items.filter((item) => item.phase === '3Φ').forEach((item) => {
+        const share = circuitPower(item) / 3;
+        totals.L1 += share;
+        totals.L2 += share;
+        totals.L3 += share;
+      });
+      items
+        .filter((item) => item.phase !== '3Φ')
+        .sort((a, b) => circuitPower(b) - circuitPower(a))
+        .forEach((item) => {
+          const phase = (Object.keys(totals) as Array<'L1' | 'L2' | 'L3'>)
+            .sort((a, b) => totals[a] - totals[b])[0];
+          totals[phase] += circuitPower(item);
+        });
+      const values = Object.values(totals);
+      const average = values.reduce((total, value) => total + value, 0) / 3;
+      return average > 0
+        ? Math.max(...values.map((value) => Math.abs(value - average))) / average
+        : 0;
+    }
+
+    let balanceSplits = 0;
+    while (provisionalImbalance(splitCircuits) > 0.2 && balanceSplits < 3) {
+      const candidate = splitCircuits
+        .map((circuit, index) => ({ circuit, index }))
+        .filter(({ circuit }) => (circuit.kind === 'IUG' || circuit.kind === 'TUG') && circuit.points >= 4)
+        .sort((a, b) => circuitPower(b.circuit) - circuitPower(a.circuit))[0];
+      if (!candidate) break;
+      const firstPoints = Math.ceil(candidate.circuit.points / 2);
+      const secondPoints = candidate.circuit.points - firstPoints;
+      const first = { ...candidate.circuit, name: `${candidate.circuit.name} · A`, points: firstPoints };
+      const second = { ...candidate.circuit, id: nextId++, name: `${candidate.circuit.name} · B`, points: secondPoints };
+      splitCircuits = [
+        ...splitCircuits.slice(0, candidate.index),
+        first,
+        second,
+        ...splitCircuits.slice(candidate.index + 1),
+      ];
+      splitCount += 1;
+      balanceSplits += 1;
+    }
+
+    const protectedCircuits = splitCircuits.map((circuit) => {
+      const current = circuitCurrent(circuit, supply);
+      const breaker = nextBreaker(current * 1.15);
+      const minimumSection = circuit.kind === 'IUG' || circuit.kind === 'EMG'
+        ? 1.5
+        : circuit.kind === 'TUG'
+          ? 2.5
+          : circuit.conductor;
+      const conductor = Number(
+        Object.keys(CONDUCTOR_CAPACITY)
+          .map(Number)
+          .sort((a, b) => a - b)
+          .find((section) => section >= minimumSection && CONDUCTOR_CAPACITY[section] >= breaker)
+          ?? 35,
+      );
+      return {
+        ...circuit,
+        breaker,
+        conductor,
+        modules: circuit.phase === '3Φ' && supply === 'tri' ? 4 : 2,
+      };
+    });
+
+    const phaseAssignments = new Map<number, Phase>();
+    if (supply === 'tri') {
+      const totals = { L1: 0, L2: 0, L3: 0 };
+      protectedCircuits
+        .filter((circuit) => circuit.phase !== '3Φ')
+        .sort((a, b) => circuitPower(b) - circuitPower(a))
+        .forEach((circuit) => {
+          const phase = (Object.keys(totals) as Array<'L1' | 'L2' | 'L3'>)
+            .sort((a, b) => totals[a] - totals[b])[0];
+          phaseAssignments.set(circuit.id, phase);
+          totals[phase] += circuitPower(circuit);
+        });
+    }
+
+    setCircuits(
+      protectedCircuits.map((circuit) => ({
+        ...circuit,
+        phase: supply === 'mono'
+          ? 'L1'
+          : circuit.phase === '3Φ'
+            ? '3Φ'
+            : phaseAssignments.get(circuit.id) ?? 'L1',
+      })),
+    );
+    setReservePercent(25);
+    setModulesPerRow(18);
+    setOptimizationMessage(
+      splitCount
+        ? `Se dividieron ${splitCount} circuito(s), se balancearon fases y se ajustaron protecciones.`
+        : 'Fases balanceadas, protecciones revisadas y reserva modular ajustada.',
+    );
+  }
+
   function resetProject() {
     setProjectName('Iglesia · Salón 24 × 10 m');
     setSupply('tri');
@@ -316,10 +664,13 @@ export default function Home() {
     setReservePercent(25);
     setModulesPerRow(18);
     setCircuits(INITIAL_CIRCUITS);
+    setArchitecture('balanced');
+    setPrices(DEFAULT_PRICES);
+    setOptimizationMessage('');
   }
 
   const devices = useMemo(() => {
-    const mainDevices = [
+    const mainDevices: Array<{ key: string; label: string; detail: string; span: number; className: string }> = [
       {
         key: 'cabecera',
         label: 'IGA',
@@ -334,25 +685,27 @@ export default function Home() {
         span: supply === 'tri' ? 4 : 2,
         className: 'device-spd',
       },
-      {
-        key: 'diff',
-        label: 'ID',
-        detail: '30 mA',
-        span: supply === 'tri' ? 4 : 2,
-        className: 'device-rcd',
-      },
     ];
+    if (architecture === 'essential') {
+      mainDevices.push({ key: 'diff', label: 'ID', detail: '30 mA', span: supply === 'tri' ? 4 : 2, className: 'device-rcd' });
+    }
+    if (architecture === 'balanced') {
+      mainDevices.push(
+        { key: 'diff-a', label: 'ID A', detail: 'Normal · 30 mA', span: supply === 'tri' ? 4 : 2, className: 'device-rcd' },
+        { key: 'diff-b', label: 'ID B', detail: 'Crítico · 30 mA', span: supply === 'tri' ? 4 : 2, className: 'device-rcd' },
+      );
+    }
     return [
       ...mainDevices,
       ...circuits.map((circuit, index) => ({
         key: `circuit-${circuit.id}`,
-        label: `C${index + 1}`,
-        detail: `${circuit.breaker} A`,
-        span: circuit.modules,
+        label: architecture === 'continuity' ? `C${index + 1} + ID` : `C${index + 1}`,
+        detail: architecture === 'continuity' ? `${circuit.breaker} A · 30 mA` : `${circuit.breaker} A`,
+        span: circuit.modules + (architecture === 'continuity' ? (circuit.phase === '3Φ' ? 4 : 2) : 0),
         className: circuit.kind === 'EMG' ? 'device-emergency' : 'device-circuit',
       })),
     ];
-  }, [calculations.mainBreaker, circuits, supply]);
+  }, [architecture, calculations.mainBreaker, circuits, supply]);
 
   return (
     <main className="min-h-screen bg-background text-foreground">
@@ -457,6 +810,9 @@ export default function Home() {
                 <p className="mt-1 text-xs text-muted-foreground">Agregá bocas y ajustá cada circuito; el tablero se redimensiona en el momento.</p>
               </div>
               <div className="flex flex-wrap gap-1.5">
+                <Button className="bg-slate-900 text-white hover:bg-slate-800" size="sm" onClick={optimizeProject}>
+                  <Sparkles data-icon="inline-start" /> Optimizar
+                </Button>
                 {(Object.keys(TEMPLATES) as CircuitKind[]).map((kind) => (
                   <Button key={kind} variant="outline" size="sm" onClick={() => addCircuit(kind)} title={TEMPLATES[kind].label}>
                     <Plus data-icon="inline-start" /> {kind}
@@ -530,6 +886,11 @@ export default function Home() {
             </div>
 
             <div className="border-t bg-muted/20 p-4">
+              {optimizationMessage && (
+                <div className="mb-3 flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-800">
+                  <CheckCircle2 className="size-4 shrink-0" /> {optimizationMessage}
+                </div>
+              )}
               {warnings.length ? (
                 <div className="flex gap-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-amber-950">
                   <AlertTriangle className="mt-0.5 size-4 shrink-0" />
@@ -591,7 +952,103 @@ export default function Home() {
             </div>
             <p className="max-w-xl text-xs text-muted-foreground">El esquema muestra la arquitectura del tablero. Deben verificarse poder de corte, cortocircuito, selectividad, caída de tensión y método de instalación.</p>
           </div>
-          <SingleLineDiagram circuits={circuits} supply={supply} mainBreaker={calculations.mainBreaker} />
+          <SingleLineDiagram circuits={circuits} supply={supply} mainBreaker={calculations.mainBreaker} architecture={architecture} />
+        </section>
+
+        <section className="mt-5 rounded-2xl border bg-card p-4 shadow-sm print:break-before-page">
+          <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+            <div>
+              <div className="flex items-center gap-2 text-emerald-700">
+                <DollarSign className="size-4" />
+                <p className="text-[11px] font-semibold uppercase tracking-[0.12em]">Costo y optimización</p>
+              </div>
+              <h2 className="mt-1 text-lg font-semibold">Tres arquitecturas comparables</h2>
+              <p className="mt-1 max-w-3xl text-xs text-muted-foreground">Valores minoristas de referencia en ARS consultados el 29/08/2026. Incluyen una previsión editable para accesorios, armado y contingencia; no incluyen cableado del edificio, puesta a tierra, canalizaciones ni honorarios.</p>
+            </div>
+            <Badge className="w-fit border border-emerald-200 bg-emerald-50 text-emerald-800">Propuesta activa: {selectedCost.title}</Badge>
+          </div>
+
+          <div className="grid gap-3 lg:grid-cols-3">
+            {costOptions.map((option) => (
+              <CostOptionCard
+                key={option.id}
+                option={option}
+                selected={architecture === option.id}
+                recommended={option.id === recommendedCost.id}
+                onSelect={() => setArchitecture(option.id)}
+              />
+            ))}
+          </div>
+
+          <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,.9fr)_minmax(0,1.4fr)]">
+            <div className="rounded-xl border bg-slate-950 p-4 text-white">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-400">Qué encarece esta propuesta</p>
+                  <h3 className="mt-1 font-semibold">Mayores impulsores de costo</h3>
+                </div>
+                <TrendingUp className="size-5 text-amber-300" />
+              </div>
+              <div className="mt-4 space-y-3">
+                {selectedDrivers.map((driver, index) => {
+                  const percent = selectedCost.total > 0 ? (driver.value / selectedCost.total) * 100 : 0;
+                  return (
+                    <div key={driver.label}>
+                      <div className="mb-1 flex justify-between gap-3 text-xs">
+                        <span>{index + 1}. {driver.label}</span>
+                        <span className="font-mono font-semibold">{formatMoney(driver.value)}</span>
+                      </div>
+                      <div className="h-1.5 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-amber-300" style={{ width: `${Math.max(4, percent)}%` }} /></div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="mt-4 rounded-lg border border-white/10 bg-white/5 p-3 text-xs leading-relaxed text-slate-300">
+                <strong className="text-white">Criterio:</strong> el DPS y los diferenciales no se eliminan para ahorrar. La mejora de costo viene de evitar sobredimensionamiento, balancear fases, dividir circuitos sobrecargados y elegir el gabinete inmediato superior con al menos {reservePercent}% de reserva.
+              </div>
+            </div>
+
+            <div className="print-hide rounded-xl border bg-muted/20 p-4">
+              <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+                <div>
+                  <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">Catálogo editable</p>
+                  <h3 className="font-semibold">Ajustá con tus cotizaciones locales</h3>
+                </div>
+                <Button variant="ghost" size="sm" onClick={() => setPrices(DEFAULT_PRICES)}><RotateCcw data-icon="inline-start" /> Restaurar precios</Button>
+              </div>
+              <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                <PriceInput label="Térmica 2P" value={prices.mcb2P} onChange={(value) => setPrices((current) => ({ ...current, mcb2P: value }))} />
+                <PriceInput label="Térmica / IGA 4P" value={prices.mcb4P} onChange={(value) => setPrices((current) => ({ ...current, mcb4P: value }))} />
+                <PriceInput label="Diferencial 2P" value={prices.rcd2P} onChange={(value) => setPrices((current) => ({ ...current, rcd2P: value }))} />
+                <PriceInput label="Diferencial 4P" value={prices.rcd4P} onChange={(value) => setPrices((current) => ({ ...current, rcd4P: value }))} />
+                <PriceInput label="DPS 1P+N / 2P" value={prices.spd2P} onChange={(value) => setPrices((current) => ({ ...current, spd2P: value }))} />
+                <PriceInput label="DPS 3P+N / 4P" value={prices.spd4P} onChange={(value) => setPrices((current) => ({ ...current, spd4P: value }))} />
+                <PriceInput label="Gabinete 16 M" value={prices.cabinet16} onChange={(value) => setPrices((current) => ({ ...current, cabinet16: value }))} />
+                <PriceInput label="Gabinete 36 M" value={prices.cabinet36} onChange={(value) => setPrices((current) => ({ ...current, cabinet36: value }))} />
+                <PriceInput label="Gabinete 54 M (estim.)" value={prices.cabinet54} onChange={(value) => setPrices((current) => ({ ...current, cabinet54: value }))} />
+                <PriceInput label="Gabinete 72 M (estim.)" value={prices.cabinet72} onChange={(value) => setPrices((current) => ({ ...current, cabinet72: value }))} />
+                <PriceInput label="Prima Tipo A" value={prices.typeAPremium} suffix="%" onChange={(value) => setPrices((current) => ({ ...current, typeAPremium: value }))} />
+                <PriceInput label="Accesorios" value={prices.accessoriesPercent} suffix="%" onChange={(value) => setPrices((current) => ({ ...current, accessoriesPercent: value }))} />
+                <PriceInput label="Armado + contingencia" value={prices.assemblyPercent} suffix="%" onChange={(value) => setPrices((current) => ({ ...current, assemblyPercent: value }))} />
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-4">
+            <div className="mb-2 flex items-center gap-2">
+              <ExternalLink className="size-3.5 text-muted-foreground" />
+              <h3 className="text-xs font-semibold">Fuentes de precios y comparaciones</h3>
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+              {PRICE_SOURCES.map((source) => (
+                <a key={source.label} href={source.href} target="_blank" rel="noreferrer" className="group rounded-lg border bg-background p-3 transition-colors hover:border-emerald-300 hover:bg-emerald-50">
+                  <p className="text-xs font-semibold group-hover:text-emerald-900">{source.label}</p>
+                  <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">{source.detail}</p>
+                </a>
+              ))}
+            </div>
+            <p className="mt-3 text-[10px] leading-relaxed text-muted-foreground">Las promociones y el stock cambian. El diferencial Tipo A se modela con una prima porcentual editable porque la referencia económica relevada es clase AC. Para LED, fuentes conmutadas, audio y electrónica conviene que el profesional verifique la clase requerida. Los gabinetes de 54 y 72 módulos son extrapolaciones editables, no precios publicados.</p>
+          </div>
         </section>
 
         <section className="mt-5 grid gap-4 rounded-2xl border border-sky-200 bg-sky-50 p-4 text-sky-950 lg:grid-cols-[auto_1fr_auto] lg:items-center">
@@ -607,6 +1064,57 @@ export default function Home() {
         </section>
       </section>
     </main>
+  );
+}
+
+function CostOptionCard({
+  option,
+  selected,
+  recommended,
+  onSelect,
+}: {
+  option: CostOption;
+  selected: boolean;
+  recommended: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <article className={`relative rounded-xl border p-4 transition-all ${selected ? 'border-emerald-400 bg-emerald-50 shadow-sm ring-1 ring-emerald-200' : 'bg-background hover:border-slate-300'}`}>
+      {recommended && <Badge className="absolute right-3 top-3 bg-emerald-700 text-white">mejor costo/protección</Badge>}
+      <div className="flex items-center gap-2">
+        <div className={`grid size-8 place-items-center rounded-lg ${selected ? 'bg-emerald-700 text-white' : 'bg-muted text-muted-foreground'}`}><ShieldCheck className="size-4" /></div>
+        <div>
+          <h3 className="text-sm font-semibold">{option.title}</h3>
+          <p className="text-[10px] text-muted-foreground">{option.subtitle}</p>
+        </div>
+      </div>
+      <p className="mt-4 font-mono text-2xl font-black tracking-tight">{formatMoney(option.total)}</p>
+      <p className="mt-1 text-[10px] text-muted-foreground">Materiales: {formatMoney(option.material)} · {option.cabinetLabel} · {option.modules} M requeridos</p>
+      <Separator className="my-3" />
+      <div className="space-y-2 text-[11px] leading-relaxed">
+        <p><strong>Protección:</strong> {option.protection}</p>
+        <p><strong>Continuidad:</strong> {option.continuity}</p>
+      </div>
+      <div className="mt-3 flex items-center gap-2">
+        <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-emerald-500" style={{ width: `${option.score}%` }} /></div>
+        <span className="font-mono text-[10px] font-bold">{option.score}/100</span>
+      </div>
+      <Button variant={selected ? 'default' : 'outline'} size="sm" className={`mt-4 w-full ${selected ? 'bg-emerald-700 hover:bg-emerald-800' : ''}`} onClick={onSelect}>
+        {selected ? 'Propuesta aplicada' : 'Usar propuesta'} {!selected && <ArrowRight data-icon="inline-end" />}
+      </Button>
+    </article>
+  );
+}
+
+function PriceInput({ label, value, suffix = '$', onChange }: { label: string; value: number; suffix?: string; onChange: (value: number) => void }) {
+  return (
+    <div className="space-y-1">
+      <Label className="text-[10px] text-muted-foreground">{label}</Label>
+      <div className="relative">
+        <Input type="number" min="0" step="1" value={value} onChange={(event) => onChange(Number(event.target.value))} className={suffix === '$' ? 'pl-7 font-mono text-xs' : 'pr-8 font-mono text-xs'} />
+        <span className={`pointer-events-none absolute top-1/2 -translate-y-1/2 text-[10px] text-muted-foreground ${suffix === '$' ? 'left-3' : 'right-3'}`}>{suffix}</span>
+      </div>
+    </div>
   );
 }
 
@@ -674,7 +1182,12 @@ function PanelFront({ devices, rows, modulesPerRow }: { devices: Array<{ key: st
   );
 }
 
-function SingleLineDiagram({ circuits, supply, mainBreaker }: { circuits: Circuit[]; supply: Supply; mainBreaker: number }) {
+function SingleLineDiagram({ circuits, supply, mainBreaker, architecture }: { circuits: Circuit[]; supply: Supply; mainBreaker: number; architecture: Architecture }) {
+  const protectionLabel = architecture === 'essential'
+    ? 'DPS + ID'
+    : architecture === 'balanced'
+      ? 'DPS + 2 ID'
+      : 'DPS + ID/circuito';
   return (
     <div className="unifilar overflow-x-auto rounded-xl border bg-[#f8fafc] p-5">
       <div className="mx-auto min-w-[760px] max-w-6xl">
@@ -685,7 +1198,7 @@ function SingleLineDiagram({ circuits, supply, mainBreaker }: { circuits: Circui
           <DiagramWire />
           <DiagramNode kicker="Cabecera" title={`IGA ${mainBreaker} A`} detail={supply === 'tri' ? '4P' : '2P'} />
           <DiagramWire />
-          <DiagramNode kicker="Protección" title="DPS + ID" detail="30 mA" tone="blue" />
+          <DiagramNode kicker="Protección" title={protectionLabel} detail="30 mA" tone="blue" />
           <DiagramWire />
           <DiagramNode kicker="Barras" title={supply === 'tri' ? 'L1 · L2 · L3 · N · PE' : 'L · N · PE'} detail="Distribución" tone="amber" />
         </div>

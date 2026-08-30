@@ -1694,9 +1694,11 @@ function ProtectionGuide() {
     { code: 'C1…', title: 'Interruptor termomagnético de circuito', description: 'Cada C protege una salida. El verde identifica iluminación de emergencia.', swatch: 'bg-amber-400' },
   ];
   return (
-    <div className="mt-4 grid gap-2 sm:grid-cols-2">
-      {items.map((item) => (
-        <div key={item.code} className="flex gap-3 rounded-xl border bg-muted/20 p-3">
+    <div className="mt-4 space-y-2 border-t pt-4">
+      <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground">Cómo leer el tablero, en orden</p>
+      {items.map((item, index) => (
+        <div key={item.code} className="grid grid-cols-[auto_auto_1fr] items-start gap-3 rounded-xl border bg-muted/20 p-3">
+          <span className="grid size-6 place-items-center rounded-full bg-slate-200 font-mono text-[10px] font-black text-slate-700">{index + 1}</span>
           <span className={`grid h-8 min-w-12 place-items-center rounded-lg font-mono text-[11px] font-black ${item.swatch} ${item.code === 'C1…' ? 'text-slate-950' : 'text-white'}`}>{item.code}</span>
           <div>
             <p className="text-xs font-semibold leading-tight">{item.title}</p>
@@ -1751,15 +1753,17 @@ function PanelFront({ devices, rows, modulesPerRow }: { devices: PanelDevice[]; 
                   <div className="absolute inset-y-0 left-0 z-10 flex flex-col justify-between p-2 text-inherit" style={{ width: `${slot.device.span * 100}%` }} title={`${slot.device.label} · ${slot.device.fullName} · ${slot.device.detail}`}>
                     <div className="min-w-0">
                       <div className="flex items-start justify-between gap-1">
-                        <p className="truncate font-mono text-sm font-black leading-none tracking-tight">{slot.device.label}</p>
+                        <p className="truncate font-mono text-base font-black leading-none tracking-tight">{slot.device.label}</p>
                         <span className="shrink-0 rounded border border-current/20 bg-white/20 px-1 py-0.5 font-mono text-[7px] font-bold">{slot.device.span}M</span>
                       </div>
-                      <p className="mt-1 line-clamp-2 text-[8px] font-bold uppercase leading-[1.15] tracking-[0.02em] opacity-85">{slot.device.fullName}</p>
+                      <p className="mt-1 text-[8px] font-bold uppercase tracking-[0.1em] opacity-75">Protección</p>
                     </div>
-                    <p className="w-fit rounded-md border border-current/20 bg-white/30 px-1.5 py-1 font-mono text-[10px] font-black leading-none backdrop-blur-sm">{slot.device.detail}</p>
+                    <div className="flex items-end justify-between gap-2 pr-1">
+                      <p className="w-fit rounded-md border border-current/20 bg-white/30 px-1.5 py-1 font-mono text-[10px] font-black leading-none backdrop-blur-sm">{slot.device.detail}</p>
+                      <span className="mb-0.5 h-6 w-1.5 shrink-0 rounded-full bg-slate-950/70 shadow-[0_0_0_1px_rgba(255,255,255,.25)]" />
+                    </div>
                   </div>
                 )}
-                {slot.device && <span className="absolute bottom-2 right-1.5 z-20 h-5 w-1.5 rounded-full bg-slate-950/70 shadow-[0_0_0_1px_rgba(255,255,255,.25)]" />}
                 {!slot.device && <span className="absolute inset-x-0 top-1/2 h-px bg-slate-200" />}
               </div>
             ))}

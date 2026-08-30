@@ -1305,7 +1305,7 @@ export default function Home() {
           </div>
         </section>
 
-        <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1.3fr)_minmax(520px,1fr)]">
+        <div className="space-y-5">
           <section className="min-w-0 rounded-2xl border bg-card shadow-sm">
             <div className="print-hide flex flex-col gap-3 border-b p-4 sm:flex-row sm:items-center sm:justify-between">
               <div>
@@ -1416,7 +1416,7 @@ export default function Home() {
             </div>
           </section>
 
-          <div className="space-y-5">
+          <div className="grid items-start gap-5 xl:grid-cols-[minmax(520px,1.3fr)_minmax(360px,.7fr)]">
             <section className="rounded-2xl border bg-card p-4 shadow-sm">
               <div className="mb-4 flex items-start justify-between gap-3">
                 <div>

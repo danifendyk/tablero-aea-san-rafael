@@ -38,7 +38,7 @@ type Phase = 'L1' | 'L2' | 'L3' | '3Φ';
 type CircuitKind = 'IUG' | 'TUG' | 'TUE' | 'EMG' | 'FM';
 type Architecture = 'essential' | 'balanced' | 'continuity';
 type ExperienceMode = 'guided' | 'technical';
-type ProjectPreset = 'church' | 'commercial' | 'residential' | 'custom';
+type ProjectPreset = 'hall' | 'commercial' | 'residential' | 'custom';
 type WorkType = 'new' | 'remodel' | 'survey';
 type EvacuationClass = 'BD1' | 'BD2' | 'BD3' | 'BD4';
 
@@ -113,7 +113,7 @@ const STORAGE_KEY = 'tablero-aea-san-rafael:v2';
 const COPPER_RESISTIVITY = 0.018;
 
 const INITIAL_PROFILE: ProjectProfile = {
-  preset: 'church',
+  preset: 'hall',
   workType: 'new',
   widthM: 24,
   lengthM: 10,
@@ -263,7 +263,7 @@ const TEMPLATES: Record<CircuitKind, CircuitTemplate> = {
 const INITIAL_CIRCUITS: Circuit[] = [
   {
     id: 1,
-    name: 'Iluminación nave principal',
+    name: 'Iluminación salón principal',
     kind: 'IUG',
     points: 12,
     unitVA: 100,
@@ -381,7 +381,7 @@ function voltageDrop(circuit: Circuit, supply: Supply) {
 
 function projectCircuits(preset: ProjectPreset): Circuit[] {
   const base = INITIAL_CIRCUITS.map((circuit) => ({ ...circuit }));
-  if (preset === 'church') return base;
+  if (preset === 'hall') return base;
   if (preset === 'commercial') {
     return [
       { ...base[0], name: 'Iluminación local', points: 14 },
@@ -412,7 +412,7 @@ function phaseColor(phase: Phase) {
 export default function Home() {
   const [experienceMode, setExperienceMode] = useState<ExperienceMode>('guided');
   const [profile, setProfile] = useState<ProjectProfile>(INITIAL_PROFILE);
-  const [projectName, setProjectName] = useState('Iglesia · Salón 24 × 10 m');
+  const [projectName, setProjectName] = useState('SALÓN · 24 × 10 m');
   const [supply, setSupply] = useState<Supply>('tri');
   const [demandFactor, setDemandFactor] = useState(0.8);
   const [reservePercent, setReservePercent] = useState(25);
@@ -440,13 +440,24 @@ export default function Home() {
         }> : {};
       queueMicrotask(() => {
         if (data.experienceMode) setExperienceMode(data.experienceMode);
-        if (data.profile) setProfile({ ...INITIAL_PROFILE, ...data.profile });
-        if (data.projectName) setProjectName(data.projectName);
+        if (data.profile) {
+          const legacyPreset = (data.profile.preset as string) === 'church' ? 'hall' : data.profile.preset;
+          setProfile({ ...INITIAL_PROFILE, ...data.profile, preset: legacyPreset as ProjectPreset });
+        }
+        if (data.projectName) {
+          setProjectName(data.projectName
+            .replace(/Iglesia\s*·\s*Salón/gi, 'SALÓN')
+            .replace(/Iglesia/gi, 'SALÓN'));
+        }
         if (data.supply) setSupply(data.supply);
         if (typeof data.demandFactor === 'number') setDemandFactor(data.demandFactor);
         if (typeof data.reservePercent === 'number') setReservePercent(data.reservePercent);
         if (typeof data.modulesPerRow === 'number') setModulesPerRow(data.modulesPerRow);
-        if (Array.isArray(data.circuits)) setCircuits(data.circuits.map((circuit) => ({ ...circuit, lengthM: circuit.lengthM ?? 20 })));
+        if (Array.isArray(data.circuits)) setCircuits(data.circuits.map((circuit) => ({
+          ...circuit,
+          name: circuit.name === 'Iluminación nave principal' ? 'Iluminación salón principal' : circuit.name,
+          lengthM: circuit.lengthM ?? 20,
+        })));
         if (data.architecture) setArchitecture(data.architecture);
         if (data.prices) setPrices({ ...DEFAULT_PRICES, ...data.prices });
         setPersistenceReady(true);
@@ -523,10 +534,11 @@ export default function Home() {
     };
   }, [architecture, circuits, demandFactor, modulesPerRow, reservePercent, supply]);
 
-  const isPublicVenue = profile.preset === 'church'
+  const isPublicVenue = profile.preset === 'hall'
     || profile.occupancy >= 50
     || profile.evacuation !== 'BD1';
   const projectArea = Math.max(0, profile.widthM) * Math.max(0, profile.lengthM);
+  const areaPerPerson = profile.occupancy > 0 ? projectArea / profile.occupancy : 0;
 
   const warnings = useMemo(() => {
     const messages: string[] = [];
@@ -678,7 +690,7 @@ export default function Home() {
 
   function applyPreset(preset: ProjectPreset) {
     const presetData: Record<ProjectPreset, { name: string; supply: Supply; profile: Partial<ProjectProfile> }> = {
-      church: { name: 'Iglesia · Salón 24 × 10 m', supply: 'tri', profile: { widthM: 24, lengthM: 10, occupancy: 180, evacuation: 'BD3' } },
+      hall: { name: 'SALÓN · 24 × 10 m', supply: 'tri', profile: { widthM: 24, lengthM: 10, occupancy: 180, evacuation: 'BD3' } },
       commercial: { name: 'Local comercial', supply: 'tri', profile: { widthM: 12, lengthM: 8, occupancy: 60, evacuation: 'BD2' } },
       residential: { name: 'Vivienda', supply: 'mono', profile: { widthM: 10, lengthM: 8, occupancy: 5, evacuation: 'BD1' } },
       custom: { name: 'Proyecto personalizado', supply, profile: {} },
@@ -851,7 +863,7 @@ export default function Home() {
   function resetProject() {
     setExperienceMode('guided');
     setProfile(INITIAL_PROFILE);
-    setProjectName('Iglesia · Salón 24 × 10 m');
+    setProjectName('SALÓN · 24 × 10 m');
     setSupply('tri');
     setDemandFactor(0.8);
     setReservePercent(25);
@@ -961,14 +973,14 @@ export default function Home() {
           <div className="p-4">
             <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
               {([
-                ['church', 'Iglesia / culto'],
+                ['hall', 'SALÓN'],
                 ['commercial', 'Comercio'],
                 ['residential', 'Vivienda'],
                 ['custom', 'Personalizado'],
               ] as Array<[ProjectPreset, string]>).map(([preset, label]) => (
                 <button key={preset} type="button" onClick={() => applyPreset(preset)} className={`rounded-xl border p-3 text-left transition-colors ${profile.preset === preset ? 'border-amber-400 bg-amber-50 text-amber-950 ring-1 ring-amber-200' : 'hover:border-slate-300 hover:bg-muted/30'}`}>
                   <span className="text-xs font-semibold">{label}</span>
-                  <span className="mt-1 block text-[10px] text-muted-foreground">{preset === 'church' ? 'Pública concurrencia' : preset === 'commercial' ? 'Atención al público' : preset === 'residential' ? 'Uso doméstico' : 'Sin supuestos previos'}</span>
+                  <span className="mt-1 block text-[10px] text-muted-foreground">{preset === 'hall' ? 'Pública concurrencia · emergencia' : preset === 'commercial' ? 'Atención al público' : preset === 'residential' ? 'Uso doméstico' : 'Sin supuestos previos'}</span>
                 </button>
               ))}
             </div>
@@ -1003,8 +1015,18 @@ export default function Home() {
               <div className="rounded-xl border bg-muted/25 p-3">
                 <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Superficie</p>
                 <p className="mt-1 font-mono text-lg font-bold">{projectArea.toFixed(0)} m²</p>
+                <p className="mt-0.5 text-[10px] text-muted-foreground">{areaPerPerson.toFixed(2)} m²/persona</p>
               </div>
             </div>
+            {profile.preset === 'hall' && (
+              <div className="mt-4 flex flex-col gap-2 rounded-xl border border-sky-200 bg-sky-50 p-3 text-sky-950 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <p className="text-xs font-semibold">Plantilla SALÓN activa</p>
+                  <p className="mt-0.5 text-[10px] leading-relaxed text-sky-900/75">Incluye circuitos separados para iluminación, tomacorrientes, emergencia y audio. Confirmá el aforo, las vías de evacuación, la autonomía de emergencia y las cargas reales.</p>
+                </div>
+                <Badge className="w-fit border border-sky-300 bg-white text-sky-800">Local de pública concurrencia</Badge>
+              </div>
+            )}
           </div>
         </section>
 

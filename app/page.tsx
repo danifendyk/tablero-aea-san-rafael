@@ -95,6 +95,14 @@ type PriceCatalog = {
 };
 
 type CostLine = { label: string; value: number };
+type PanelDevice = {
+  key: string;
+  label: string;
+  fullName: string;
+  detail: string;
+  span: number;
+  className: string;
+};
 type CostOption = {
   id: Architecture;
   title: string;
@@ -890,10 +898,11 @@ export default function Home() {
   }
 
   const devices = useMemo(() => {
-    const mainDevices: Array<{ key: string; label: string; detail: string; span: number; className: string }> = [
+    const mainDevices: PanelDevice[] = [
       {
         key: 'cabecera',
         label: 'IGA',
+        fullName: 'Interruptor General Automático',
         detail: `${calculations.mainBreaker} A`,
         span: supply === 'tri' ? 4 : 2,
         className: 'device-main',
@@ -901,18 +910,19 @@ export default function Home() {
       {
         key: 'spd',
         label: 'DPS',
+        fullName: 'Protección contra sobretensiones',
         detail: supply === 'tri' ? '3P+N' : '1P+N',
         span: supply === 'tri' ? 4 : 2,
         className: 'device-spd',
       },
     ];
     if (architecture === 'essential') {
-      mainDevices.push({ key: 'diff', label: 'ID', detail: '30 mA', span: supply === 'tri' ? 4 : 2, className: 'device-rcd' });
+      mainDevices.push({ key: 'diff', label: 'ID', fullName: 'Interruptor Diferencial', detail: 'General · 30 mA', span: supply === 'tri' ? 4 : 2, className: 'device-rcd' });
     }
     if (architecture === 'balanced') {
       mainDevices.push(
-        { key: 'diff-a', label: 'ID A', detail: 'Normal · 30 mA', span: supply === 'tri' ? 4 : 2, className: 'device-rcd' },
-        { key: 'diff-b', label: 'ID B', detail: 'Crítico · 30 mA', span: supply === 'tri' ? 4 : 2, className: 'device-rcd' },
+        { key: 'diff-a', label: 'ID A', fullName: 'Interruptor Diferencial', detail: 'Uso normal · 30 mA', span: supply === 'tri' ? 4 : 2, className: 'device-rcd' },
+        { key: 'diff-b', label: 'ID B', fullName: 'Interruptor Diferencial', detail: 'Uso crítico · 30 mA', span: supply === 'tri' ? 4 : 2, className: 'device-rcd' },
       );
     }
     return [
@@ -920,6 +930,7 @@ export default function Home() {
       ...circuits.map((circuit, index) => ({
         key: `circuit-${circuit.id}`,
         label: architecture === 'continuity' ? `C${index + 1} + ID` : `C${index + 1}`,
+        fullName: circuit.kind === 'EMG' ? 'Térmica · Emergencia' : `Térmica · ${circuit.kind}`,
         detail: architecture === 'continuity' ? `${circuit.breaker} A · 30 mA` : `${circuit.breaker} A`,
         span: circuit.modules + (architecture === 'continuity' ? (circuit.phase === '3Φ' ? 4 : 2) : 0),
         className: circuit.kind === 'EMG' ? 'device-emergency' : 'device-circuit',
@@ -1294,7 +1305,7 @@ export default function Home() {
           </div>
         </section>
 
-        <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1.45fr)_minmax(420px,.9fr)]">
+        <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1.3fr)_minmax(520px,1fr)]">
           <section className="min-w-0 rounded-2xl border bg-card shadow-sm">
             <div className="print-hide flex flex-col gap-3 border-b p-4 sm:flex-row sm:items-center sm:justify-between">
               <div>
@@ -1410,18 +1421,13 @@ export default function Home() {
               <div className="mb-4 flex items-start justify-between gap-3">
                 <div>
                   <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">Vista frontal</p>
-                  <h2 className="font-semibold">Tablero DIN · {calculations.rows} filas</h2>
+                  <h2 className="text-lg font-semibold">Tablero DIN · {calculations.rows} filas</h2>
+                  <p className="mt-1 text-xs text-muted-foreground">Lectura de izquierda a derecha: cabecera, protección y circuitos de salida.</p>
                 </div>
                 <Badge variant="outline">≈ {calculations.widthMm} × {calculations.heightMm} × 120 mm</Badge>
               </div>
               <PanelFront devices={devices} rows={calculations.rows} modulesPerRow={modulesPerRow} />
-              <div className="mt-3 flex flex-wrap gap-x-4 gap-y-2 text-[10px] text-muted-foreground">
-                <Legend swatch="bg-slate-800" label="Cabecera" />
-                <Legend swatch="bg-violet-600" label="DPS" />
-                <Legend swatch="bg-sky-600" label="Diferencial" />
-                <Legend swatch="bg-amber-400" label="Circuitos" />
-                <Legend swatch="bg-emerald-500" label="Emergencia" />
-              </div>
+              <ProtectionGuide />
             </section>
 
             {supply === 'tri' && (
@@ -1680,8 +1686,26 @@ function CompactNumber({ value, min, max, onChange }: { value: number; min?: num
   return <Input type="number" value={value} min={min} max={max} onChange={(event) => onChange(Number(event.target.value))} className="ml-auto w-20 text-right font-mono text-xs" />;
 }
 
-function Legend({ swatch, label }: { swatch: string; label: string }) {
-  return <span className="flex items-center gap-1.5"><span className={`size-2 rounded-sm ${swatch}`} />{label}</span>;
+function ProtectionGuide() {
+  const items = [
+    { code: 'IGA', title: 'Interruptor General Automático', description: 'Corte general y protección principal contra sobrecargas y cortocircuitos.', swatch: 'bg-slate-800' },
+    { code: 'DPS', title: 'Dispositivo de Protección contra Sobretensiones', description: 'Limita sobretensiones transitorias y las deriva hacia tierra.', swatch: 'bg-violet-600' },
+    { code: 'ID', title: 'Interruptor Diferencial', description: 'Detecta fugas de corriente. En este esquema se considera sensibilidad de 30 mA.', swatch: 'bg-sky-600' },
+    { code: 'C1…', title: 'Interruptor termomagnético de circuito', description: 'Cada C protege una salida. El verde identifica iluminación de emergencia.', swatch: 'bg-amber-400' },
+  ];
+  return (
+    <div className="mt-4 grid gap-2 sm:grid-cols-2">
+      {items.map((item) => (
+        <div key={item.code} className="flex gap-3 rounded-xl border bg-muted/20 p-3">
+          <span className={`grid h-8 min-w-12 place-items-center rounded-lg font-mono text-[11px] font-black ${item.swatch} ${item.code === 'C1…' ? 'text-slate-950' : 'text-white'}`}>{item.code}</span>
+          <div>
+            <p className="text-xs font-semibold leading-tight">{item.title}</p>
+            <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">{item.description}</p>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function PhaseBar({ phase, value, percent }: { phase: Phase; value: number; percent: number }) {
@@ -1694,7 +1718,7 @@ function PhaseBar({ phase, value, percent }: { phase: Phase; value: number; perc
   );
 }
 
-function PanelFront({ devices, rows, modulesPerRow }: { devices: Array<{ key: string; label: string; detail: string; span: number; className: string }>; rows: number; modulesPerRow: number }) {
+function PanelFront({ devices, rows, modulesPerRow }: { devices: PanelDevice[]; rows: number; modulesPerRow: number }) {
   const slots: Array<{ device?: (typeof devices)[number]; start?: boolean; continuation?: boolean }> = Array.from({ length: rows * modulesPerRow }, () => ({}));
   let cursor = 0;
   devices.forEach((device) => {
@@ -1709,19 +1733,34 @@ function PanelFront({ devices, rows, modulesPerRow }: { devices: Array<{ key: st
   });
 
   return (
-    <div className="panel-shell rounded-xl border-8 border-slate-800 bg-slate-200 p-3 shadow-[inset_0_0_0_1px_rgba(255,255,255,.4),0_8px_24px_rgba(15,23,42,.12)]">
+    <div className="panel-shell rounded-2xl border-[10px] border-slate-800 bg-slate-200 p-4 shadow-[inset_0_0_0_1px_rgba(255,255,255,.65),0_10px_28px_rgba(15,23,42,.16)]">
+      <div className="mb-4 flex items-center justify-between gap-3 rounded-lg border border-slate-300 bg-white/70 px-3 py-2">
+        <div>
+          <p className="text-[9px] font-bold uppercase tracking-[0.14em] text-slate-500">Distribución modular</p>
+          <p className="mt-0.5 text-xs font-semibold text-slate-800">IGA → DPS → ID → circuitos</p>
+        </div>
+        <span className="rounded-md bg-slate-800 px-2 py-1 font-mono text-[9px] font-bold text-white">1 módulo = 18 mm</span>
+      </div>
       {Array.from({ length: rows }).map((_, rowIndex) => (
-        <div key={rowIndex} className="mb-3 last:mb-0">
-          <div className="mb-1 flex justify-between font-mono text-[8px] font-bold uppercase tracking-wider text-slate-500"><span>Riel {rowIndex + 1}</span><span>{modulesPerRow}M</span></div>
-          <div className="grid h-14 overflow-hidden rounded-md border border-slate-500 bg-slate-700 p-1" style={{ gridTemplateColumns: `repeat(${modulesPerRow}, minmax(0, 1fr))` }}>
+        <div key={rowIndex} className="mb-4 last:mb-0">
+          <div className="mb-1.5 flex justify-between font-mono text-[10px] font-black uppercase tracking-[0.1em] text-slate-600"><span>Riel DIN {rowIndex + 1}</span><span>{modulesPerRow} módulos</span></div>
+          <div className="grid h-[92px] overflow-hidden rounded-xl border-4 border-slate-700 bg-slate-700 p-1.5 shadow-[inset_0_2px_8px_rgba(15,23,42,.35)]" style={{ gridTemplateColumns: `repeat(${modulesPerRow}, minmax(0, 1fr))` }}>
             {slots.slice(rowIndex * modulesPerRow, (rowIndex + 1) * modulesPerRow).map((slot, index) => (
-              <div key={index} className={`relative min-w-0 border-r border-black/15 last:border-r-0 ${slot.device ? slot.device.className : 'bg-slate-100'}`}>
+              <div key={index} className={`relative min-w-0 border-r border-slate-950/20 last:border-r-0 ${slot.device ? slot.device.className : 'bg-slate-50'}`}>
                 {slot.start && slot.device && (
-                  <div className="absolute inset-y-0 left-0 z-10 flex items-center px-1.5 text-slate-950" style={{ width: `${slot.device.span * 100}%` }}>
-                    <div className="min-w-0 leading-none"><p className="truncate font-mono text-[9px] font-black">{slot.device.label}</p><p className="mt-1 truncate font-mono text-[7px] font-semibold opacity-70">{slot.device.detail}</p></div>
+                  <div className="absolute inset-y-0 left-0 z-10 flex flex-col justify-between p-2 text-inherit" style={{ width: `${slot.device.span * 100}%` }} title={`${slot.device.label} · ${slot.device.fullName} · ${slot.device.detail}`}>
+                    <div className="min-w-0">
+                      <div className="flex items-start justify-between gap-1">
+                        <p className="truncate font-mono text-sm font-black leading-none tracking-tight">{slot.device.label}</p>
+                        <span className="shrink-0 rounded border border-current/20 bg-white/20 px-1 py-0.5 font-mono text-[7px] font-bold">{slot.device.span}M</span>
+                      </div>
+                      <p className="mt-1 line-clamp-2 text-[8px] font-bold uppercase leading-[1.15] tracking-[0.02em] opacity-85">{slot.device.fullName}</p>
+                    </div>
+                    <p className="w-fit rounded-md border border-current/20 bg-white/30 px-1.5 py-1 font-mono text-[10px] font-black leading-none backdrop-blur-sm">{slot.device.detail}</p>
                   </div>
                 )}
-                {slot.device && <span className="absolute bottom-1 right-1 h-3 w-1 rounded-full bg-slate-950/60" />}
+                {slot.device && <span className="absolute bottom-2 right-1.5 z-20 h-5 w-1.5 rounded-full bg-slate-950/70 shadow-[0_0_0_1px_rgba(255,255,255,.25)]" />}
+                {!slot.device && <span className="absolute inset-x-0 top-1/2 h-px bg-slate-200" />}
               </div>
             ))}
           </div>

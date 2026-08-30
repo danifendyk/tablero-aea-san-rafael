@@ -2,7 +2,7 @@
 
 Herramienta de predimensionado de tableros eléctricos para proyectos en San Rafael, Mendoza.
 
-Incluye definición rápida por tipo de proyecto, circuitos editables, caída de tensión, cortocircuito y poder de corte, puesta a tierra, balance de fases, vista frontal DIN, esquemas unifilar y multifilar, control del expediente, comparación de arquitecturas, optimización y costos de referencia.
+Incluye definición rápida por tipo de proyecto, memoria de cálculo con fórmulas y reemplazo de valores, circuitos editables, caída de tensión, cortocircuito y poder de corte, puesta a tierra, balance de fases, vista frontal DIN, esquemas unifilar y multifilar, control del expediente, comparación de arquitecturas, optimización y costos de referencia.
 
 ## Marco normativo
 

@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   ArrowRight,
   BookOpenCheck,
+  Calculator,
   CheckCircle2,
   CircuitBoard,
   Copy,
@@ -325,6 +326,13 @@ function formatPower(va: number) {
     : `${Math.round(va)} VA`;
 }
 
+function formatNumber(value: number, digits = 2) {
+  return new Intl.NumberFormat('es-AR', {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  }).format(value);
+}
+
 function formatMoney(value: number) {
   return new Intl.NumberFormat('es-AR', {
     style: 'currency',
@@ -365,7 +373,7 @@ function circuitPower(circuit: Circuit) {
 function circuitCurrent(circuit: Circuit, supply: Supply) {
   const voltage = circuit.phase === '3Φ' && supply === 'tri' ? 380 : 220;
   const divisor = circuit.phase === '3Φ' && supply === 'tri' ? Math.sqrt(3) : 1;
-  return circuitPower(circuit) / (divisor * voltage * Math.max(circuit.powerFactor, 0.1));
+  return circuitPower(circuit) / (divisor * voltage);
 }
 
 function voltageDrop(circuit: Circuit, supply: Supply) {
@@ -487,16 +495,6 @@ export default function Home() {
   const calculations = useMemo(() => {
     const installedVA = circuits.reduce((total, circuit) => total + circuitPower(circuit), 0);
     const demandVA = installedVA * demandFactor;
-    const mainCurrent =
-      supply === 'tri'
-        ? demandVA / (Math.sqrt(3) * 380 * 0.9)
-        : demandVA / (220 * 0.9);
-    const mainBreaker = nextBreaker(mainCurrent * 1.15);
-    const baseModules = supply === 'tri' ? 12 : 6;
-    const occupiedModules = architectureOccupiedModules(architecture, supply, circuits);
-    const recommendedModules = Math.ceil(occupiedModules * (1 + reservePercent / 100));
-    const rows = Math.max(1, Math.ceil(recommendedModules / modulesPerRow));
-    const cabinetModules = rows * modulesPerRow;
     const phaseVA = { L1: 0, L2: 0, L3: 0 };
 
     circuits.forEach((circuit) => {
@@ -509,6 +507,21 @@ export default function Home() {
         phaseVA[circuit.phase] += power;
       }
     });
+
+    const phaseCurrent = {
+      L1: (phaseVA.L1 * demandFactor) / 220,
+      L2: (phaseVA.L2 * demandFactor) / 220,
+      L3: (phaseVA.L3 * demandFactor) / 220,
+    };
+    const mainCurrent = supply === 'tri'
+      ? Math.max(phaseCurrent.L1, phaseCurrent.L2, phaseCurrent.L3)
+      : demandVA / 220;
+    const mainBreaker = nextBreaker(mainCurrent * 1.15);
+    const baseModules = supply === 'tri' ? 12 : 6;
+    const occupiedModules = architectureOccupiedModules(architecture, supply, circuits);
+    const recommendedModules = Math.ceil(occupiedModules * (1 + reservePercent / 100));
+    const rows = Math.max(1, Math.ceil(recommendedModules / modulesPerRow));
+    const cabinetModules = rows * modulesPerRow;
 
     const phaseValues = Object.values(phaseVA);
     const averagePhase = phaseValues.reduce((sum, value) => sum + value, 0) / 3;
@@ -528,6 +541,7 @@ export default function Home() {
       rows,
       cabinetModules,
       phaseVA,
+      phaseCurrent,
       imbalance,
       widthMm: modulesPerRow * 18 + 80,
       heightMm: rows * 150 + 80,
@@ -1080,6 +1094,144 @@ export default function Home() {
           <Metric label="Ocupación / reserva" value={`${calculations.occupiedModules} / ${calculations.cabinetModules - calculations.occupiedModules} M`} />
         </div>
 
+        <section className="mb-5 overflow-hidden rounded-2xl border bg-card shadow-sm print:break-before-page">
+          <div className="flex flex-col gap-3 border-b bg-slate-950 p-4 text-white sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <div className="flex items-center gap-2 text-amber-300">
+                <Calculator className="size-4" />
+                <p className="text-[11px] font-semibold uppercase tracking-[0.12em]">Memoria de cálculo visible</p>
+              </div>
+              <h2 className="mt-1 text-lg font-semibold">Fórmulas, valores reemplazados y resultados</h2>
+              <p className="mt-1 max-w-3xl text-xs text-slate-400">Las cargas se ingresan en VA: la potencia aparente ya contempla el factor de potencia. Si el dato disponible está en W, primero debe convertirse con S = P / cos φ.</p>
+            </div>
+            <Badge className="w-fit border border-amber-300/20 bg-amber-300/10 text-amber-200">ρ cobre = 0,018 Ω·mm²/m</Badge>
+          </div>
+
+          <div className="grid gap-3 p-4 md:grid-cols-2 xl:grid-cols-3">
+            <FormulaCard
+              title="Potencia instalada"
+              formula="Sinst = Σ(ni × Si)"
+              substitution={`${circuits.map((circuit) => Math.round(circuitPower(circuit))).join(' + ') || '0'} VA`}
+              result={formatPower(calculations.installedVA)}
+              note="ni: cantidad de bocas · Si: VA asignados por boca"
+            />
+            <FormulaCard
+              title="Demanda simultánea"
+              formula="Sd = Sinst × fs"
+              substitution={`${Math.round(calculations.installedVA)} VA × ${formatNumber(demandFactor, 2)}`}
+              result={formatPower(calculations.demandVA)}
+              note="fs: factor de simultaneidad editable"
+            />
+            <FormulaCard
+              title="Corriente de cabecera"
+              formula={supply === 'tri' ? 'Ib,max = max(SL1, SL2, SL3) × fs / 220 V' : 'Ib = Sd / 220 V'}
+              substitution={supply === 'tri'
+                ? `máx(${Math.round(calculations.phaseVA.L1)}, ${Math.round(calculations.phaseVA.L2)}, ${Math.round(calculations.phaseVA.L3)}) × ${formatNumber(demandFactor, 2)} / 220`
+                : `${Math.round(calculations.demandVA)} / 220`}
+              result={`${formatNumber(calculations.mainCurrent, 2)} A`}
+              note={supply === 'tri'
+                ? `Se adopta la fase más cargada: L1 ${formatNumber(calculations.phaseCurrent.L1, 2)} A · L2 ${formatNumber(calculations.phaseCurrent.L2, 2)} A · L3 ${formatNumber(calculations.phaseCurrent.L3, 2)} A`
+                : 'Suministro monofásico'}
+            />
+            <FormulaCard
+              title="Protección general sugerida"
+              formula="In ≥ 1,15 × Ib"
+              substitution={`1,15 × ${formatNumber(calculations.mainCurrent, 2)} A = ${formatNumber(calculations.mainCurrent * 1.15, 2)} A`}
+              result={`${calculations.mainBreaker} A`}
+              note="Se adopta el calibre normalizado inmediato superior; verificar Iz e Ik"
+            />
+            <FormulaCard
+              title="Reserva del tablero"
+              formula="Mrec = ⌈Mocup × (1 + r/100)⌉"
+              substitution={`⌈${calculations.occupiedModules} × (1 + ${reservePercent}/100)⌉`}
+              result={`${calculations.recommendedModules} módulos`}
+              note={`Gabinete adoptado: ${calculations.rows} × ${modulesPerRow} = ${calculations.cabinetModules} módulos`}
+            />
+            <FormulaCard
+              title="Dimensiones orientativas"
+              formula="A = Mfila × 18 + 80 · H = filas × 150 + 80"
+              substitution={`A = ${modulesPerRow} × 18 + 80 · H = ${calculations.rows} × 150 + 80`}
+              result={`${calculations.widthMm} × ${calculations.heightMm} mm`}
+              note="Estimación geométrica; adoptar dimensiones reales del fabricante y verificar disipación"
+            />
+            <FormulaCard
+              title="Desbalance de fases"
+              formula="D = max(|Sfase − Sprom|) / Sprom × 100"
+              substitution={supply === 'tri'
+                ? `máx. desvío respecto del promedio de L1, L2 y L3`
+                : 'No aplica a suministro monofásico'}
+              result={supply === 'tri' ? `${formatNumber(calculations.imbalance * 100, 1)} %` : 'No aplica'}
+              note="La aplicación alerta cuando el valor estimado supera 20 %"
+            />
+            <FormulaCard
+              title="Poder de corte"
+              formula="Icn ≥ Ik presunta"
+              substitution={`${formatNumber(profile.breakingCapacityKa, 1)} kA ≥ ${formatNumber(profile.prospectiveShortCircuitKa, 1)} kA`}
+              result={profile.breakingCapacityKa >= profile.prospectiveShortCircuitKa ? 'Condición satisfecha' : 'No satisfecha'}
+              note="Ik debe calcularse o medirse en el punto de instalación"
+            />
+            <FormulaCard
+              title="Costo de la propuesta"
+              formula="Ctotal = Cbase × (1 + a/100) × (1 + m/100)"
+              substitution={`${formatMoney(selectedCost.material / (1 + prices.accessoriesPercent / 100))} × (1 + ${prices.accessoriesPercent}/100) × (1 + ${prices.assemblyPercent}/100)`}
+              result={formatMoney(selectedCost.total)}
+              note="a: accesorios · m: armado y contingencia · valores sólo referenciales"
+            />
+          </div>
+
+          <div className="border-t px-4 py-3">
+            <div className="mb-3">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-muted-foreground">Desarrollo por circuito</p>
+              <h3 className="font-semibold">Corriente y caída de tensión</h3>
+            </div>
+            <div className="overflow-x-auto rounded-xl border">
+              <table className="w-full min-w-[1240px] text-left text-xs">
+                <thead>
+                  <tr className="border-b bg-muted/45 text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
+                    <th className="px-3 py-2.5">Circuito</th>
+                    <th className="px-3 py-2.5">Carga</th>
+                    <th className="px-3 py-2.5">Fórmula de corriente</th>
+                    <th className="px-3 py-2.5">Resultado Ib</th>
+                    <th className="px-3 py-2.5">Chequeo protección</th>
+                    <th className="px-3 py-2.5">Fórmula de caída</th>
+                    <th className="px-3 py-2.5">Resultado ΔV</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {circuits.map((circuit, index) => {
+                    const threePhase = circuit.phase === '3Φ' && supply === 'tri';
+                    const current = circuitCurrent(circuit, supply);
+                    const drop = voltageDrop(circuit, supply);
+                    const capacity = CONDUCTOR_CAPACITY[circuit.conductor] ?? 0;
+                    const protectionOkay = current <= circuit.breaker && circuit.breaker <= capacity;
+                    return (
+                      <tr key={circuit.id} className="border-b last:border-0">
+                        <td className="px-3 py-3"><strong>C{index + 1}</strong><span className="ml-2 text-muted-foreground">{circuit.name}</span></td>
+                        <td className="px-3 py-3 font-mono">{circuit.points} × {circuit.unitVA} = {Math.round(circuitPower(circuit))} VA</td>
+                        <td className="px-3 py-3">
+                          <code className="block rounded bg-slate-100 px-2 py-1 text-[10px] text-slate-800">{threePhase ? 'Ib = S / (√3 × 380)' : 'Ib = S / 220'}</code>
+                          <span className="mt-1 block font-mono text-[9px] text-muted-foreground">{threePhase ? `${Math.round(circuitPower(circuit))} / (1,732 × 380)` : `${Math.round(circuitPower(circuit))} / 220`}</span>
+                        </td>
+                        <td className="px-3 py-3 font-mono font-bold">{formatNumber(current, 2)} A</td>
+                        <td className="px-3 py-3">
+                          <code className={`block rounded px-2 py-1 text-[10px] font-semibold ${protectionOkay ? 'bg-emerald-50 text-emerald-800' : 'bg-amber-50 text-amber-800'}`}>Ib ≤ In ≤ Iz</code>
+                          <span className="mt-1 block font-mono text-[9px] text-muted-foreground">{formatNumber(current, 2)} ≤ {circuit.breaker} ≤ {capacity} A</span>
+                        </td>
+                        <td className="px-3 py-3">
+                          <code className="block rounded bg-slate-100 px-2 py-1 text-[10px] text-slate-800">{threePhase ? 'ΔV = √3 × ρ × L × Ib / s' : 'ΔV = 2 × ρ × L × Ib / s'}</code>
+                          <span className="mt-1 block font-mono text-[9px] text-muted-foreground">{threePhase ? '1,732' : '2'} × 0,018 × {circuit.lengthM} × {formatNumber(current, 2)} / {circuit.conductor}</span>
+                        </td>
+                        <td className={`px-3 py-3 font-mono font-bold ${drop.percent > 3 ? 'text-amber-700' : 'text-emerald-700'}`}>{formatNumber(drop.volts, 2)} V · {formatNumber(drop.percent, 2)} %</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <p className="mt-3 text-[10px] leading-relaxed text-muted-foreground">Símbolos: S = potencia aparente [VA], Ib = corriente de diseño [A], In = corriente nominal de la protección [A], L = longitud de ida [m], s = sección [mm²], ρ = resistividad del cobre. El límite de 3 % usado por la aplicación es un criterio preliminar conservador; deben verificarse temperatura, reactancia, método de instalación, agrupamiento y caída total conforme al proyecto.</p>
+          </div>
+        </section>
+
         <section className="mb-5 grid overflow-hidden rounded-2xl border bg-card shadow-sm xl:grid-cols-[minmax(320px,.8fr)_minmax(0,1.7fr)]">
           <div className="border-b bg-slate-950 p-4 text-white xl:border-b-0 xl:border-r">
             <div className="flex items-center gap-2 text-amber-300">
@@ -1423,6 +1575,23 @@ export default function Home() {
         </section>
       </section>
     </main>
+  );
+}
+
+function FormulaCard({ title, formula, substitution, result, note }: { title: string; formula: string; substitution: string; result: string; note: string }) {
+  return (
+    <article className="rounded-xl border bg-background p-3.5">
+      <p className="text-[10px] font-semibold uppercase tracking-[0.09em] text-muted-foreground">{title}</p>
+      <code className="mt-2 block rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 font-mono text-xs font-semibold text-slate-900">{formula}</code>
+      <div className="mt-2 grid grid-cols-[1fr_auto] items-end gap-3">
+        <div className="min-w-0">
+          <p className="text-[9px] uppercase tracking-wide text-muted-foreground">Reemplazo</p>
+          <p className="mt-0.5 break-words font-mono text-[10px] leading-relaxed text-slate-600">{substitution}</p>
+        </div>
+        <p className="whitespace-nowrap font-mono text-lg font-black tracking-tight text-slate-950">{result}</p>
+      </div>
+      <p className="mt-2 border-t pt-2 text-[9px] leading-relaxed text-muted-foreground">{note}</p>
+    </article>
   );
 }
 

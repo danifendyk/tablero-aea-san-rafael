@@ -144,6 +144,7 @@ body { font-family: var(--font-ui); }
 .device-spd { background: linear-gradient(145deg, #a855f7, #6d28d9); color: white; }
 .device-rcd { background: linear-gradient(145deg, #38bdf8, #0369a1); color: white; }
 .device-circuit { background: linear-gradient(145deg, #fde047, #f59e0b); color: #172033; }
+.device-feeder { background: linear-gradient(145deg, #0284c7, #0369a1); color: white; }
 .device-emergency { background: linear-gradient(145deg, #6ee7b7, #059669); color: #052e2b; }
 
 @media (max-width: 640px) {

@@ -5,7 +5,7 @@ import { defineConfig } from 'vite';
 
 export default defineConfig({
   base: '/tablero-aea-san-rafael/',
-  root: 'pages',
+  root: 'spa',
   publicDir: '../public',
   css: { postcss: { plugins: [tailwindcss()] } },
   plugins: [react()],

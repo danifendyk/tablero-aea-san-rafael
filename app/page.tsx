@@ -1,19 +1,22 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
+  BookOpenCheck,
   CheckCircle2,
   CircuitBoard,
   Copy,
   DollarSign,
   ExternalLink,
   Info,
+  LayoutDashboard,
   Plus,
   Printer,
   RotateCcw,
   ShieldCheck,
+  SlidersHorizontal,
   Sparkles,
   Trash2,
   TrendingUp,
@@ -34,6 +37,26 @@ type Supply = 'mono' | 'tri';
 type Phase = 'L1' | 'L2' | 'L3' | '3Φ';
 type CircuitKind = 'IUG' | 'TUG' | 'TUE' | 'EMG' | 'FM';
 type Architecture = 'essential' | 'balanced' | 'continuity';
+type ExperienceMode = 'guided' | 'technical';
+type ProjectPreset = 'church' | 'commercial' | 'residential' | 'custom';
+type WorkType = 'new' | 'remodel' | 'survey';
+type EvacuationClass = 'BD1' | 'BD2' | 'BD3' | 'BD4';
+
+type ProjectProfile = {
+  preset: ProjectPreset;
+  workType: WorkType;
+  widthM: number;
+  lengthM: number;
+  occupancy: number;
+  evacuation: EvacuationClass;
+  prospectiveShortCircuitKa: number;
+  breakingCapacityKa: number;
+  groundResistanceOhm: number;
+  planScale: '1:50' | '1:100';
+  descriptiveMemoryReady: boolean;
+  registeredProfessionalReady: boolean;
+  siteTestReady: boolean;
+};
 
 type Circuit = {
   id: number;
@@ -45,6 +68,7 @@ type Circuit = {
   powerFactor: number;
   breaker: number;
   conductor: number;
+  lengthM: number;
   modules: number;
 };
 
@@ -85,6 +109,24 @@ type CostOption = {
 };
 
 const STANDARD_BREAKERS = [6, 10, 16, 20, 25, 32, 40, 50, 63, 80, 100, 125];
+const STORAGE_KEY = 'tablero-aea-san-rafael:v2';
+const COPPER_RESISTIVITY = 0.018;
+
+const INITIAL_PROFILE: ProjectProfile = {
+  preset: 'church',
+  workType: 'new',
+  widthM: 24,
+  lengthM: 10,
+  occupancy: 180,
+  evacuation: 'BD3',
+  prospectiveShortCircuitKa: 3,
+  breakingCapacityKa: 6,
+  groundResistanceOhm: 3,
+  planScale: '1:100',
+  descriptiveMemoryReady: false,
+  registeredProfessionalReady: false,
+  siteTestReady: false,
+};
 const CONDUCTOR_CAPACITY: Record<number, number> = {
   1.5: 16,
   2.5: 20,
@@ -165,6 +207,7 @@ const TEMPLATES: Record<CircuitKind, CircuitTemplate> = {
     powerFactor: 0.95,
     breaker: 16,
     conductor: 1.5,
+    lengthM: 24,
     modules: 2,
   },
   TUG: {
@@ -176,6 +219,7 @@ const TEMPLATES: Record<CircuitKind, CircuitTemplate> = {
     powerFactor: 0.9,
     breaker: 20,
     conductor: 2.5,
+    lengthM: 20,
     modules: 2,
   },
   TUE: {
@@ -187,6 +231,7 @@ const TEMPLATES: Record<CircuitKind, CircuitTemplate> = {
     powerFactor: 0.9,
     breaker: 20,
     conductor: 4,
+    lengthM: 20,
     modules: 2,
   },
   EMG: {
@@ -198,6 +243,7 @@ const TEMPLATES: Record<CircuitKind, CircuitTemplate> = {
     powerFactor: 0.95,
     breaker: 10,
     conductor: 1.5,
+    lengthM: 24,
     modules: 2,
   },
   FM: {
@@ -209,6 +255,7 @@ const TEMPLATES: Record<CircuitKind, CircuitTemplate> = {
     powerFactor: 0.85,
     breaker: 16,
     conductor: 2.5,
+    lengthM: 20,
     modules: 2,
   },
 };
@@ -224,6 +271,7 @@ const INITIAL_CIRCUITS: Circuit[] = [
     powerFactor: 0.95,
     breaker: 16,
     conductor: 1.5,
+    lengthM: 24,
     modules: 2,
   },
   {
@@ -236,6 +284,7 @@ const INITIAL_CIRCUITS: Circuit[] = [
     powerFactor: 0.9,
     breaker: 20,
     conductor: 2.5,
+    lengthM: 20,
     modules: 2,
   },
   {
@@ -248,6 +297,7 @@ const INITIAL_CIRCUITS: Circuit[] = [
     powerFactor: 0.95,
     breaker: 10,
     conductor: 1.5,
+    lengthM: 24,
     modules: 2,
   },
   {
@@ -260,6 +310,7 @@ const INITIAL_CIRCUITS: Circuit[] = [
     powerFactor: 0.9,
     breaker: 16,
     conductor: 2.5,
+    lengthM: 18,
     modules: 2,
   },
 ];
@@ -317,6 +368,38 @@ function circuitCurrent(circuit: Circuit, supply: Supply) {
   return circuitPower(circuit) / (divisor * voltage * Math.max(circuit.powerFactor, 0.1));
 }
 
+function voltageDrop(circuit: Circuit, supply: Supply) {
+  const current = circuitCurrent(circuit, supply);
+  const threePhase = circuit.phase === '3Φ' && supply === 'tri';
+  const volts = (threePhase ? Math.sqrt(3) : 2)
+    * Math.max(0, circuit.lengthM)
+    * current
+    * COPPER_RESISTIVITY
+    / Math.max(circuit.conductor, 0.1);
+  return { volts, percent: (volts / (threePhase ? 380 : 220)) * 100 };
+}
+
+function projectCircuits(preset: ProjectPreset): Circuit[] {
+  const base = INITIAL_CIRCUITS.map((circuit) => ({ ...circuit }));
+  if (preset === 'church') return base;
+  if (preset === 'commercial') {
+    return [
+      { ...base[0], name: 'Iluminación local', points: 14 },
+      { ...base[1], name: 'Tomacorrientes generales', points: 12 },
+      { ...base[2], name: 'Luces y carteles de emergencia', points: 6 },
+      { ...base[3], name: 'Equipo dedicado', unitVA: 2500, breaker: 20, conductor: 4 },
+    ];
+  }
+  if (preset === 'residential') {
+    return [
+      { ...base[0], name: 'Iluminación general', points: 10 },
+      { ...base[1], name: 'Tomacorrientes generales', points: 10 },
+      { ...base[3], id: 3, name: 'Cocina / uso especial', unitVA: 2500, breaker: 20, conductor: 4, phase: 'L1' },
+    ];
+  }
+  return base;
+}
+
 function phaseColor(phase: Phase) {
   return {
     L1: 'bg-amber-400',
@@ -327,6 +410,8 @@ function phaseColor(phase: Phase) {
 }
 
 export default function Home() {
+  const [experienceMode, setExperienceMode] = useState<ExperienceMode>('guided');
+  const [profile, setProfile] = useState<ProjectProfile>(INITIAL_PROFILE);
   const [projectName, setProjectName] = useState('Iglesia · Salón 24 × 10 m');
   const [supply, setSupply] = useState<Supply>('tri');
   const [demandFactor, setDemandFactor] = useState(0.8);
@@ -336,6 +421,57 @@ export default function Home() {
   const [architecture, setArchitecture] = useState<Architecture>('balanced');
   const [prices, setPrices] = useState<PriceCatalog>(DEFAULT_PRICES);
   const [optimizationMessage, setOptimizationMessage] = useState('');
+  const [persistenceReady, setPersistenceReady] = useState(false);
+
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(STORAGE_KEY);
+      const data = stored ? JSON.parse(stored) as Partial<{
+          experienceMode: ExperienceMode;
+          profile: ProjectProfile;
+          projectName: string;
+          supply: Supply;
+          demandFactor: number;
+          reservePercent: number;
+          modulesPerRow: number;
+          circuits: Circuit[];
+          architecture: Architecture;
+          prices: PriceCatalog;
+        }> : {};
+      queueMicrotask(() => {
+        if (data.experienceMode) setExperienceMode(data.experienceMode);
+        if (data.profile) setProfile({ ...INITIAL_PROFILE, ...data.profile });
+        if (data.projectName) setProjectName(data.projectName);
+        if (data.supply) setSupply(data.supply);
+        if (typeof data.demandFactor === 'number') setDemandFactor(data.demandFactor);
+        if (typeof data.reservePercent === 'number') setReservePercent(data.reservePercent);
+        if (typeof data.modulesPerRow === 'number') setModulesPerRow(data.modulesPerRow);
+        if (Array.isArray(data.circuits)) setCircuits(data.circuits.map((circuit) => ({ ...circuit, lengthM: circuit.lengthM ?? 20 })));
+        if (data.architecture) setArchitecture(data.architecture);
+        if (data.prices) setPrices({ ...DEFAULT_PRICES, ...data.prices });
+        setPersistenceReady(true);
+      });
+    } catch {
+      window.localStorage.removeItem(STORAGE_KEY);
+      queueMicrotask(() => setPersistenceReady(true));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!persistenceReady) return;
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      experienceMode,
+      profile,
+      projectName,
+      supply,
+      demandFactor,
+      reservePercent,
+      modulesPerRow,
+      circuits,
+      architecture,
+      prices,
+    }));
+  }, [architecture, circuits, demandFactor, experienceMode, modulesPerRow, persistenceReady, prices, profile, projectName, reservePercent, supply]);
 
   const calculations = useMemo(() => {
     const installedVA = circuits.reduce((total, circuit) => total + circuitPower(circuit), 0);
@@ -387,6 +523,11 @@ export default function Home() {
     };
   }, [architecture, circuits, demandFactor, modulesPerRow, reservePercent, supply]);
 
+  const isPublicVenue = profile.preset === 'church'
+    || profile.occupancy >= 50
+    || profile.evacuation !== 'BD1';
+  const projectArea = Math.max(0, profile.widthM) * Math.max(0, profile.lengthM);
+
   const warnings = useMemo(() => {
     const messages: string[] = [];
     circuits.forEach((circuit, index) => {
@@ -401,12 +542,39 @@ export default function Home() {
       if (cableCapacity && circuit.breaker > cableCapacity) {
         messages.push(`C${circuitNumber}: revisar relación entre sección y protección.`);
       }
+      if (voltageDrop(circuit, supply).percent > 3) {
+        messages.push(`C${circuitNumber}: caída estimada ${voltageDrop(circuit, supply).percent.toFixed(1)} %, revisar sección o recorrido.`);
+      }
     });
     if (calculations.imbalance > 0.2) {
       messages.push('El desbalance de fases estimado supera el 20 %.');
     }
+    if (profile.breakingCapacityKa < profile.prospectiveShortCircuitKa) {
+      messages.push('El poder de corte declarado es menor que la corriente de cortocircuito presunta.');
+    }
+    if (profile.groundResistanceOhm > 10) {
+      messages.push('La resistencia de puesta a tierra supera 10 Ω, máximo indicado por la Ordenanza 72/83.');
+    }
+    if (isPublicVenue && !circuits.some((circuit) => circuit.kind === 'EMG')) {
+      messages.push('El local de pública concurrencia no tiene circuito de iluminación de emergencia.');
+    }
+    if (isPublicVenue && architecture === 'essential') {
+      messages.push('Para pública concurrencia, separar usos normales y servicios de emergencia; evitar un único diferencial común.');
+    }
     return messages;
-  }, [calculations.imbalance, circuits, supply]);
+  }, [architecture, calculations.imbalance, circuits, isPublicVenue, profile.breakingCapacityKa, profile.groundResistanceOhm, profile.prospectiveShortCircuitKa, supply]);
+
+  const complianceItems = useMemo(() => [
+    { group: 'Ordenanza 72/83', label: 'Memoria descriptiva y especificaciones', ready: profile.descriptiveMemoryReady, action: 'Completar para el expediente' },
+    { group: 'Ordenanza 72/83', label: `Plano ${profile.planScale} con medidor, tableros, bocas y canalizaciones`, ready: profile.planScale === '1:50' || (profile.planScale === '1:100' && projectArea >= 200), action: '1:100 sólo para salón amplio; validar densidad y legibilidad' },
+    { group: 'Ordenanza 72/83', label: 'Cuadro de cargas, protecciones y secciones', ready: circuits.length > 0 && circuits.every((circuit) => circuit.breaker > 0 && circuit.conductor > 0), action: 'Completar todos los circuitos' },
+    { group: 'Ordenanza 72/83', label: 'Esquema multifilar del tablero', ready: circuits.length > 0, action: 'Generado abajo; completar canalizaciones en plano' },
+    { group: 'Ordenanza 72/83', label: 'Profesional matriculado y dirección técnica', ready: profile.registeredProfessionalReady, action: 'Requiere firma y visación' },
+    { group: 'AEA actual', label: 'Poder de corte ≥ cortocircuito presunto', ready: profile.breakingCapacityKa >= profile.prospectiveShortCircuitKa, action: 'Medir/calcular Ik en el origen' },
+    { group: 'AEA actual', label: 'Caída de tensión preliminar ≤ 3 % por circuito', ready: circuits.every((circuit) => voltageDrop(circuit, supply).percent <= 3), action: 'Verificar recorrido, montaje y caída total' },
+    { group: 'AEA 718', label: 'Circuito de emergencia separado para pública concurrencia', ready: !isPublicVenue || (architecture !== 'essential' && circuits.some((circuit) => circuit.kind === 'EMG')), action: 'Separar normal/emergencia y comprobar autonomía' },
+    { group: 'AEA 90364-6', label: 'Ensayos, mediciones y protocolo de verificación', ready: profile.siteTestReady, action: 'Completar al ejecutar la instalación' },
+  ], [architecture, circuits, isPublicVenue, profile, projectArea, supply]);
 
   const costOptions = useMemo<CostOption[]>(() => {
     const mainCost = supply === 'tri' ? prices.mcb4P : prices.mcb2P;
@@ -504,6 +672,30 @@ export default function Home() {
     .sort((a, b) => b.value - a.value)
     .slice(0, 4);
 
+  function updateProfile<K extends keyof ProjectProfile>(key: K, value: ProjectProfile[K]) {
+    setProfile((current) => ({ ...current, [key]: value }));
+  }
+
+  function applyPreset(preset: ProjectPreset) {
+    const presetData: Record<ProjectPreset, { name: string; supply: Supply; profile: Partial<ProjectProfile> }> = {
+      church: { name: 'Iglesia · Salón 24 × 10 m', supply: 'tri', profile: { widthM: 24, lengthM: 10, occupancy: 180, evacuation: 'BD3' } },
+      commercial: { name: 'Local comercial', supply: 'tri', profile: { widthM: 12, lengthM: 8, occupancy: 60, evacuation: 'BD2' } },
+      residential: { name: 'Vivienda', supply: 'mono', profile: { widthM: 10, lengthM: 8, occupancy: 5, evacuation: 'BD1' } },
+      custom: { name: 'Proyecto personalizado', supply, profile: {} },
+    };
+    const selected = presetData[preset];
+    setProfile((current) => ({ ...current, ...selected.profile, preset }));
+    setProjectName(selected.name);
+    setSupply(selected.supply);
+    setArchitecture(preset === 'residential' ? 'essential' : 'balanced');
+    setCircuits(projectCircuits(preset).map((circuit) => ({
+      ...circuit,
+      phase: selected.supply === 'mono' ? 'L1' : circuit.phase,
+      modules: selected.supply === 'mono' ? Math.min(circuit.modules, 2) : circuit.modules,
+    })));
+    setOptimizationMessage('Plantilla aplicada. Ajustá bocas, recorridos y cargas reales.');
+  }
+
   function updateCircuit<K extends keyof Circuit>(id: number, key: K, value: Circuit[K]) {
     setCircuits((current) =>
       current.map((circuit) => (circuit.id === id ? { ...circuit, [key]: value } : circuit)),
@@ -527,6 +719,7 @@ export default function Home() {
         powerFactor: template.powerFactor,
         breaker: template.breaker,
         conductor: template.conductor,
+        lengthM: template.lengthM,
         modules: phase === '3Φ' ? 4 : template.modules,
       },
     ]);
@@ -609,13 +802,11 @@ export default function Home() {
         : circuit.kind === 'TUG'
           ? 2.5
           : circuit.conductor;
-      const conductor = Number(
-        Object.keys(CONDUCTOR_CAPACITY)
-          .map(Number)
-          .sort((a, b) => a - b)
-          .find((section) => section >= minimumSection && CONDUCTOR_CAPACITY[section] >= breaker)
-          ?? 35,
-      );
+      const sections = Object.keys(CONDUCTOR_CAPACITY).map(Number).sort((a, b) => a - b);
+      const conductor = Number(sections.find((section) => {
+        if (section < minimumSection || CONDUCTOR_CAPACITY[section] < breaker) return false;
+        return voltageDrop({ ...circuit, conductor: section }, supply).percent <= 3;
+      }) ?? 35);
       return {
         ...circuit,
         breaker,
@@ -658,6 +849,8 @@ export default function Home() {
   }
 
   function resetProject() {
+    setExperienceMode('guided');
+    setProfile(INITIAL_PROFILE);
     setProjectName('Iglesia · Salón 24 × 10 m');
     setSupply('tri');
     setDemandFactor(0.8);
@@ -667,6 +860,7 @@ export default function Home() {
     setArchitecture('balanced');
     setPrices(DEFAULT_PRICES);
     setOptimizationMessage('');
+    window.localStorage.removeItem(STORAGE_KEY);
   }
 
   const devices = useMemo(() => {
@@ -744,11 +938,77 @@ export default function Home() {
           </div>
           <div className="text-right text-xs">
             <p>San Rafael · Mendoza</p>
-            <p>AEA 90364-7-718 · Ord. Gral. 72/83</p>
+            <p>AEA 90364 vigente · 771/718 · Ord. Gral. 72/83</p>
           </div>
         </div>
 
-        <div className="print-hide mb-5 grid gap-3 rounded-2xl border bg-card p-4 shadow-sm lg:grid-cols-[minmax(280px,1.4fr)_repeat(4,minmax(120px,.6fr))]">
+        <section className="print-hide mb-5 overflow-hidden rounded-2xl border bg-card shadow-sm">
+          <div className="flex flex-col gap-3 border-b bg-slate-950 p-4 text-white lg:flex-row lg:items-center lg:justify-between">
+            <div>
+              <div className="flex items-center gap-2 text-amber-300">
+                <LayoutDashboard className="size-4" />
+                <p className="text-[11px] font-semibold uppercase tracking-[0.12em]">Definir proyecto</p>
+              </div>
+              <h2 className="mt-1 text-lg font-semibold">Del ambiente al tablero en pocos datos</h2>
+              <p className="mt-1 text-xs text-slate-400">Elegí una base, corregí dimensiones y ocupación; después ajustá los circuitos reales.</p>
+            </div>
+            <div className="flex rounded-lg border border-white/15 bg-white/5 p-1">
+              <Button size="sm" variant="ghost" className={experienceMode === 'guided' ? 'bg-white text-slate-950 hover:bg-white' : 'text-slate-300 hover:bg-white/10 hover:text-white'} onClick={() => setExperienceMode('guided')}>Rápido</Button>
+              <Button size="sm" variant="ghost" className={experienceMode === 'technical' ? 'bg-white text-slate-950 hover:bg-white' : 'text-slate-300 hover:bg-white/10 hover:text-white'} onClick={() => setExperienceMode('technical')}><SlidersHorizontal data-icon="inline-start" /> Técnico</Button>
+            </div>
+          </div>
+
+          <div className="p-4">
+            <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+              {([
+                ['church', 'Iglesia / culto'],
+                ['commercial', 'Comercio'],
+                ['residential', 'Vivienda'],
+                ['custom', 'Personalizado'],
+              ] as Array<[ProjectPreset, string]>).map(([preset, label]) => (
+                <button key={preset} type="button" onClick={() => applyPreset(preset)} className={`rounded-xl border p-3 text-left transition-colors ${profile.preset === preset ? 'border-amber-400 bg-amber-50 text-amber-950 ring-1 ring-amber-200' : 'hover:border-slate-300 hover:bg-muted/30'}`}>
+                  <span className="text-xs font-semibold">{label}</span>
+                  <span className="mt-1 block text-[10px] text-muted-foreground">{preset === 'church' ? 'Pública concurrencia' : preset === 'commercial' ? 'Atención al público' : preset === 'residential' ? 'Uso doméstico' : 'Sin supuestos previos'}</span>
+                </button>
+              ))}
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8">
+              <div className="space-y-1.5 sm:col-span-2">
+                <Label htmlFor="quick-project-name" className="text-xs text-muted-foreground">Nombre del proyecto</Label>
+                <Input id="quick-project-name" value={projectName} onChange={(event) => setProjectName(event.target.value)} className="font-medium" />
+              </div>
+              <QuickNumber label="Ancho" value={profile.widthM} suffix="m" min={1} onChange={(value) => updateProfile('widthM', value)} />
+              <QuickNumber label="Largo" value={profile.lengthM} suffix="m" min={1} onChange={(value) => updateProfile('lengthM', value)} />
+              <QuickNumber label="Ocupación" value={profile.occupancy} suffix="pers." min={1} onChange={(value) => updateProfile('occupancy', value)} />
+              <div className="space-y-1.5">
+                <Label htmlFor="quick-supply" className="text-xs text-muted-foreground">Suministro</Label>
+                <NativeSelect id="quick-supply" className="w-full" value={supply} onChange={(event) => {
+                  const nextSupply = event.target.value as Supply;
+                  setSupply(nextSupply);
+                  if (nextSupply === 'mono') setCircuits((current) => current.map((circuit) => ({ ...circuit, phase: 'L1', modules: Math.min(circuit.modules, 2) })));
+                }}>
+                  <NativeSelectOption value="mono">220 V mono</NativeSelectOption>
+                  <NativeSelectOption value="tri">380/220 V tri</NativeSelectOption>
+                </NativeSelect>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="work-type" className="text-xs text-muted-foreground">Tipo de obra</Label>
+                <NativeSelect id="work-type" className="w-full" value={profile.workType} onChange={(event) => updateProfile('workType', event.target.value as WorkType)}>
+                  <NativeSelectOption value="new">Obra nueva</NativeSelectOption>
+                  <NativeSelectOption value="remodel">Reforma</NativeSelectOption>
+                  <NativeSelectOption value="survey">Relevamiento</NativeSelectOption>
+                </NativeSelect>
+              </div>
+              <div className="rounded-xl border bg-muted/25 p-3">
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Superficie</p>
+                <p className="mt-1 font-mono text-lg font-bold">{projectArea.toFixed(0)} m²</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {experienceMode === 'technical' && <div className="print-hide mb-5 grid gap-3 rounded-2xl border bg-card p-4 shadow-sm lg:grid-cols-[minmax(280px,1.4fr)_repeat(4,minmax(120px,.6fr))]">
           <div className="space-y-1.5">
             <Label htmlFor="project-name" className="text-xs text-muted-foreground">Proyecto</Label>
             <Input id="project-name" value={projectName} onChange={(event) => setProjectName(event.target.value)} className="h-10 font-medium" />
@@ -787,7 +1047,7 @@ export default function Home() {
               {[12, 18, 24].map((value) => <NativeSelectOption key={value} value={value}>{value} módulos</NativeSelectOption>)}
             </NativeSelect>
           </div>
-        </div>
+        </div>}
 
         <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
           <Metric label="Potencia instalada" value={formatPower(calculations.installedVA)} />
@@ -797,6 +1057,68 @@ export default function Home() {
           <Metric label="Tablero sugerido" value={`${calculations.rows} × ${modulesPerRow} M`} emphasis />
           <Metric label="Ocupación / reserva" value={`${calculations.occupiedModules} / ${calculations.cabinetModules - calculations.occupiedModules} M`} />
         </div>
+
+        <section className="mb-5 grid overflow-hidden rounded-2xl border bg-card shadow-sm xl:grid-cols-[minmax(320px,.8fr)_minmax(0,1.7fr)]">
+          <div className="border-b bg-slate-950 p-4 text-white xl:border-b-0 xl:border-r">
+            <div className="flex items-center gap-2 text-amber-300">
+              <BookOpenCheck className="size-4" />
+              <p className="text-[11px] font-semibold uppercase tracking-[0.12em]">Datos de verificación</p>
+            </div>
+            <h2 className="mt-1 text-lg font-semibold">Lo que define la seguridad</h2>
+            <p className="mt-1 text-xs leading-relaxed text-slate-400">Estos valores deben surgir del proyecto y de mediciones. Los iniciales son supuestos editables, no certificaciones.</p>
+            <div className="mt-4 grid grid-cols-2 gap-3">
+              <QuickNumber dark label="Ik presunta" value={profile.prospectiveShortCircuitKa} suffix="kA" min={0.1} step={0.5} onChange={(value) => updateProfile('prospectiveShortCircuitKa', value)} />
+              <QuickNumber dark label="Poder de corte" value={profile.breakingCapacityKa} suffix="kA" min={1} step={0.5} onChange={(value) => updateProfile('breakingCapacityKa', value)} />
+              <QuickNumber dark label="Puesta a tierra" value={profile.groundResistanceOhm} suffix="Ω" min={0} step={0.1} onChange={(value) => updateProfile('groundResistanceOhm', value)} />
+              <div className="space-y-1.5">
+                <Label htmlFor="evacuation" className="text-xs text-slate-400">Evacuación AEA</Label>
+                <NativeSelect id="evacuation" className="w-full border-white/15 bg-white/10 text-white" value={profile.evacuation} onChange={(event) => updateProfile('evacuation', event.target.value as EvacuationClass)}>
+                  <NativeSelectOption value="BD1">BD1 · fácil</NativeSelectOption>
+                  <NativeSelectOption value="BD2">BD2</NativeSelectOption>
+                  <NativeSelectOption value="BD3">BD3 · público</NativeSelectOption>
+                  <NativeSelectOption value="BD4">BD4 · difícil</NativeSelectOption>
+                </NativeSelect>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="plan-scale" className="text-xs text-slate-400">Escala del plano</Label>
+                <NativeSelect id="plan-scale" className="w-full border-white/15 bg-white/10 text-white" value={profile.planScale} onChange={(event) => updateProfile('planScale', event.target.value as ProjectProfile['planScale'])}>
+                  <NativeSelectOption value="1:50">1:50</NativeSelectOption>
+                  <NativeSelectOption value="1:100">1:100 · salón amplio</NativeSelectOption>
+                </NativeSelect>
+              </div>
+              <div className="flex items-end">
+                <Badge className={`mb-1 ${warnings.length ? 'border border-amber-300/30 bg-amber-300/10 text-amber-200' : 'border border-emerald-300/30 bg-emerald-300/10 text-emerald-200'}`}>{warnings.length ? `${warnings.length} alertas` : 'Sin alertas'}</Badge>
+              </div>
+            </div>
+          </div>
+
+          <div className="p-4">
+            <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">Expediente y control técnico</p>
+                <h2 className="font-semibold">{complianceItems.filter((item) => item.ready).length} de {complianceItems.length} controles con datos suficientes</h2>
+              </div>
+              <Badge variant="outline">Estado preliminar · no es visación</Badge>
+            </div>
+            <div className="grid gap-2 md:grid-cols-2">
+              {complianceItems.map((item) => (
+                <div key={`${item.group}-${item.label}`} className={`flex gap-3 rounded-xl border p-3 ${item.ready ? 'border-emerald-200 bg-emerald-50' : 'border-amber-200 bg-amber-50'}`}>
+                  {item.ready ? <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-700" /> : <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-700" />}
+                  <div>
+                    <p className="text-[9px] font-bold uppercase tracking-wide text-muted-foreground">{item.group}</p>
+                    <p className="text-xs font-semibold">{item.label}</p>
+                    {!item.ready && <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">{item.action}</p>}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="print-hide mt-3 grid gap-2 sm:grid-cols-3">
+              <ChecklistToggle label="Memoria preparada" checked={profile.descriptiveMemoryReady} onChange={(checked) => updateProfile('descriptiveMemoryReady', checked)} />
+              <ChecklistToggle label="Profesional matriculado" checked={profile.registeredProfessionalReady} onChange={(checked) => updateProfile('registeredProfessionalReady', checked)} />
+              <ChecklistToggle label="Ensayos ejecutados" checked={profile.siteTestReady} onChange={(checked) => updateProfile('siteTestReady', checked)} />
+            </div>
+          </div>
+        </section>
 
         <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1.45fr)_minmax(420px,.9fr)]">
           <section className="min-w-0 rounded-2xl border bg-card shadow-sm">
@@ -822,7 +1144,7 @@ export default function Home() {
             </div>
 
             <div className="overflow-x-auto">
-              <table className="circuit-table w-full min-w-[980px] text-left text-sm">
+              <table className={`circuit-table w-full text-left text-sm ${experienceMode === 'technical' ? 'min-w-[1160px]' : 'min-w-[980px]'}`}>
                 <thead>
                   <tr className="border-b bg-muted/45 text-[11px] uppercase tracking-[0.08em] text-muted-foreground">
                     <th className="px-3 py-2.5">Circuito / uso</th>
@@ -834,6 +1156,8 @@ export default function Home() {
                     <th className="px-2 py-2.5 text-right">Ib</th>
                     <th className="px-2 py-2.5 text-right">Protección</th>
                     <th className="px-2 py-2.5 text-right">Cable</th>
+                    {experienceMode === 'technical' && <th className="px-2 py-2.5 text-right">Recorrido</th>}
+                    {experienceMode === 'technical' && <th className="px-2 py-2.5 text-right">ΔV</th>}
                     <th className="px-2 py-2.5 text-right">Mód.</th>
                     <th className="print-hide w-20 px-2 py-2.5"><span className="sr-only">Acciones</span></th>
                   </tr>
@@ -872,6 +1196,8 @@ export default function Home() {
                           {Object.keys(CONDUCTOR_CAPACITY).map((value) => <NativeSelectOption key={value} value={value}>{value} mm²</NativeSelectOption>)}
                         </NativeSelect>
                       </td>
+                      {experienceMode === 'technical' && <td className="px-2 py-2"><CompactNumber value={circuit.lengthM} min={1} onChange={(value) => updateCircuit(circuit.id, 'lengthM', value)} /></td>}
+                      {experienceMode === 'technical' && <td className={`px-2 py-2 text-right font-mono text-xs font-semibold ${voltageDrop(circuit, supply).percent > 3 ? 'text-amber-700' : 'text-emerald-700'}`}>{voltageDrop(circuit, supply).percent.toFixed(1)} %</td>}
                       <td className="px-2 py-2"><CompactNumber value={circuit.modules} min={1} max={8} onChange={(value) => updateCircuit(circuit.id, 'modules', value)} /></td>
                       <td className="print-hide px-2 py-2">
                         <div className="flex justify-end opacity-50 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
@@ -953,6 +1279,17 @@ export default function Home() {
             <p className="max-w-xl text-xs text-muted-foreground">El esquema muestra la arquitectura del tablero. Deben verificarse poder de corte, cortocircuito, selectividad, caída de tensión y método de instalación.</p>
           </div>
           <SingleLineDiagram circuits={circuits} supply={supply} mainBreaker={calculations.mainBreaker} architecture={architecture} />
+        </section>
+
+        <section className="mt-5 rounded-2xl border border-sky-200 bg-card p-4 shadow-sm print:break-before-page">
+          <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-sky-700">Exigencia municipal verificada</p>
+              <h2 className="text-lg font-semibold">Esquema multifilar para Ordenanza 72/83</h2>
+            </div>
+            <p className="max-w-2xl text-xs leading-relaxed text-muted-foreground">La ordenanza pide agrupar fase, neutro y protección por salida, identificar circuitos y secciones. Este cuadro sirve como base; el plano profesional debe completar canalizaciones, diámetros, conductores y conexiones reales.</p>
+          </div>
+          <MultiLineDiagram circuits={circuits} supply={supply} />
         </section>
 
         <section className="mt-5 rounded-2xl border bg-card p-4 shadow-sm print:break-before-page">
@@ -1055,7 +1392,7 @@ export default function Home() {
           <div className="grid size-9 place-items-center rounded-lg bg-sky-100"><Info className="size-5" /></div>
           <div>
             <h2 className="text-sm font-semibold">Marco de cálculo y límites</h2>
-            <p className="mt-1 text-xs leading-relaxed text-sky-900/80">Herramienta de predimensionado basada en AEA 90364, Secciones 771 y 718, Código de Edificación de San Rafael y Ordenanza General 72/83. No reemplaza el proyecto, la memoria de cálculo, la firma profesional ni la visación municipal.</p>
+            <p className="mt-1 text-xs leading-relaxed text-sky-900/80">Herramienta de predimensionado basada en AEA 90364 (Partes 0–3 y 6 vigentes, Secciones 771 y 718), criterios modernos de tableros IEC 61439 y Ordenanza General 72/83 de Mendoza. La ordenanza es histórica y puede contener criterios superados: ante conflicto prevalece el requisito de seguridad vigente y la definición de la autoridad/profesional. No reemplaza proyecto, memoria, firma, ensayos ni visación municipal.</p>
           </div>
           <div className="flex flex-wrap gap-2 text-xs">
             <a className="rounded-lg border border-sky-300 bg-white px-3 py-2 font-medium hover:bg-sky-100" href="https://www.sanrafael.gov.ar/archivos-muni/obras/edificacion.pdf" target="_blank" rel="noreferrer">Código municipal</a>
@@ -1064,6 +1401,27 @@ export default function Home() {
         </section>
       </section>
     </main>
+  );
+}
+
+function QuickNumber({ label, value, suffix, min, step = 1, dark = false, onChange }: { label: string; value: number; suffix: string; min?: number; step?: number; dark?: boolean; onChange: (value: number) => void }) {
+  return (
+    <div className="space-y-1.5">
+      <Label className={`text-xs ${dark ? 'text-slate-400' : 'text-muted-foreground'}`}>{label}</Label>
+      <div className="relative">
+        <Input type="number" min={min} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} className={`pr-12 font-mono ${dark ? 'border-white/15 bg-white/10 text-white' : ''}`} />
+        <span className={`pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[10px] ${dark ? 'text-slate-400' : 'text-muted-foreground'}`}>{suffix}</span>
+      </div>
+    </div>
+  );
+}
+
+function ChecklistToggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (checked: boolean) => void }) {
+  return (
+    <label className="flex cursor-pointer items-center gap-2 rounded-lg border bg-background p-2.5 text-xs font-medium hover:bg-muted/30">
+      <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} className="size-4 accent-emerald-700" />
+      {label}
+    </label>
   );
 }
 
@@ -1218,6 +1576,55 @@ function SingleLineDiagram({ circuits, supply, mainBreaker, architecture }: { ci
           ))}
         </div>
       </div>
+    </div>
+  );
+}
+
+function MultiLineDiagram({ circuits, supply }: { circuits: Circuit[]; supply: Supply }) {
+  return (
+    <div className="overflow-x-auto rounded-xl border bg-[#f8fafc]">
+      <table className="w-full min-w-[860px] border-collapse text-left text-xs">
+        <thead>
+          <tr className="border-b-2 border-slate-800 bg-slate-100 text-[10px] uppercase tracking-[0.08em] text-slate-600">
+            <th className="px-3 py-2.5">Salida</th>
+            <th className="px-3 py-2.5">Protección</th>
+            <th className="px-3 py-2.5">Conductores activos</th>
+            <th className="px-3 py-2.5">Neutro</th>
+            <th className="px-3 py-2.5">Protección PE</th>
+            <th className="px-3 py-2.5">Carga / recorrido</th>
+          </tr>
+        </thead>
+        <tbody>
+          {circuits.map((circuit, index) => {
+            const threePhase = circuit.phase === '3Φ' && supply === 'tri';
+            return (
+              <tr key={circuit.id} className="border-b last:border-0">
+                <td className="px-3 py-3" aria-label={`Circuito C${index + 1}: ${circuit.name}`}>
+                  <div className="flex items-center gap-2">
+                    <span className="grid size-6 place-items-center rounded bg-slate-900 font-mono text-[9px] font-bold text-white">C{index + 1}</span>
+                    <div><p className="font-semibold">{circuit.name}</p><p className="text-[9px] text-slate-500">{circuit.kind} · {circuit.phase}</p></div>
+                  </div>
+                </td>
+                <td className="px-3 py-3 font-mono">TM {circuit.breaker} A · {threePhase ? '4P' : '2P'}<br /><span className="text-[9px] text-slate-500">ID 30 mA aguas arriba</span></td>
+                <td className="px-3 py-3"><ConductorLines count={threePhase ? 3 : 1} color="bg-amber-500" label={threePhase ? `L1+L2+L3 · ${circuit.conductor} mm²` : `${circuit.phase} · ${circuit.conductor} mm²`} /></td>
+                <td className="px-3 py-3"><ConductorLines count={1} color="bg-sky-500" label={`N · ${circuit.conductor} mm²`} /></td>
+                <td className="px-3 py-3"><ConductorLines count={1} color="bg-emerald-500" label={`PE · ${circuit.conductor} mm²*`} /></td>
+                <td className="px-3 py-3 font-mono">{formatPower(circuitPower(circuit))} · {circuit.lengthM} m<br /><span className={voltageDrop(circuit, supply).percent > 3 ? 'text-amber-700' : 'text-emerald-700'}>ΔV {voltageDrop(circuit, supply).percent.toFixed(1)} %</span></td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <p className="border-t bg-amber-50 px-3 py-2 text-[10px] leading-relaxed text-amber-900">* La sección PE mostrada es conservadora e igual a la activa. Verificar su dimensionamiento, continuidad, canalización y la sección mínima del conductor entre tablero y electrodo según proyecto y reglamentación vigente.</p>
+    </div>
+  );
+}
+
+function ConductorLines({ count, color, label }: { count: number; color: string; label: string }) {
+  return (
+    <div>
+      <div className="space-y-1">{Array.from({ length: count }).map((_, index) => <span key={index} className={`block h-0.5 w-24 ${color}`} />)}</div>
+      <p className="mt-1 font-mono text-[9px] text-slate-600">{label}</p>
     </div>
   );
 }

@@ -956,7 +956,7 @@ export default function Home() {
         </div>
       </header>
 
-      <section className="print-sheet mx-auto max-w-[1680px] px-4 py-5 lg:px-6">
+      <section className="print-sheet mx-auto flex max-w-[1680px] flex-col px-4 py-5 lg:px-6">
         <div className="mb-4 hidden items-start justify-between border-b-2 border-slate-900 pb-3 print:flex">
           <div>
             <p className="text-xs font-bold uppercase tracking-[0.16em]">Planilla de predimensionado eléctrico</p>
@@ -1094,12 +1094,12 @@ export default function Home() {
           <Metric label="Ocupación / reserva" value={`${calculations.occupiedModules} / ${calculations.cabinetModules - calculations.occupiedModules} M`} />
         </div>
 
-        <section className="mb-5 overflow-hidden rounded-2xl border bg-card shadow-sm print:break-before-page">
+        <section className="order-last mt-5 overflow-hidden rounded-2xl border bg-card shadow-sm print:break-before-page">
           <div className="flex flex-col gap-3 border-b bg-slate-950 p-4 text-white sm:flex-row sm:items-end sm:justify-between">
             <div>
               <div className="flex items-center gap-2 text-amber-300">
                 <Calculator className="size-4" />
-                <p className="text-[11px] font-semibold uppercase tracking-[0.12em]">Memoria de cálculo visible</p>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.12em]">Anexo final · Memoria de cálculo</p>
               </div>
               <h2 className="mt-1 text-lg font-semibold">Fórmulas, valores reemplazados y resultados</h2>
               <p className="mt-1 max-w-3xl text-xs text-slate-400">Las cargas se ingresan en VA: la potencia aparente ya contempla el factor de potencia. Si el dato disponible está en W, primero debe convertirse con S = P / cos φ.</p>

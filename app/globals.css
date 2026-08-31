@@ -48,11 +48,13 @@
   --radius-4xl: calc(var(--radius) * 2.6);
 }
 
-body { font-family: var(--font-ui); }
+body {
+  font-family: var(--font-ui);
+}
 
 :root {
-  --font-ui: "Aptos", "Segoe UI", Arial, sans-serif;
-  --font-tech: "Cascadia Mono", "Roboto Mono", Consolas, monospace;
+  --font-ui: 'Aptos', 'Segoe UI', Arial, sans-serif;
+  --font-tech: 'Cascadia Mono', 'Roboto Mono', Consolas, monospace;
   --background: oklch(0.975 0.006 240);
   --foreground: oklch(0.21 0.035 252);
   --card: oklch(1 0 0);
@@ -138,17 +140,40 @@ body { font-family: var(--font-ui); }
 .device-rcd,
 .device-circuit,
 .device-emergency {
-  box-shadow: inset 0 2px 0 rgb(255 255 255 / 22%), inset 0 -2px 0 rgb(15 23 42 / 16%);
+  box-shadow:
+    inset 0 2px 0 rgb(255 255 255 / 22%),
+    inset 0 -2px 0 rgb(15 23 42 / 16%);
 }
-.device-main { background: linear-gradient(145deg, #475569, #172033); color: white; }
-.device-spd { background: linear-gradient(145deg, #a855f7, #6d28d9); color: white; }
-.device-rcd { background: linear-gradient(145deg, #38bdf8, #0369a1); color: white; }
-.device-circuit { background: linear-gradient(145deg, #fde047, #f59e0b); color: #172033; }
-.device-feeder { background: linear-gradient(145deg, #0284c7, #0369a1); color: white; }
-.device-emergency { background: linear-gradient(145deg, #6ee7b7, #059669); color: #052e2b; }
+.device-main {
+  background: linear-gradient(145deg, #475569, #172033);
+  color: white;
+}
+.device-spd {
+  background: linear-gradient(145deg, #a855f7, #6d28d9);
+  color: white;
+}
+.device-rcd {
+  background: linear-gradient(145deg, #38bdf8, #0369a1);
+  color: white;
+}
+.device-circuit {
+  background: linear-gradient(145deg, #fde047, #f59e0b);
+  color: #172033;
+}
+.device-feeder {
+  background: linear-gradient(145deg, #0284c7, #0369a1);
+  color: white;
+}
+.device-emergency {
+  background: linear-gradient(145deg, #6ee7b7, #059669);
+  color: #052e2b;
+}
 
 @media (max-width: 640px) {
-  .panel-shell { border-width: 6px; padding: 0.5rem; }
+  .panel-shell {
+    border-width: 6px;
+    padding: 0.5rem;
+  }
 }
 
 @page {
@@ -157,14 +182,72 @@ body { font-family: var(--font-ui); }
 }
 
 @media print {
-  :root { --background: white; --foreground: #0f172a; --card: white; --border: #94a3b8; }
-  body { background: white !important; font-size: 10px; }
-  .print-hide { display: none !important; }
-  .print-sheet { max-width: none !important; padding: 0 !important; }
+  :root {
+    --background: white;
+    --foreground: #0f172a;
+    --card: white;
+    --border: #94a3b8;
+  }
+  body {
+    background: white !important;
+    font-size: 10px;
+  }
+  .print-hide {
+    display: none !important;
+  }
+  .print-sheet {
+    max-width: none !important;
+    padding: 0 !important;
+  }
   .circuit-table input,
-  .circuit-table select { appearance: none; border: 0 !important; padding: 0 !important; background: transparent !important; box-shadow: none !important; }
+  .circuit-table select {
+    appearance: none;
+    border: 0 !important;
+    padding: 0 !important;
+    background: transparent !important;
+    box-shadow: none !important;
+  }
   .circuit-table th,
-  .circuit-table td { padding-top: 4px !important; padding-bottom: 4px !important; }
-  .panel-shell { box-shadow: none !important; }
-  a { color: inherit !important; text-decoration: none !important; }
+  .circuit-table td {
+    padding-top: 4px !important;
+    padding-bottom: 4px !important;
+  }
+  .panel-shell {
+    box-shadow: none !important;
+  }
+  .print-diagram {
+    color: #0f172a;
+    max-width: 100%;
+  }
+  .print-diagram .overflow-x-auto {
+    overflow: visible !important;
+  }
+  .print-diagram table {
+    min-width: 0 !important;
+    width: 100%;
+    table-layout: fixed;
+  }
+  .print-diagram td,
+  .print-diagram th {
+    overflow-wrap: anywhere;
+  }
+  .print-diagram thead {
+    display: table-header-group;
+  }
+  .print-diagram tr,
+  .diagram-branch,
+  .panel-shell > div {
+    break-inside: avoid;
+  }
+  .print-diagram * {
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
+  }
+  .print-diagram .whitespace-nowrap {
+    white-space: normal !important;
+  }
+  a {
+    color: inherit !important;
+    text-decoration: none !important;
+  }
 }

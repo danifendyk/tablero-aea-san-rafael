@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   ArrowDownRight,
@@ -40,11 +40,51 @@ import {
   NativeSelectOption,
 } from '@/components/ui/native-select';
 import { Separator } from '@/components/ui/separator';
+import {
+  accumulatedVoltageDrop,
+  activePower,
+  balancePanelCircuits,
+  conductorAmpacity,
+  CABLE_REFERENCE_URL,
+  DEFAULT_CONDUCTOR_TEMPERATURE_C,
+  downstreamPhaseDemand,
+  feederVoltageDrop,
+  PRELIMINARY_CONDUCTOR_CAPACITY as CONDUCTOR_CAPACITY,
+  selectPreliminaryBreaker,
+  STANDARD_BREAKERS,
+  type FeederDrop,
+  type AmpacitySettings,
+} from '@/lib/electrical';
+import { toExcelCsv } from '@/lib/csv';
+import {
+  buildPanelDevices,
+  ARCHITECTURE_OPTIONS,
+  LEGACY_ARCHITECTURE,
+  architectureDetails,
+  circuitModuleSpan,
+  differentialGroups,
+  differentialLabel,
+  layoutDin,
+  protectiveConductorSection,
+  PHASE_CONDUCTOR_COLORS,
+} from '@/lib/panel-layout';
+import {
+  canDeletePanel,
+  finiteNumber,
+  highlightedCircuit,
+  readStoredProject,
+  resetStoredProject,
+  saveStoredProject,
+} from '@/lib/project-data';
 
 export type Supply = 'mono' | 'tri';
 export type Phase = 'L1' | 'L2' | 'L3' | '3Φ';
 export type CircuitKind = 'IUG' | 'TUG' | 'TUE' | 'EMG' | 'FM';
-export type Architecture = 'essential' | 'balanced' | 'continuity';
+export type Architecture =
+  | 'essential'
+  | 'balanced'
+  | 'residential'
+  | 'continuity';
 export type ExperienceMode = 'guided' | 'technical';
 export type ProjectPreset = 'hall' | 'commercial' | 'residential' | 'custom';
 export type WorkType = 'new' | 'remodel' | 'survey';
@@ -66,6 +106,8 @@ export type ProjectProfile = {
   descriptiveMemoryReady: boolean;
   registeredProfessionalReady: boolean;
   siteTestReady: boolean;
+  emergencyAutonomyHours?: number;
+  emergencyEvidence?: string;
 };
 
 export type Circuit = {
@@ -80,6 +122,8 @@ export type Circuit = {
   conductor: number;
   lengthM: number;
   modules: number;
+  ampacity?: AmpacitySettings;
+  conduit?: string;
 };
 
 export type CircuitTemplate = Omit<Circuit, 'id' | 'name' | 'phase'> & {
@@ -104,6 +148,8 @@ export type Panel = {
   feederConductor?: number;
   feederBreaker?: number;
   feederPhase?: Phase;
+  feederAmpacity?: AmpacitySettings;
+  feederConduit?: string;
 };
 
 export type PanelCalculation = {
@@ -124,7 +170,8 @@ export type PanelCalculation = {
   imbalance: number;
   widthMm: number;
   heightMm: number;
-  feederDrop: { volts: number; percent: number };
+  feederDrop: FeederDrop;
+  activeInstalledW: number;
 };
 
 export type PriceCatalog = {
@@ -135,6 +182,8 @@ export type PriceCatalog = {
   spd2P: number;
   spd4P: number;
   cabinet16: number;
+  cabinet18: number;
+  cabinet24: number;
   cabinet36: number;
   cabinet54: number;
   cabinet72: number;
@@ -164,13 +213,11 @@ export type CostOption = {
   total: number;
   continuity: string;
   protection: string;
-  score: number;
+  differentialCount: number;
+  nominalCount: number | null;
+  groups: { label: string; circuits: string[] }[];
   lines: CostLine[];
 };
-
-const STANDARD_BREAKERS = [6, 10, 16, 20, 25, 32, 40, 50, 63, 80, 100, 125];
-const STORAGE_KEY = 'tablero-aea-san-rafael:v3';
-const COPPER_RESISTIVITY = 0.018;
 
 const INITIAL_PROFILE: ProjectProfile = {
   preset: 'hall',
@@ -188,17 +235,6 @@ const INITIAL_PROFILE: ProjectProfile = {
   siteTestReady: false,
 };
 
-const CONDUCTOR_CAPACITY: Record<number, number> = {
-  1.5: 16,
-  2.5: 20,
-  4: 25,
-  6: 32,
-  10: 50,
-  16: 63,
-  25: 80,
-  35: 100,
-};
-
 const DEFAULT_PRICES: PriceCatalog = {
   mcb2P: 10995,
   mcb4P: 29995,
@@ -207,6 +243,8 @@ const DEFAULT_PRICES: PriceCatalog = {
   spd2P: 81186,
   spd4P: 193708,
   cabinet16: 31000,
+  cabinet18: 41500,
+  cabinet24: 55333,
   cabinet36: 83000,
   cabinet54: 124500,
   cabinet72: 166000,
@@ -266,7 +304,7 @@ const TEMPLATES: Record<CircuitKind, CircuitTemplate> = {
     points: 10,
     unitVA: 100,
     powerFactor: 0.95,
-    breaker: 16,
+    breaker: 10,
     conductor: 1.5,
     lengthM: 24,
     modules: 2,
@@ -330,7 +368,7 @@ const INITIAL_CIRCUITS_TP: Circuit[] = [
     unitVA: 100,
     phase: 'L1',
     powerFactor: 0.95,
-    breaker: 16,
+    breaker: 10,
     conductor: 1.5,
     lengthM: 24,
     modules: 2,
@@ -424,6 +462,8 @@ function formatMoney(value: number) {
 
 function cabinetFor(modules: number, prices: PriceCatalog) {
   if (modules <= 16) return { label: '16 M', value: prices.cabinet16 };
+  if (modules <= 18) return { label: '18 M', value: prices.cabinet18 };
+  if (modules <= 24) return { label: '24 M', value: prices.cabinet24 };
   if (modules <= 36) return { label: '36 M', value: prices.cabinet36 };
   if (modules <= 54) return { label: '54 M', value: prices.cabinet54 };
   if (modules <= 72) return { label: '72 M', value: prices.cabinet72 };
@@ -438,20 +478,19 @@ function architectureOccupiedModules(
   childPanels: Panel[] = [],
   includeDps = true,
 ) {
-  const poleSpan = supply === 'tri' ? 4 : 2;
-  const circuitModules = circuits.reduce((total, circuit) => total + circuit.modules, 0);
-  const feederModules = childPanels.reduce(
-    (total, child) => total + (child.supply === 'tri' ? 4 : 2),
+  return buildPanelDevices(
+    {
+      id: 'dimensionado',
+      name: '',
+      type: 'TP',
+      supply,
+      architecture,
+      includeDps,
+      circuits,
+    },
+    childPanels,
     0,
-  );
-  const headerModules = poleSpan + (includeDps ? poleSpan : 0);
-  if (architecture === 'essential') return headerModules + poleSpan + circuitModules + feederModules;
-  if (architecture === 'balanced') return headerModules + poleSpan * 2 + circuitModules + feederModules;
-  const individualDifferentials = circuits.reduce(
-    (total, circuit) => total + (circuit.phase === '3Φ' ? 4 : 2),
-    0,
-  );
-  return headerModules + circuitModules + individualDifferentials + feederModules;
+  ).reduce((sum, device) => sum + device.span, 0);
 }
 
 function circuitPower(circuit: Circuit) {
@@ -467,29 +506,14 @@ function circuitCurrent(circuit: Circuit, supply: Supply) {
 function voltageDrop(circuit: Circuit, supply: Supply) {
   const current = circuitCurrent(circuit, supply);
   const threePhase = circuit.phase === '3Φ' && supply === 'tri';
-  const volts =
-    (threePhase ? Math.sqrt(3) : 2) *
-    Math.max(0, circuit.lengthM) *
-    current *
-    COPPER_RESISTIVITY /
-    Math.max(circuit.conductor, 0.1);
-  return { volts, percent: (volts / (threePhase ? 380 : 220)) * 100 };
-}
-
-function feederVoltageDrop(
-  current: number,
-  lengthM: number,
-  conductor: number,
-  supply: Supply,
-) {
-  const threePhase = supply === 'tri';
-  const volts =
-    (threePhase ? Math.sqrt(3) : 2) *
-    Math.max(0, lengthM) *
-    current *
-    COPPER_RESISTIVITY /
-    Math.max(conductor, 0.1);
-  return { volts, percent: (volts / (threePhase ? 380 : 220)) * 100 };
+  return feederVoltageDrop(
+    current,
+    circuit.lengthM,
+    circuit.conductor,
+    threePhase ? 'tri' : 'mono',
+    false,
+    circuit.ampacity?.conductorTemperatureC ?? DEFAULT_CONDUCTOR_TEMPERATURE_C,
+  );
 }
 
 function projectCircuits(preset: ProjectPreset): Circuit[] {
@@ -500,14 +524,28 @@ function projectCircuits(preset: ProjectPreset): Circuit[] {
       { ...base[0], name: 'Iluminación salón de ventas', points: 14 },
       { ...base[1], name: 'Tomacorrientes generales', points: 12 },
       { ...base[2], name: 'Luces de emergencia y salida', points: 6 },
-      { ...base[3], name: 'Aire acondicionado / equipo', unitVA: 2500, breaker: 20, conductor: 4 },
+      {
+        ...base[3],
+        name: 'Aire acondicionado / equipo',
+        unitVA: 2500,
+        breaker: 20,
+        conductor: 4,
+      },
     ];
   }
   if (preset === 'residential') {
     return [
       { ...base[0], name: 'Iluminación general PB', points: 10 },
       { ...base[1], name: 'Tomacorrientes generales', points: 10 },
-      { ...base[3], id: 3, name: 'Cocina y tomas especiales', unitVA: 2500, breaker: 20, conductor: 4, phase: 'L1' },
+      {
+        ...base[3],
+        id: 3,
+        name: 'Cocina y tomas especiales',
+        unitVA: 2500,
+        breaker: 20,
+        conductor: 4,
+        phase: 'L1',
+      },
     ];
   }
   return base;
@@ -515,20 +553,15 @@ function projectCircuits(preset: ProjectPreset): Circuit[] {
 
 function phaseColor(phase: Phase) {
   return {
-    L1: 'bg-amber-400',
-    L2: 'bg-sky-500',
-    L3: 'bg-rose-500',
+    L1: 'bg-amber-900',
+    L2: 'bg-neutral-900',
+    L3: 'bg-red-600',
     '3Φ': 'bg-violet-500',
   }[phase];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
-}
-
-function finiteNumber(value: unknown, fallback: number, min = 0, max = Number.POSITIVE_INFINITY) {
-  const parsed = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
 }
 
 function panelHasDps(panel: Panel) {
@@ -544,7 +577,12 @@ function normalizePrices(value: unknown): PriceCatalog {
   return Object.fromEntries(
     Object.entries(DEFAULT_PRICES).map(([key, fallback]) => [
       key,
-      finiteNumber(raw[key], fallback, 0),
+      finiteNumber(
+        raw[key],
+        fallback,
+        0,
+        key.endsWith('Percent') || key === 'typeAPremium' ? 1000 : 1e12,
+      ),
     ]),
   ) as PriceCatalog;
 }
@@ -552,7 +590,9 @@ function normalizePrices(value: unknown): PriceCatalog {
 function normalizeProfile(value: unknown): ProjectProfile {
   const raw = isRecord(value) ? value : {};
   return {
-    preset: ['hall', 'commercial', 'residential', 'custom'].includes(String(raw.preset))
+    preset: ['hall', 'commercial', 'residential', 'custom'].includes(
+      String(raw.preset),
+    )
       ? (raw.preset as ProjectPreset)
       : INITIAL_PROFILE.preset,
     workType: ['new', 'remodel', 'survey'].includes(String(raw.workType))
@@ -560,7 +600,9 @@ function normalizeProfile(value: unknown): ProjectProfile {
       : INITIAL_PROFILE.workType,
     widthM: finiteNumber(raw.widthM, INITIAL_PROFILE.widthM, 1),
     lengthM: finiteNumber(raw.lengthM, INITIAL_PROFILE.lengthM, 1),
-    occupancy: Math.round(finiteNumber(raw.occupancy, INITIAL_PROFILE.occupancy, 1)),
+    occupancy: Math.round(
+      finiteNumber(raw.occupancy, INITIAL_PROFILE.occupancy, 1),
+    ),
     evacuation: ['BD1', 'BD2', 'BD3', 'BD4'].includes(String(raw.evacuation))
       ? (raw.evacuation as EvacuationClass)
       : INITIAL_PROFILE.evacuation,
@@ -583,10 +625,41 @@ function normalizeProfile(value: unknown): ProjectProfile {
     descriptiveMemoryReady: raw.descriptiveMemoryReady === true,
     registeredProfessionalReady: raw.registeredProfessionalReady === true,
     siteTestReady: raw.siteTestReady === true,
+    emergencyAutonomyHours: finiteNumber(raw.emergencyAutonomyHours, 0, 0, 168),
+    emergencyEvidence:
+      typeof raw.emergencyEvidence === 'string'
+        ? raw.emergencyEvidence.slice(0, 1000)
+        : '',
   };
 }
 
-function normalizeCircuit(value: unknown, index: number, supply: Supply): Circuit {
+function normalizeAmpacity(value: unknown): AmpacitySettings {
+  const raw = isRecord(value) ? value : {};
+  const mode = raw.mode === 'declared' ? 'declared' : 'reference';
+  return {
+    mode,
+    ambientC: [20, 30, 40].includes(Number(raw.ambientC))
+      ? (Number(raw.ambientC) as 20 | 30 | 40)
+      : 40,
+    groupedCircuits: [1, 2, 3].includes(Number(raw.groupedCircuits))
+      ? (Number(raw.groupedCircuits) as 1 | 2 | 3)
+      : 1,
+    conductorTemperatureC:
+      mode === 'declared' && raw.conductorTemperatureC === 90
+        ? 90
+        : raw.conductorTemperatureC === 20
+          ? 20
+          : 70,
+    declaredA: finiteNumber(raw.declaredA, 0, 0, 10000),
+    basis: typeof raw.basis === 'string' ? raw.basis.slice(0, 1000) : '',
+  };
+}
+
+function normalizeCircuit(
+  value: unknown,
+  index: number,
+  supply: Supply,
+): Circuit {
   const raw = isRecord(value) ? value : {};
   const kind = ['IUG', 'TUG', 'TUE', 'EMG', 'FM'].includes(String(raw.kind))
     ? (raw.kind as CircuitKind)
@@ -598,7 +671,11 @@ function normalizeCircuit(value: unknown, index: number, supply: Supply): Circui
   const phase = supply === 'mono' ? 'L1' : requestedPhase;
   const requestedBreaker = finiteNumber(raw.breaker, template.breaker, 1);
   const breaker = nextBreaker(requestedBreaker);
-  const requestedConductor = finiteNumber(raw.conductor, template.conductor, 0.1);
+  const requestedConductor = finiteNumber(
+    raw.conductor,
+    template.conductor,
+    0.1,
+  );
   const conductor = CONDUCTOR_CAPACITY[requestedConductor]
     ? requestedConductor
     : template.conductor;
@@ -617,7 +694,12 @@ function normalizeCircuit(value: unknown, index: number, supply: Supply): Circui
     breaker,
     conductor,
     lengthM: finiteNumber(raw.lengthM, template.lengthM, 0),
-    modules: Math.max(1, Math.round(finiteNumber(raw.modules, template.modules, 1, 8))),
+    modules: circuitModuleSpan({
+      phase,
+      modules: finiteNumber(raw.modules, template.modules, 2, 8),
+    }),
+    ampacity: normalizeAmpacity(raw.ampacity),
+    conduit: typeof raw.conduit === 'string' ? raw.conduit.slice(0, 300) : '',
   };
 }
 
@@ -631,13 +713,21 @@ function normalizePanels(value: unknown): Panel[] | null {
   const normalized = records.map((raw, panelIndex) => {
     const type: PanelType = raw.type === 'TP' ? 'TP' : 'TS';
     const fallbackId = type === 'TP' ? 'tp' : `ts-${panelIndex}`;
-    let id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : fallbackId;
+    let id =
+      typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : fallbackId;
     while (usedIds.has(id)) id = `${id}-${panelIndex + 1}`;
     usedIds.add(id);
     const supply: Supply = raw.supply === 'mono' ? 'mono' : 'tri';
     const circuits = Array.isArray(raw.circuits)
-      ? raw.circuits.map((circuit, index) => normalizeCircuit(circuit, index, supply))
+      ? raw.circuits.map((circuit, index) =>
+          normalizeCircuit(circuit, index, supply),
+        )
       : [];
+    const circuitIds = new Set<number>();
+    circuits.forEach((circuit) => {
+      while (circuitIds.has(circuit.id)) circuit.id += 1;
+      circuitIds.add(circuit.id);
+    });
     const feederPhase: Phase =
       supply === 'tri'
         ? '3Φ'
@@ -654,20 +744,37 @@ function normalizePanels(value: unknown): Panel[] | null {
             ? 'Tablero Principal (TP)'
             : `TS${panelIndex} · Tablero Seccional`,
       type,
-      parentId: type === 'TP' ? null : typeof raw.parentId === 'string' ? raw.parentId : null,
+      parentId:
+        type === 'TP'
+          ? null
+          : typeof raw.parentId === 'string'
+            ? raw.parentId
+            : null,
       supply,
-      demandFactor: finiteNumber(raw.demandFactor, type === 'TP' ? 0.8 : 0.85, 0.1, 1),
-      reservePercent: finiteNumber(raw.reservePercent, 25, 0, 100),
-      modulesPerRow: [12, 18, 24].includes(Number(raw.modulesPerRow))
+      demandFactor: finiteNumber(
+        raw.demandFactor,
+        type === 'TP' ? 0.8 : 0.85,
+        0.1,
+        1,
+      ),
+      reservePercent: finiteNumber(raw.reservePercent, 25, 20, 80),
+      modulesPerRow: [12, 16, 18, 24].includes(Number(raw.modulesPerRow))
         ? Number(raw.modulesPerRow)
         : 18,
-      architecture: ['essential', 'balanced', 'continuity'].includes(String(raw.architecture))
+      architecture: [
+        'essential',
+        'balanced',
+        'residential',
+        'continuity',
+      ].includes(String(raw.architecture))
         ? (raw.architecture as Architecture)
         : 'balanced',
-      includeDps: typeof raw.includeDps === 'boolean' ? raw.includeDps : type === 'TP',
+      includeDps:
+        typeof raw.includeDps === 'boolean' ? raw.includeDps : type === 'TP',
       differentialType: raw.differentialType === 'AC' ? 'AC' : 'A',
       circuits,
-      feederLengthM: type === 'TS' ? finiteNumber(raw.feederLengthM, 15, 1) : undefined,
+      feederLengthM:
+        type === 'TS' ? finiteNumber(raw.feederLengthM, 15, 1) : undefined,
       feederConductor:
         type === 'TS' && CONDUCTOR_CAPACITY[Number(raw.feederConductor)]
           ? Number(raw.feederConductor)
@@ -675,8 +782,16 @@ function normalizePanels(value: unknown): Panel[] | null {
             ? 6
             : undefined,
       feederBreaker:
-        type === 'TS' ? nextBreaker(finiteNumber(raw.feederBreaker, 32, 1)) : undefined,
+        type === 'TS'
+          ? nextBreaker(finiteNumber(raw.feederBreaker, 32, 1))
+          : undefined,
       feederPhase: type === 'TS' ? feederPhase : undefined,
+      feederAmpacity:
+        type === 'TS' ? normalizeAmpacity(raw.feederAmpacity) : undefined,
+      feederConduit:
+        typeof raw.feederConduit === 'string'
+          ? raw.feederConduit.slice(0, 300)
+          : '',
     } satisfies Panel;
   });
 
@@ -690,7 +805,10 @@ function normalizePanels(value: unknown): Panel[] | null {
         parentId: tp.id,
         supply: 'mono',
         feederPhase: 'L1',
-        circuits: panel.circuits.map((circuit) => ({ ...circuit, phase: 'L1' as Phase })),
+        circuits: panel.circuits.map((circuit) => ({
+          ...circuit,
+          phase: 'L1' as Phase,
+        })),
       };
     }
     return { ...panel, parentId: tp.id };
@@ -698,7 +816,8 @@ function normalizePanels(value: unknown): Panel[] | null {
 }
 
 export default function Home() {
-  const [experienceMode, setExperienceMode] = useState<ExperienceMode>('guided');
+  const [experienceMode, setExperienceMode] =
+    useState<ExperienceMode>('guided');
   const [profile, setProfile] = useState<ProjectProfile>(INITIAL_PROFILE);
   const [projectName, setProjectName] = useState('SALÓN · 24 × 10 m');
   const [panels, setPanels] = useState<Panel[]>(INITIAL_PANELS);
@@ -706,81 +825,84 @@ export default function Home() {
   const [prices, setPrices] = useState<PriceCatalog>(DEFAULT_PRICES);
   const [optimizationMessage, setOptimizationMessage] = useState('');
   const [persistenceReady, setPersistenceReady] = useState(false);
+  const [persistenceError, setPersistenceError] = useState<string | null>(null);
+  const [storageBlocked, setStorageBlocked] = useState(false);
   const [hoveredCircuitId, setHoveredCircuitId] = useState<number | null>(null);
-  const [selectedCircuitId, setSelectedCircuitId] = useState<number | null>(null);
+  const [selectedCircuitId, setSelectedCircuitId] = useState<number | null>(
+    null,
+  );
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Active panel helper
   const activePanel = useMemo(() => {
-    return panels.find((p) => p.id === activePanelId) ?? panels[0] ?? INITIAL_PANELS[0];
+    return (
+      panels.find((p) => p.id === activePanelId) ??
+      panels[0] ??
+      INITIAL_PANELS[0]
+    );
   }, [panels, activePanelId]);
   const tpPanel = useMemo(
-    () => panels.find((panel) => panel.type === 'TP') ?? panels[0] ?? INITIAL_PANELS[0],
+    () =>
+      panels.find((panel) => panel.type === 'TP') ??
+      panels[0] ??
+      INITIAL_PANELS[0],
     [panels],
   );
 
-  // Backward compatibility & load
+  // Read and normalize before scheduling React updates; never destroy unreadable data.
   useEffect(() => {
-    try {
-      const storedV3 = window.localStorage.getItem(STORAGE_KEY);
-      if (storedV3) {
-        const data = JSON.parse(storedV3);
-        queueMicrotask(() => {
-          if (data.experienceMode) setExperienceMode(data.experienceMode);
-          if (data.profile) setProfile(normalizeProfile(data.profile));
-          if (data.projectName) setProjectName(data.projectName);
-          const normalizedPanels = normalizePanels(data.panels);
-          if (normalizedPanels) {
-            setPanels(normalizedPanels);
-            const requestedActiveId = data.activePanelId;
-            setActivePanelId(
-              normalizedPanels.some((panel) => panel.id === requestedActiveId)
-                ? requestedActiveId
-                : normalizedPanels[0].id,
-            );
-          }
-          if (data.prices) setPrices(normalizePrices(data.prices));
-          setPersistenceReady(true);
-        });
-        return;
+    const stored = readStoredProject(() => window.localStorage);
+    let error = stored.error;
+    let restored: { panels: Panel[]; data: Record<string, unknown> } | null =
+      null;
+    if (stored.data) {
+      try {
+        const data = stored.data;
+        const sourcePanels = stored.legacy
+          ? [
+              {
+                ...INITIAL_PANELS[0],
+                supply: data.supply,
+                demandFactor: data.demandFactor,
+                reservePercent: data.reservePercent,
+                modulesPerRow: data.modulesPerRow,
+                architecture: data.architecture,
+                circuits: data.circuits ?? INITIAL_CIRCUITS_TP,
+              },
+            ]
+          : data.panels;
+        const normalized = normalizePanels(sourcePanels);
+        if (!normalized) throw new Error('Proyecto sin TP válido');
+        restored = { panels: normalized, data };
+      } catch {
+        error =
+          'El proyecto guardado tiene un formato inválido. No se sobrescribió; importá un JSON válido o restablecé cuando tengas una copia.';
       }
-
-      // Check legacy v2
-      const storedLegacy = window.localStorage.getItem('tablero-aea-san-rafael:v2');
-      if (storedLegacy) {
-        const data = JSON.parse(storedLegacy);
-        queueMicrotask(() => {
-          if (data.experienceMode) setExperienceMode(data.experienceMode);
-          if (data.profile) setProfile(normalizeProfile(data.profile));
-          if (data.projectName) setProjectName(data.projectName);
-          if (data.prices) setPrices(normalizePrices(data.prices));
-
-          const migratedPanel: Panel = {
-            id: 'tp',
-            name: 'Tablero Principal (TP)',
-            type: 'TP',
-            parentId: null,
-            supply: data.supply || 'tri',
-            demandFactor: typeof data.demandFactor === 'number' ? data.demandFactor : 0.8,
-            reservePercent: typeof data.reservePercent === 'number' ? data.reservePercent : 25,
-            modulesPerRow: typeof data.modulesPerRow === 'number' ? data.modulesPerRow : 18,
-            architecture: data.architecture || 'balanced',
-            includeDps: true,
-            differentialType: 'A',
-            circuits: Array.isArray(data.circuits) ? data.circuits : INITIAL_CIRCUITS_TP,
-          };
-          setPanels(normalizePanels([migratedPanel]) ?? INITIAL_PANELS);
-          setActivePanelId('tp');
-          setPersistenceReady(true);
-        });
-        return;
-      }
-
-      queueMicrotask(() => setPersistenceReady(true));
-    } catch {
-      window.localStorage.removeItem(STORAGE_KEY);
-      queueMicrotask(() => setPersistenceReady(true));
     }
+    queueMicrotask(() => {
+      if (restored) {
+        const { panels: loadedPanels, data } = restored;
+        setPanels(loadedPanels);
+        setExperienceMode(
+          data.experienceMode === 'technical' ? 'technical' : 'guided',
+        );
+        setProfile(normalizeProfile(data.profile));
+        setProjectName(
+          typeof data.projectName === 'string' && data.projectName.trim()
+            ? data.projectName
+            : 'SALÓN · 24 × 10 m',
+        );
+        setPrices(normalizePrices(data.prices));
+        setActivePanelId(
+          loadedPanels.some((panel) => panel.id === data.activePanelId)
+            ? String(data.activePanelId)
+            : loadedPanels[0].id,
+        );
+      }
+      setPersistenceError(error);
+      setStorageBlocked(Boolean(error));
+      setPersistenceReady(true);
+    });
   }, []);
 
   useEffect(() => {
@@ -790,32 +912,64 @@ export default function Home() {
     });
   }, [activePanelId]);
 
-  // Save to localStorage
+  // Local draft only; an unavailable/quota-limited store must not crash React.
   useEffect(() => {
-    if (!persistenceReady) return;
-    window.localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({
-        experienceMode,
-        profile,
-        projectName,
-        panels,
-        activePanelId,
-        prices,
-      }),
-    );
-  }, [activePanelId, experienceMode, panels, persistenceReady, prices, profile, projectName]);
+    if (!persistenceReady || storageBlocked) return;
+    const error = saveStoredProject(() => window.localStorage, {
+      experienceMode,
+      profile,
+      projectName,
+      panels,
+      activePanelId,
+      prices,
+    });
+    queueMicrotask(() => setPersistenceError(error));
+  }, [
+    activePanelId,
+    experienceMode,
+    panels,
+    persistenceReady,
+    prices,
+    profile,
+    projectName,
+    storageBlocked,
+  ]);
 
   // Panel mutations
-  const updateActivePanel = <K extends keyof Panel>(key: K, value: Panel[K]) => {
+  const updateActivePanel = <K extends keyof Panel>(
+    key: K,
+    value: Panel[K],
+  ) => {
+    setOptimizationMessage('');
+    if (key === 'reservePercent')
+      value = finiteNumber(value, 25, 20, 80) as Panel[K];
     setPanels((current) =>
-      current.map((p) => (p.id === activePanel.id ? { ...p, [key]: value } : p)),
+      current.map((p) => {
+        if (p.id !== activePanel.id) return p;
+        const next = { ...p, [key]: value };
+        if (
+          key === 'feederConductor' &&
+          value !== p.feederConductor &&
+          next.feederAmpacity?.mode === 'declared'
+        )
+          next.feederAmpacity = {
+            ...next.feederAmpacity,
+            declaredA: 0,
+            basis: '',
+          };
+        return next;
+      }),
     );
   };
 
   const changePanelSupply = (panelId: string, nextSupply: Supply) => {
+    setOptimizationMessage('');
     const targetPanel = panels.find((panel) => panel.id === panelId);
-    if (targetPanel?.type === 'TS' && nextSupply === 'tri' && tpPanel.supply === 'mono') {
+    if (
+      targetPanel?.type === 'TS' &&
+      nextSupply === 'tri' &&
+      tpPanel.supply === 'mono'
+    ) {
       setOptimizationMessage(
         'No se puede alimentar un TS trifásico desde un TP monofásico.',
       );
@@ -828,12 +982,17 @@ export default function Home() {
 
       return current.map((panel) => {
         const isTarget = panel.id === panelId;
-        const mustFollowMonoTp = target.type === 'TP' && nextSupply === 'mono' && panel.type === 'TS';
+        const mustFollowMonoTp =
+          target.type === 'TP' && nextSupply === 'mono' && panel.type === 'TS';
         if (!isTarget && !mustFollowMonoTp) return panel;
         const normalizedSupply = mustFollowMonoTp ? 'mono' : nextSupply;
         return {
           ...panel,
           supply: normalizedSupply,
+          feederAmpacity:
+            panel.feederAmpacity?.mode === 'declared'
+              ? { ...panel.feederAmpacity, declaredA: 0, basis: '' }
+              : panel.feederAmpacity,
           feederPhase:
             panel.type === 'TS'
               ? normalizedSupply === 'tri'
@@ -841,15 +1000,19 @@ export default function Home() {
                 : mustFollowMonoTp
                   ? 'L1'
                   : panel.feederPhase === 'L2' || panel.feederPhase === 'L3'
-                  ? panel.feederPhase
-                  : 'L1'
+                    ? panel.feederPhase
+                    : 'L1'
               : undefined,
           circuits:
             normalizedSupply === 'mono'
               ? panel.circuits.map((circuit) => ({
                   ...circuit,
                   phase: 'L1' as Phase,
-                  modules: Math.min(circuit.modules, 2),
+                  modules: 2,
+                  ampacity:
+                    circuit.ampacity?.mode === 'declared'
+                      ? { ...circuit.ampacity, declaredA: 0, basis: '' }
+                      : circuit.ampacity,
                 }))
               : panel.circuits,
         };
@@ -858,6 +1021,7 @@ export default function Home() {
   };
 
   const addSectionalPanel = () => {
+    setOptimizationMessage('');
     const nextIndex = panels.filter((p) => p.type === 'TS').length + 1;
     const newId = createPanelId('ts');
     const newPanel: Panel = {
@@ -869,7 +1033,8 @@ export default function Home() {
       demandFactor: 0.85,
       reservePercent: 25,
       modulesPerRow: 18,
-      architecture: 'balanced',
+      architecture:
+        profile.preset === 'residential' ? 'residential' : 'balanced',
       includeDps: false,
       differentialType: profile.preset === 'residential' ? 'AC' : 'A',
       feederLengthM: 15,
@@ -885,7 +1050,7 @@ export default function Home() {
           unitVA: 100,
           phase: 'L1',
           powerFactor: 0.95,
-          breaker: 16,
+          breaker: 10,
           conductor: 1.5,
           lengthM: 18,
           modules: 2,
@@ -910,6 +1075,7 @@ export default function Home() {
   };
 
   const duplicatePanel = (panel: Panel) => {
+    setOptimizationMessage('');
     const newId = createPanelId('ts');
     const nextIndex = panels.filter((p) => p.type === 'TS').length + 1;
     const duplicated: Panel = {
@@ -925,7 +1091,8 @@ export default function Home() {
   };
 
   const deletePanel = (id: string) => {
-    if (panels.length <= 1) return;
+    if (!canDeletePanel(panels, id)) return;
+    setOptimizationMessage('');
     const remaining = panels.filter((p) => p.id !== id);
     setPanels(remaining);
     if (activePanelId === id) {
@@ -967,11 +1134,28 @@ export default function Home() {
         (isTP
           ? childPanelsForTP.reduce(
               (total, child) =>
-                total + child.circuits.reduce((sum, circuit) => sum + circuitPower(circuit), 0),
+                total +
+                child.circuits.reduce(
+                  (sum, circuit) => sum + circuitPower(circuit),
+                  0,
+                ),
               0,
             )
           : 0);
       const demandVA = ownInstalledVA * panel.demandFactor + childDemandVA;
+      const activeInstalledW =
+        panel.circuits.reduce((sum, circuit) => sum + activePower(circuit), 0) +
+        (isTP
+          ? childPanelsForTP.reduce(
+              (sum, child) =>
+                sum +
+                child.circuits.reduce(
+                  (total, circuit) => total + activePower(circuit),
+                  0,
+                ),
+              0,
+            )
+          : 0);
       const phaseVA = { L1: 0, L2: 0, L3: 0 };
 
       panel.circuits.forEach((circuit) => {
@@ -989,29 +1173,10 @@ export default function Home() {
 
       // For TP: also distribute child panel loads into phase balance
       if (isTP) {
-        childPanelsForTP.forEach((child) => {
-          const childDemand =
-            child.circuits.reduce((total, circuit) => total + circuitPower(circuit), 0) *
-            child.demandFactor;
-          if (child.supply === 'mono') {
-            const feederPhase =
-              child.feederPhase === 'L2' || child.feederPhase === 'L3'
-                ? child.feederPhase
-                : 'L1';
-            phaseVA[feederPhase] += childDemand;
-            return;
-          }
-          child.circuits.forEach((circuit) => {
-            const power = circuitPower(circuit) * child.demandFactor;
-            if (circuit.phase === '3Φ') {
-              phaseVA.L1 += power / 3;
-              phaseVA.L2 += power / 3;
-              phaseVA.L3 += power / 3;
-            } else {
-              phaseVA[circuit.phase] += power;
-            }
-          });
-        });
+        const downstream = downstreamPhaseDemand(panel.id, childPanelsForTP);
+        phaseVA.L1 += downstream.L1;
+        phaseVA.L2 += downstream.L2;
+        phaseVA.L3 += downstream.L3;
       }
 
       // For TP: phaseVA already includes demand factors, so divide by 220 directly
@@ -1030,11 +1195,14 @@ export default function Home() {
         0,
       );
       const maxFeederBreaker = isTP
-        ? childPanelsForTP.reduce((max, c) => Math.max(max, c.feederBreaker ?? 0), 0)
+        ? childPanelsForTP.reduce(
+            (max, c) => Math.max(max, c.feederBreaker ?? 0),
+            0,
+          )
         : 0;
       const maxBranchBreaker = Math.max(maxOutgoingBreaker, maxFeederBreaker);
       const currentBasedBreaker = nextBreaker(mainCurrent * 1.15);
-      // IGA must satisfy In >= 1.15 * Ib AND In >= max(outgoing branch/feeder breakers) for electrical hierarchy & selectivity
+      // Preliminary rating heuristic only: this does NOT demonstrate selectivity.
       const mainBreaker = Math.max(currentBasedBreaker, maxBranchBreaker || 10);
       const includeDps = panelHasDps(panel);
       const baseModules = architectureOccupiedModules(
@@ -1044,36 +1212,36 @@ export default function Home() {
         [],
         includeDps,
       );
-      const occupiedModules = architectureOccupiedModules(
-        panel.architecture,
-        panel.supply,
-        panel.circuits,
-        isTP ? childPanelsForTP : [],
-        includeDps,
+      const layout = layoutDin(
+        buildPanelDevices(panel, isTP ? childPanelsForTP : [], mainBreaker),
+        panel.modulesPerRow,
+        panel.reservePercent,
       );
-      const recommendedModules = Math.ceil(
-        occupiedModules * (1 + panel.reservePercent / 100),
-      );
-      const rows = Math.max(1, Math.ceil(recommendedModules / panel.modulesPerRow));
-      const cabinetModules = rows * panel.modulesPerRow;
+      const { occupiedModules, recommendedModules, rows, cabinetModules } =
+        layout;
 
       const phaseValues = Object.values(phaseVA);
-      const averagePhase = phaseValues.reduce((sum, value) => sum + value, 0) / 3;
+      const averagePhase =
+        phaseValues.reduce((sum, value) => sum + value, 0) / 3;
       const imbalance =
         panel.supply === 'tri' && averagePhase > 0
-          ? Math.max(...phaseValues.map((value) => Math.abs(value - averagePhase))) /
-            averagePhase
+          ? Math.max(
+              ...phaseValues.map((value) => Math.abs(value - averagePhase)),
+            ) / averagePhase
           : 0;
 
       const feederDrop =
-        panel.type === 'TS' && panel.feederLengthM && panel.feederConductor
+        panel.type === 'TS'
           ? feederVoltageDrop(
               mainCurrent,
-              panel.feederLengthM,
-              panel.feederConductor,
+              panel.feederLengthM ?? 15,
+              panel.feederConductor ?? 6,
               panel.supply,
+              panel.circuits.some((circuit) => circuit.phase !== '3Φ'),
+              panel.feederAmpacity?.conductorTemperatureC ??
+                DEFAULT_CONDUCTOR_TEMPERATURE_C,
             )
-          : { volts: 0, percent: 0 };
+          : feederVoltageDrop(0, 0, 6, 'mono');
 
       map.set(panel.id, {
         ownInstalledVA,
@@ -1094,6 +1262,7 @@ export default function Home() {
         widthMm: panel.modulesPerRow * 18 + 80,
         heightMm: rows * 150 + 80,
         feederDrop,
+        activeInstalledW,
       });
     });
 
@@ -1120,7 +1289,8 @@ export default function Home() {
         imbalance: 0,
         widthMm: 404,
         heightMm: 230,
-        feederDrop: { volts: 0, percent: 0 },
+        feederDrop: feederVoltageDrop(0, 0, 6, 'mono'),
+        activeInstalledW: 0,
       }
     );
   }, [panelCalculations, activePanel.id]);
@@ -1135,7 +1305,8 @@ export default function Home() {
       0,
     );
     const fallbackDemand = panels.reduce(
-      (total, panel) => total + (panelCalculations.get(panel.id)?.demandVA ?? 0),
+      (total, panel) =>
+        total + (panelCalculations.get(panel.id)?.demandVA ?? 0),
       0,
     );
     return {
@@ -1150,7 +1321,8 @@ export default function Home() {
     profile.preset === 'hall' ||
     profile.occupancy >= 50 ||
     profile.evacuation !== 'BD1';
-  const projectArea = Math.max(0, profile.widthM) * Math.max(0, profile.lengthM);
+  const projectArea =
+    Math.max(0, profile.widthM) * Math.max(0, profile.lengthM);
   const areaPerPerson =
     profile.occupancy > 0 ? projectArea / profile.occupancy : 0;
 
@@ -1171,23 +1343,45 @@ export default function Home() {
           `C${circuitNumber}: la corriente estimada supera la protección seleccionada.`,
         );
       }
-      const cableCapacity = CONDUCTOR_CAPACITY[circuit.conductor];
-      if (cableCapacity && circuit.breaker > cableCapacity) {
+      const cableCapacity = conductorAmpacity(
+        circuit.conductor,
+        circuit.phase === '3Φ',
+        circuit.ampacity,
+      );
+      if (!cableCapacity) {
         messages.push(
-          `C${circuitNumber}: revisar relación entre sección y protección.`,
+          `C${circuitNumber}: no hay capacidad preliminar para la sección seleccionada.`,
+        );
+      } else if (circuit.breaker > cableCapacity) {
+        messages.push(
+          `C${circuitNumber}: la térmica de ${circuit.breaker} A supera Iz preliminar ${cableCapacity} A; revisar sección y protección.`,
         );
       }
-      const circuitDropPercent = voltageDrop(circuit, activePanel.supply).percent;
+      const circuitDropPercent = voltageDrop(
+        circuit,
+        activePanel.supply,
+      ).percent;
       const totalDropPercent =
         circuitDropPercent +
         (activePanel.type === 'TS' ? calculations.feederDrop.percent : 0);
-      const terminalLimit = circuit.kind === 'FM' ? 4 : 2;
+      const terminalLimit =
+        activePanel.type === 'TP'
+          ? circuit.kind === 'FM'
+            ? 5
+            : 3
+          : circuit.kind === 'FM'
+            ? 4
+            : 2;
       const totalLimit = circuit.kind === 'FM' ? 5 : 3;
       if (circuitDropPercent > terminalLimit) {
         messages.push(
-          `C${circuitNumber}: caída del circuito ${circuitDropPercent.toFixed(1)} %; supera el criterio de ${terminalLimit} % desde el tablero seccional.`,
+          `C${circuitNumber}: caída del circuito ${circuitDropPercent.toFixed(1)} %; supera el criterio AEA de ${terminalLimit} % desde el ${activePanel.type}.`,
         );
       }
+      if (circuitDropPercent > 2)
+        messages.push(
+          `C${circuitNumber}: además supera el 2 % indicado para cables de circuitos por la Ord. 72/83, III.2.9.4. Confirmar el criterio municipal del expediente.`,
+        );
       if (totalDropPercent > totalLimit) {
         messages.push(
           `C${circuitNumber}: caída total estimada ${totalDropPercent.toFixed(1)} % (circuito + alimentador); supera ${totalLimit} %.`,
@@ -1198,13 +1392,21 @@ export default function Home() {
     if (activePanel.type === 'TS') {
       const feederBreaker = activePanel.feederBreaker ?? 32;
       const feederConductor = activePanel.feederConductor ?? 6;
-      const feederCapacity = CONDUCTOR_CAPACITY[feederConductor] ?? 0;
+      const feederCapacity = conductorAmpacity(
+        feederConductor,
+        activePanel.supply === 'tri',
+        activePanel.feederAmpacity,
+      );
+      if (feederCapacity === null)
+        messages.push(
+          'Alimentador: falta una Iz de diseño válida y su fuente/condiciones.',
+        );
       if (feederBreaker < calculations.mainCurrent) {
         messages.push(
           `Alimentador: la térmica de ${feederBreaker} A es menor que Ib ${calculations.mainCurrent.toFixed(1)} A.`,
         );
       }
-      if (feederCapacity > 0 && feederBreaker > feederCapacity) {
+      if (feederCapacity !== null && feederBreaker > feederCapacity) {
         messages.push(
           `Alimentador: ${feederBreaker} A supera la capacidad preliminar de ${feederCapacity} A para ${feederConductor} mm².`,
         );
@@ -1224,14 +1426,18 @@ export default function Home() {
         );
       }
       if (tpPanel.supply === 'mono' && activePanel.supply === 'tri') {
-        messages.push('Incompatibilidad: un TP monofásico no puede alimentar un TS trifásico.');
+        messages.push(
+          'Incompatibilidad: un TP monofásico no puede alimentar un TS trifásico.',
+        );
       }
       if (
         activePanel.supply === 'mono' &&
         tpPanel.supply === 'tri' &&
         !['L1', 'L2', 'L3'].includes(String(activePanel.feederPhase))
       ) {
-        messages.push('Alimentador monofásico: seleccionar la fase L1, L2 o L3 del TP.');
+        messages.push(
+          'Alimentador monofásico: seleccionar la fase L1, L2 o L3 del TP.',
+        );
       }
     }
 
@@ -1239,7 +1445,9 @@ export default function Home() {
       messages.push('El desbalance de fases estimado supera el 20 %.');
     }
     if (calculations.mainCurrent * 1.15 > STANDARD_BREAKERS.at(-1)!) {
-      messages.push('La corriente de cabecera supera el rango de calibres modelado (125 A).');
+      messages.push(
+        'La corriente de cabecera supera el rango de calibres modelado (125 A).',
+      );
     }
     if (profile.breakingCapacityKa < profile.prospectiveShortCircuitKa) {
       messages.push(
@@ -1253,17 +1461,27 @@ export default function Home() {
     }
     if (
       isPublicVenue &&
-      !panels.some((panel) => panel.circuits.some((circuit) => circuit.kind === 'EMG'))
+      !panels.some((panel) =>
+        panel.circuits.some((circuit) => circuit.kind === 'EMG'),
+      )
     ) {
       messages.push(
         'El proyecto de pública concurrencia no tiene ningún circuito de iluminación de emergencia.',
       );
     }
-    if (isPublicVenue && activePanel.architecture === 'essential') {
-      messages.push(
-        'Para pública concurrencia, separar usos normales y servicios de emergencia; evitar un único diferencial común.',
-      );
+    if (isPublicVenue) {
+      for (const panel of panels.filter(
+        (item) => item.architecture === 'residential' && item.circuits.length,
+      )) {
+        messages.push(
+          `${panel.name}: arquitectura domiciliaria de ID único en pública concurrencia. No separa iluminación/tomas ni emergencia; revisar AEA 718 y Ordenanza 72/83. No se considera una solución validada para este salón.`,
+        );
+      }
     }
+    if (isPublicVenue && !emergencyAutonomyDeclared(profile))
+      messages.push(
+        'Emergencia: falta declarar autonomía ≥2 h y una referencia de ensayo/ficha. Un circuito EMG no demuestra autonomía ni iluminancia.',
+      );
     return messages;
   }, [
     activePanel,
@@ -1272,154 +1490,99 @@ export default function Home() {
     calculations.mainCurrent,
     isPublicVenue,
     panels,
-    profile.breakingCapacityKa,
-    profile.groundResistanceOhm,
-    profile.prospectiveShortCircuitKa,
+    profile,
     tpPanel.supply,
   ]);
 
   const costOptions = useMemo<CostOption[]>(() => {
-    const mcbHeadPrice =
-      activePanel.supply === 'tri' ? prices.mcb4P : prices.mcb2P;
-    const baseRcdPrice = activePanel.supply === 'tri' ? prices.rcd4P : prices.rcd2P;
-    const differentialType = panelDifferentialType(activePanel);
-    const differentialFactor =
-      differentialType === 'A' ? 1 + prices.typeAPremium / 100 : 1;
-    const rcdPrice =
-      baseRcdPrice * differentialFactor;
-    const spdPrice = activePanel.supply === 'tri' ? prices.spd4P : prices.spd2P;
-    const includeDps = panelHasDps(activePanel);
-    const branchMcbPrice = activePanel.circuits.reduce(
-      (total, circuit) =>
-        total + (circuit.phase === '3Φ' ? prices.mcb4P : prices.mcb2P),
-      0,
-    );
-
-    const childPanels =
+    const children =
       activePanel.type === 'TP'
-        ? panels.filter((panel) => panel.type === 'TS' && panel.parentId === activePanel.id)
+        ? panels.filter(
+            (panel) => panel.type === 'TS' && panel.parentId === activePanel.id,
+          )
         : [];
-    const feederMcbPrice = childPanels.reduce(
-      (total, child) => total + (child.supply === 'tri' ? prices.mcb4P : prices.mcb2P),
-      0,
+    const differentialType = panelDifferentialType(activePanel);
+    const typeFactor =
+      differentialType === 'A' ? 1 + prices.typeAPremium / 100 : 1;
+    // Keep legacy quotes readable without offering this mode as a new choice.
+    return [...ARCHITECTURE_OPTIONS, LEGACY_ARCHITECTURE].map(
+      (definition): CostOption => {
+        const panel = { ...activePanel, architecture: definition.id };
+        const groups = differentialGroups(panel);
+        const layout = layoutDin(
+          buildPanelDevices(panel, children, 0),
+          panel.modulesPerRow,
+          panel.reservePercent,
+        );
+        const cabinet = cabinetFor(layout.cabinetModules, prices);
+        const lines: CostLine[] = [
+          { label: `Gabinete DIN (${cabinet.label})`, value: cabinet.value },
+          {
+            label: `${panel.type === 'TP' ? 'IGA' : 'Corte local'} ${panel.supply === 'tri' ? '4P' : '2P'}`,
+            value: panel.supply === 'tri' ? prices.mcb4P : prices.mcb2P,
+          },
+          {
+            label: `${groups.length} diferenciales · tipo ${differentialType}`,
+            value: groups.reduce(
+              (sum, group) =>
+                sum +
+                (group.span === 4 ? prices.rcd4P : prices.rcd2P) * typeFactor,
+              0,
+            ),
+          },
+          {
+            label: `Térmicas de circuitos (${panel.circuits.length})`,
+            value: panel.circuits.reduce(
+              (sum, circuit) =>
+                sum + (circuit.phase === '3Φ' ? prices.mcb4P : prices.mcb2P),
+              0,
+            ),
+          },
+        ];
+        if (panelHasDps(panel))
+          lines.splice(2, 0, {
+            label: `DPS ${panel.supply === 'tri' ? '3P+N' : '1P+N'} transitorias`,
+            value: panel.supply === 'tri' ? prices.spd4P : prices.spd2P,
+          });
+        if (children.length)
+          lines.push({
+            label: `Térmicas alimentadores TS (${children.length})`,
+            value: children.reduce(
+              (sum, child) =>
+                sum + (child.supply === 'tri' ? prices.mcb4P : prices.mcb2P),
+              0,
+            ),
+          });
+        const material = lines.reduce((sum, line) => sum + line.value, 0);
+        return {
+          id: definition.id,
+          title: definition.title,
+          subtitle: definition.subtitle,
+          differentialCount: groups.length,
+          nominalCount: definition.nominalCount,
+          groups: groups.map((group) => ({
+            label: group.label,
+            circuits: group.circuits.map(
+              (circuit) =>
+                `C${panel.circuits.findIndex((item) => item.id === circuit.id) + 1} · ${circuit.name}`,
+            ),
+          })),
+          modules: layout.occupiedModules,
+          cabinetLabel: cabinet.label,
+          material,
+          total:
+            material *
+            (1 + prices.accessoriesPercent / 100) *
+            (1 + prices.assemblyPercent / 100),
+          protection:
+            definition.id === 'residential'
+              ? 'Un grupo común. Destinada a vivienda; no validada para pública concurrencia.'
+              : 'Separación de emergencia. No certifica por sí sola AEA 718 ni un mínimo reglamentario.',
+          continuity: definition.behavior,
+          lines,
+        };
+      },
     );
-    const essentialModules = architectureOccupiedModules(
-      'essential',
-      activePanel.supply,
-      activePanel.circuits,
-      childPanels,
-      includeDps,
-    );
-    const balancedModules = architectureOccupiedModules(
-      'balanced',
-      activePanel.supply,
-      activePanel.circuits,
-      childPanels,
-      includeDps,
-    );
-    const continuityDifferentials = activePanel.circuits.reduce(
-      (total, circuit) =>
-        total +
-        (circuit.phase === '3Φ' ? prices.rcd4P : prices.rcd2P) * differentialFactor,
-      0,
-    );
-    const continuityModules = architectureOccupiedModules(
-      'continuity',
-      activePanel.supply,
-      activePanel.circuits,
-      childPanels,
-      includeDps,
-    );
-
-    const calculateCost = (
-      id: Architecture,
-      title: string,
-      subtitle: string,
-      modules: number,
-      differentialCost: number,
-      protection: string,
-      continuity: string,
-      score: number,
-      rcdLabel: string,
-    ): CostOption => {
-      const cabinet = cabinetFor(
-        Math.ceil(modules * (1 + activePanel.reservePercent / 100)),
-        prices,
-      );
-      const lines: CostLine[] = [
-        { label: `Gabinete DIN (${cabinet.label})`, value: cabinet.value },
-        {
-          label: `${activePanel.type === 'TP' ? 'IGA' : 'Corte local'} ${activePanel.supply === 'tri' ? '4P' : '2P'}`,
-          value: mcbHeadPrice,
-        },
-        { label: `${rcdLabel} · tipo ${differentialType}`, value: differentialCost },
-        { label: `Térmicas de circuitos (${activePanel.circuits.length})`, value: branchMcbPrice },
-      ];
-      if (includeDps) {
-        lines.splice(2, 0, {
-          label: `DPS ${activePanel.supply === 'tri' ? '3P+N' : '1P+N'} transitorias`,
-          value: spdPrice,
-        });
-      }
-      if (feederMcbPrice > 0) {
-        lines.push({
-          label: `Térmicas alimentadores TS (${childPanels.length})`,
-          value: feederMcbPrice,
-        });
-      }
-      const material = lines.reduce((total, line) => total + line.value, 0);
-      const withAccessories = material * (1 + prices.accessoriesPercent / 100);
-      const total = withAccessories * (1 + prices.assemblyPercent / 100);
-      return {
-        id,
-        title,
-        subtitle,
-        modules,
-        cabinetLabel: cabinet.label,
-        material,
-        total,
-        protection,
-        continuity,
-        score,
-        lines,
-      };
-    };
-
-    return [
-      calculateCost(
-        'essential',
-        'Propuesta Esencial',
-        '1 diferencial de cabecera',
-        essentialModules,
-        rcdPrice,
-        'Protección reglamentaria básica.',
-        'Un disparo corta toda la instalación.',
-        68,
-        `1 × Diferencial ${activePanel.supply === 'tri' ? '4P' : '2P'} 30 mA`,
-      ),
-      calculateCost(
-        'balanced',
-        'Propuesta Equilibrada',
-        '2 diferenciales por zonas',
-        balancedModules,
-        rcdPrice * 2,
-        'Excelente protección con separación de fallas.',
-        'Aísla iluminación/tomas del resto de las cargas.',
-        92,
-        `2 × Diferencial ${activePanel.supply === 'tri' ? '4P' : '2P'} 30 mA`,
-      ),
-      calculateCost(
-        'continuity',
-        'Máxima Continuidad',
-        'Diferencial por circuito',
-        continuityModules,
-        continuityDifferentials,
-        'Protección independiente por salida.',
-        'La falla en un circuito no afecta a ningún otro.',
-        98,
-        `${activePanel.circuits.length} × Diferenciales dedicados`,
-      ),
-    ];
   }, [activePanel, panels, prices]);
 
   const selectedCost = useMemo(() => {
@@ -1431,8 +1594,10 @@ export default function Home() {
 
   const recommendedCost = useMemo(() => {
     return isPublicVenue
-      ? costOptions.find((option) => option.id === 'balanced') ?? costOptions[1]
-      : costOptions[0];
+      ? (costOptions.find((option) => option.id === 'balanced') ??
+          costOptions[1])
+      : (costOptions.find((option) => option.id === 'residential') ??
+          costOptions[0]);
   }, [costOptions, isPublicVenue]);
 
   const projectCostSummary = useMemo(() => {
@@ -1443,47 +1608,41 @@ export default function Home() {
               (child) => child.type === 'TS' && child.parentId === panel.id,
             )
           : [];
-      const requiredModules = architectureOccupiedModules(
-        panel.architecture,
-        panel.supply,
-        panel.circuits,
-        children,
-        panelHasDps(panel),
-      );
       const cabinet = cabinetFor(
-        Math.ceil(requiredModules * (1 + panel.reservePercent / 100)),
+        layoutDin(
+          buildPanelDevices(panel, children, 0),
+          panel.modulesPerRow,
+          panel.reservePercent,
+        ).cabinetModules,
         prices,
       );
       const head = panel.supply === 'tri' ? prices.mcb4P : prices.mcb2P;
       const spd = panel.supply === 'tri' ? prices.spd4P : prices.spd2P;
       const typeFactor =
-        panelDifferentialType(panel) === 'A' ? 1 + prices.typeAPremium / 100 : 1;
+        panelDifferentialType(panel) === 'A'
+          ? 1 + prices.typeAPremium / 100
+          : 1;
       const rcd2P = prices.rcd2P * typeFactor;
       const rcd4P = prices.rcd4P * typeFactor;
-      const sharedRcd = (panel.supply === 'tri' ? rcd4P : rcd2P) *
-        (panel.architecture === 'essential' ? 1 : panel.architecture === 'balanced' ? 2 : 0);
-      const individualRcd =
-        panel.architecture === 'continuity'
-          ? panel.circuits.reduce(
-              (total, circuit) => total + (circuit.phase === '3Φ' ? rcd4P : rcd2P),
-              0,
-            )
-          : 0;
+      const differentialCost = differentialGroups(panel).reduce(
+        (sum, group) => sum + (group.span === 4 ? rcd4P : rcd2P),
+        0,
+      );
       const terminalBreakers = panel.circuits.reduce(
         (total, circuit) =>
           total + (circuit.phase === '3Φ' ? prices.mcb4P : prices.mcb2P),
         0,
       );
       const feederBreakers = children.reduce(
-        (total, child) => total + (child.supply === 'tri' ? prices.mcb4P : prices.mcb2P),
+        (total, child) =>
+          total + (child.supply === 'tri' ? prices.mcb4P : prices.mcb2P),
         0,
       );
       const material =
         cabinet.value +
         head +
         (panelHasDps(panel) ? spd : 0) +
-        sharedRcd +
-        individualRcd +
+        differentialCost +
         terminalBreakers +
         feederBreakers;
       const total =
@@ -1500,16 +1659,30 @@ export default function Home() {
   }, [panels, prices]);
 
   const selectedDrivers = useMemo(() => {
-    return [...selectedCost.lines].sort((a, b) => b.value - a.value).slice(0, 4);
+    return [...selectedCost.lines]
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 4);
   }, [selectedCost.lines]);
 
   const complianceItems = useMemo(() => {
     return [
+      ...(isPublicVenue
+        ? [
+            {
+              group: 'Ordenanza 72/83 · III.2.22',
+              label: 'Autonomía de emergencia ≥2 h declarada',
+              ready: emergencyAutonomyDeclared(profile),
+              action: emergencyAutonomyDeclared(profile)
+                ? `${profile.emergencyAutonomyHours} h · ${profile.emergencyEvidence}. Evidencia declarada, no validada.`
+                : 'Faltan duración y referencia de ensayo/ficha. La presencia de EMG no verifica autonomía ni lux.',
+            },
+          ]
+        : []),
       {
         group: 'Municipalidad de San Rafael',
-        label: 'Escala reglamentaria 1:50 o 1:100',
-        ready: true,
-        action: `Escala seleccionada: ${profile.planScale}`,
+        label: 'Plano a escala verificado',
+        ready: false,
+        action: `Escala solicitada: ${profile.planScale}. El selector no genera ni verifica un plano a escala; falta comprobar el plano de planta y la admisibilidad de esa escala.`,
       },
       {
         group: 'Ordenanza 72/83',
@@ -1522,9 +1695,9 @@ export default function Home() {
       },
       {
         group: 'AEA 90364-7-771/718',
-        label: 'Poder de corte ≥ Ik presunta',
+        label: 'Poder de corte declarado ≥ Ik declarada',
         ready: profile.breakingCapacityKa >= profile.prospectiveShortCircuitKa,
-        action: `${profile.breakingCapacityKa} kA adoptado ≥ ${profile.prospectiveShortCircuitKa} kA presunto`,
+        action: `${profile.breakingCapacityKa} kA adoptado / ${profile.prospectiveShortCircuitKa} kA presunto. Comparación de datos ingresados; falta respaldar Ik y la selección del equipo.`,
       },
       {
         group: 'Expediente municipal',
@@ -1551,21 +1724,13 @@ export default function Home() {
           : 'Falta asentar protocolo de medición',
       },
     ];
-  }, [
-    profile.breakingCapacityKa,
-    profile.descriptiveMemoryReady,
-    profile.groundResistanceOhm,
-    profile.planScale,
-    profile.prospectiveShortCircuitKa,
-    profile.registeredProfessionalReady,
-    profile.siteTestReady,
-  ]);
+  }, [profile, isPublicVenue]);
 
   function updateProfile<K extends keyof ProjectProfile>(
     key: K,
     value: ProjectProfile[K],
   ) {
-    setProfile((current) => ({ ...current, [key]: value }));
+    setProfile((current) => normalizeProfile({ ...current, [key]: value }));
   }
 
   function applyPreset(preset: ProjectPreset) {
@@ -1602,7 +1767,7 @@ export default function Home() {
         occupancy: 5,
         evacuation: 'BD1' as EvacuationClass,
         supply: 'mono' as Supply,
-        architecture: 'essential' as Architecture,
+        architecture: 'residential' as Architecture,
         differentialType: 'AC' as DifferentialType,
       },
     }[preset];
@@ -1647,7 +1812,9 @@ export default function Home() {
       }),
     );
     setActivePanelId(tpPanel.id);
-    setOptimizationMessage('Preajuste aplicado al proyecto y al Tablero Principal.');
+    setOptimizationMessage(
+      'Preajuste aplicado al proyecto y al Tablero Principal.',
+    );
   }
 
   function updateCircuit<K extends keyof Circuit>(
@@ -1657,9 +1824,18 @@ export default function Home() {
   ) {
     updateActivePanel(
       'circuits',
-      activePanel.circuits.map((circuit) =>
-        circuit.id === id ? { ...circuit, [key]: value } : circuit,
-      ),
+      activePanel.circuits.map((circuit) => {
+        if (circuit.id !== id) return circuit;
+        const next = { ...circuit, [key]: value };
+        if (
+          (key === 'conductor' || key === 'phase') &&
+          value !== circuit[key] &&
+          next.ampacity?.mode === 'declared'
+        )
+          next.ampacity = { ...next.ampacity, declaredA: 0, basis: '' };
+        next.modules = circuitModuleSpan(next);
+        return next;
+      }),
     );
   }
 
@@ -1672,9 +1848,7 @@ export default function Home() {
     const defaultPhase: Phase =
       activePanel.supply === 'mono'
         ? 'L1'
-        : (['L1', 'L2', 'L3'] as const)[
-            (activePanel.circuits.length) % 3
-          ];
+        : (['L1', 'L2', 'L3'] as const)[activePanel.circuits.length % 3];
 
     const newCircuit: Circuit = {
       id: newId,
@@ -1704,54 +1878,37 @@ export default function Home() {
   }
 
   function optimizeProject() {
-    if (activePanel.supply !== 'tri') {
-      setOptimizationMessage(
-        'En monofásico no hay fases para balancear. Ajustamos protecciones y calibre comercial.',
+    const pending: string[] = [];
+    const balanced = balancePanelCircuits(activePanel, panels);
+    const optimized = balanced.map((circuit, index) => {
+      const current = circuitCurrent(circuit, activePanel.supply);
+      const capacity = conductorAmpacity(
+        circuit.conductor,
+        circuit.phase === '3Φ',
+        circuit.ampacity,
       );
-      updateActivePanel(
-        'circuits',
-        activePanel.circuits.map((circuit) => ({
-          ...circuit,
-          breaker: nextBreaker(circuitCurrent(circuit, 'mono') * 1.15),
-        })),
+      const selected = selectPreliminaryBreaker(
+        current,
+        capacity ?? NaN,
+        circuit.breaker,
       );
-      return;
-    }
-
-    const singlePhaseCircuits = activePanel.circuits
-      .filter((circuit) => circuit.phase !== '3Φ')
-      .sort((a, b) => circuitPower(b) - circuitPower(a));
-    const threePhaseCircuits = activePanel.circuits.filter(
-      (circuit) => circuit.phase === '3Φ',
-    );
-
-    const phaseTotals: Record<'L1' | 'L2' | 'L3', number> = {
-      L1: 0,
-      L2: 0,
-      L3: 0,
-    };
-    const updatedSinglePhase: Circuit[] = [];
-
-    singlePhaseCircuits.forEach((circuit) => {
-      const bestPhase = (['L1', 'L2', 'L3'] as const).reduce((minPhase, phase) =>
-        phaseTotals[phase] < phaseTotals[minPhase] ? phase : minPhase,
-      );
-      const power = circuitPower(circuit);
-      phaseTotals[bestPhase] += power;
-      const current = power / 220;
-      updatedSinglePhase.push({
-        ...circuit,
-        phase: bestPhase,
-        breaker: Math.max(circuit.breaker, nextBreaker(current * 1.15)),
-      });
+      if (selected === null) {
+        pending.push(
+          `C${index + 1}: sin térmica compatible con Ib ${formatNumber(current)} A e Iz preliminar ${capacity ?? 'desconocida'} A; revisar carga y cable`,
+        );
+        return circuit;
+      }
+      return { ...circuit, breaker: selected };
     });
-
-    const optimized = [...updatedSinglePhase, ...threePhaseCircuits].sort(
-      (a, b) => a.id - b.id,
-    );
     updateActivePanel('circuits', optimized);
+    const phaseMessage =
+      activePanel.supply === 'tri'
+        ? activePanel.type === 'TP'
+          ? 'Se revisó el reparto de circuitos propios considerando las cargas de los TS y sus factores de demanda. Las fases de sus alimentadores no se cambiaron.'
+          : 'Se revisó el reparto de fases de este TS.'
+        : 'En monofásico no hay fases para balancear.';
     setOptimizationMessage(
-      'Fases balanceadas y calibres de protección verificados con éxito.',
+      `${phaseMessage} ${pending.length ? `Optimización parcial: ${pending.join('; ')}. Se conservaron sus térmicas para revisión, sin validarlas.` : 'Las térmicas de los circuitos quedan dentro del chequeo preliminar Ib ≤ In ≤ Iz.'} No se modificaron alimentadores ni cables. No verifica selectividad, cortocircuito ni condiciones reales de instalación.`,
     );
   }
 
@@ -1762,7 +1919,16 @@ export default function Home() {
     setActivePanelId('tp');
     setPrices(DEFAULT_PRICES);
     setOptimizationMessage('');
-    window.localStorage.removeItem(STORAGE_KEY);
+    const error = resetStoredProject(() => window.localStorage, {
+      experienceMode,
+      profile: INITIAL_PROFILE,
+      projectName: 'SALÓN · 24 × 10 m',
+      panels: INITIAL_PANELS,
+      activePanelId: 'tp',
+      prices: DEFAULT_PRICES,
+    });
+    setPersistenceError(error);
+    setStorageBlocked(Boolean(error));
   }
 
   // Export JSON
@@ -1799,13 +1965,18 @@ export default function Home() {
         if (!isRecord(data)) throw new Error('Formato raíz inválido');
         const importedPanels = normalizePanels(data.panels);
         if (!importedPanels) {
-          throw new Error('Debe existir exactamente un TP y al menos un tablero válido');
+          throw new Error(
+            'Debe existir exactamente un TP y al menos un tablero válido',
+          );
         }
         if (typeof data.projectName === 'string' && data.projectName.trim()) {
           setProjectName(data.projectName.trim());
         }
         if (data.profile) setProfile(normalizeProfile(data.profile));
-        if (data.experienceMode === 'guided' || data.experienceMode === 'technical') {
+        if (
+          data.experienceMode === 'guided' ||
+          data.experienceMode === 'technical'
+        ) {
           setExperienceMode(data.experienceMode);
         }
         setPanels(importedPanels);
@@ -1816,6 +1987,7 @@ export default function Home() {
         );
         if (data.prices) setPrices(normalizePrices(data.prices));
         setOptimizationMessage('Proyecto importado correctamente.');
+        setStorageBlocked(false);
       } catch (error) {
         alert(
           `Error al leer el proyecto: ${error instanceof Error ? error.message : 'formato inválido'}.`,
@@ -1829,8 +2001,30 @@ export default function Home() {
   // Export CSV
   function exportCircuitsCSV(allPanels = false) {
     const targetPanels = allPanels ? panels : [activePanel];
-    let csv =
-      'Tablero,Clase,ID,Nombre,Tipo,Bocas,VA por Boca,Potencia Total [VA],Fase,Ib [A],Protección In [A],Conductor [mm2],Longitud [m],Caída ΔU [%],Módulos DIN\n';
+    const rows: (string | number)[][] = [
+      [
+        'Tablero',
+        'Clase',
+        'ID',
+        'Nombre',
+        'Tipo',
+        'Bocas',
+        'VA por boca',
+        'Potencia [VA]',
+        'Fase',
+        'Ib [A]',
+        'Protección In [A]',
+        'Conductor [mm²]',
+        'Longitud [m]',
+        'Caída tramo [%]',
+        'Caída total estimada [%]',
+        'Módulos DIN',
+        'FP declarado',
+        'P instalada [W]',
+        'Cañería declarada',
+      ],
+    ];
+    const rounded = (value: number) => Number(value.toFixed(2));
 
     targetPanels.forEach((panel) => {
       if (panel.type === 'TP') {
@@ -1838,18 +2032,66 @@ export default function Home() {
           .filter((child) => child.type === 'TS' && child.parentId === panel.id)
           .forEach((child, index) => {
             const childCalculation = panelCalculations.get(child.id);
-            csv += `"${panel.name}",Alimentador,A${index + 1},"${child.name}",TS,,,${childCalculation?.demandVA.toFixed(0) ?? 0},${child.feederPhase ?? (child.supply === 'tri' ? '3Φ' : 'L1')},${childCalculation?.mainCurrent.toFixed(2) ?? 0},${child.feederBreaker ?? 32},${child.feederConductor ?? 6},${child.feederLengthM ?? 15},${childCalculation?.feederDrop.percent.toFixed(2) ?? 0},${child.supply === 'tri' ? 4 : 2}\n`;
+            const drop = rounded(childCalculation?.feederDrop.percent ?? 0);
+            rows.push([
+              panel.name,
+              'Alimentador (demanda)',
+              `A${index + 1}`,
+              child.name,
+              'TS',
+              '',
+              '',
+              rounded(childCalculation?.demandVA ?? 0),
+              child.supply === 'tri' ? '3Φ' : (child.feederPhase ?? 'L1'),
+              rounded(childCalculation?.mainCurrent ?? 0),
+              child.feederBreaker ?? 32,
+              child.feederConductor ?? 6,
+              child.feederLengthM ?? 15,
+              drop,
+              drop,
+              child.supply === 'tri' ? 4 : 2,
+              '',
+              rounded(childCalculation?.activeInstalledW ?? 0),
+              child.feederConduit ?? '',
+            ]);
           });
       }
       panel.circuits.forEach((c, index) => {
         const power = circuitPower(c);
         const current = circuitCurrent(c, panel.supply);
         const drop = voltageDrop(c, panel.supply);
-        csv += `"${panel.name}",Circuito terminal,C${index + 1},"${c.name}",${c.kind},${c.points},${c.unitVA},${power},${c.phase},${current.toFixed(2)},${c.breaker},${c.conductor},${c.lengthM},${drop.percent.toFixed(2)},${c.modules}\n`;
+        const totalDrop =
+          drop.percent +
+          (panel.type === 'TS'
+            ? (panelCalculations.get(panel.id)?.feederDrop.percent ?? 0)
+            : 0);
+        rows.push([
+          panel.name,
+          'Circuito terminal (instalada)',
+          `C${index + 1}`,
+          c.name,
+          c.kind,
+          c.points,
+          c.unitVA,
+          power,
+          c.phase,
+          rounded(current),
+          c.breaker,
+          c.conductor,
+          c.lengthM,
+          rounded(drop.percent),
+          rounded(totalDrop),
+          circuitModuleSpan(c),
+          c.powerFactor,
+          rounded(activePower(c)),
+          c.conduit ?? '',
+        ]);
       });
     });
 
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const blob = new Blob([toExcelCsv(rows)], {
+      type: 'text/csv;charset=utf-8;',
+    });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -1866,105 +2108,15 @@ export default function Home() {
       : [];
   }, [activePanel.id, activePanel.type, panels]);
 
-  const devices = useMemo(() => {
-    const headerDevices: PanelDevice[] = [
-      {
-        key: 'cabecera',
-        label: activePanel.type === 'TP' ? 'IGA' : 'CORTE',
-        fullName:
-          activePanel.type === 'TP'
-            ? 'Interruptor General Automático'
-            : 'Interruptor de corte local',
-        detail: `${calculations.mainBreaker} A`,
-        span: activePanel.supply === 'tri' ? 4 : 2,
-        className: 'device-main',
-      },
-    ];
-    if (panelHasDps(activePanel)) {
-      headerDevices.push({
-        key: 'spd',
-        label: 'DPS',
-        fullName: 'Protección contra sobretensiones',
-        detail: activePanel.supply === 'tri' ? '3P+N' : '1P+N',
-        span: activePanel.supply === 'tri' ? 4 : 2,
-        className: 'device-spd',
-      });
-    }
-    const differentialDevices: PanelDevice[] = [];
-    if (activePanel.architecture === 'essential') {
-      differentialDevices.push({
-        key: 'diff',
-        label: 'ID',
-        fullName: 'Interruptor Diferencial',
-        detail: `General · 30 mA · ${panelDifferentialType(activePanel)}`,
-        span: activePanel.supply === 'tri' ? 4 : 2,
-        className: 'device-rcd',
-      });
-    }
-    if (activePanel.architecture === 'balanced') {
-      differentialDevices.push(
-        {
-          key: 'diff-a',
-          label: 'ID A',
-          fullName: 'Interruptor Diferencial',
-          detail: `Uso normal · 30 mA · ${panelDifferentialType(activePanel)}`,
-          span: activePanel.supply === 'tri' ? 4 : 2,
-          className: 'device-rcd',
-        },
-        {
-          key: 'diff-b',
-          label: 'ID B',
-          fullName: 'Interruptor Diferencial',
-          detail: `Uso crítico · 30 mA · ${panelDifferentialType(activePanel)}`,
-          span: activePanel.supply === 'tri' ? 4 : 2,
-          className: 'device-rcd',
-        },
-      );
-    }
+  const devices = useMemo(
+    () => buildPanelDevices(activePanel, childPanels, calculations.mainBreaker),
+    [activePanel, calculations.mainBreaker, childPanels],
+  );
 
-    // If active panel is TP, display feeder breakers for child TS panels!
-    const feederDevices: PanelDevice[] = childPanels.map((child, idx) => ({
-      key: `feeder-${child.id}`,
-      label: `Alim. TS${idx + 1}`,
-      fullName: `Alimentador a ${child.name}`,
-      detail: `${child.feederBreaker ?? 32} A · ${child.supply === 'tri' ? '4P' : `2P ${child.feederPhase ?? 'L1'}`}`,
-      span: child.supply === 'tri' ? 4 : 2,
-      className: 'device-feeder',
-    }));
-
-    return [
-      ...headerDevices,
-      ...feederDevices,
-      ...differentialDevices,
-      ...activePanel.circuits.map((circuit, index) => ({
-        key: `circuit-${circuit.id}`,
-        circuitId: circuit.id,
-        label:
-          activePanel.architecture === 'continuity'
-            ? `C${index + 1} + ID`
-            : `C${index + 1}`,
-        fullName:
-          circuit.kind === 'EMG'
-            ? 'Térmica · Emergencia'
-            : `Térmica · ${circuit.kind}`,
-        detail:
-          activePanel.architecture === 'continuity'
-            ? `${circuit.breaker} A · 30 mA`
-            : `${circuit.breaker} A`,
-        span:
-          circuit.modules +
-          (activePanel.architecture === 'continuity'
-            ? circuit.phase === '3Φ'
-              ? 4
-              : 2
-            : 0),
-        className:
-          circuit.kind === 'EMG' ? 'device-emergency' : 'device-circuit',
-      })),
-    ];
-  }, [activePanel, calculations.mainBreaker, childPanels]);
-
-  const activeHighlightedCircuitId = selectedCircuitId ?? hoveredCircuitId;
+  const activeHighlightedCircuitId = highlightedCircuit(
+    hoveredCircuitId,
+    selectedCircuitId,
+  );
 
   return (
     <main className="min-h-screen bg-background text-foreground">
@@ -2023,10 +2175,10 @@ export default function Home() {
               size="sm"
               className="text-slate-300 hover:bg-white/10 hover:text-white"
               onClick={() => exportCircuitsCSV(true)}
-              title="Descargar todos los tableros y circuitos en CSV"
+              title="Descargar todos los tableros y circuitos en CSV para Excel es-AR (punto y coma, coma decimal)"
             >
               <FileSpreadsheet data-icon="inline-start" />
-              <span className="hidden sm:inline">CSV proyecto</span>
+              <span className="hidden sm:inline">CSV · Excel es-AR</span>
             </Button>
             <Button
               variant="ghost"
@@ -2050,6 +2202,14 @@ export default function Home() {
       </header>
 
       <section className="print-sheet mx-auto flex max-w-[1680px] flex-col px-4 py-5 print:hidden lg:px-6">
+        {persistenceError && (
+          <p
+            role="alert"
+            className="mb-4 rounded-xl border border-amber-400 bg-amber-50 p-4 text-sm text-amber-950"
+          >
+            {persistenceError}
+          </p>
+        )}
         {/* Print Header */}
         <div className="mb-4 hidden items-start justify-between border-b-2 border-slate-900 pb-3 print:flex">
           <div>
@@ -2058,7 +2218,11 @@ export default function Home() {
             </p>
             <h1 className="text-2xl font-bold">{projectName}</h1>
             <p className="mt-1 font-mono text-sm font-semibold text-slate-800">
-              {activePanel.name} ({activePanel.type === 'TP' ? 'Tablero Principal' : 'Tablero Seccional'})
+              {activePanel.name} (
+              {activePanel.type === 'TP'
+                ? 'Tablero Principal'
+                : 'Tablero Seccional'}
+              )
             </p>
           </div>
           <div className="text-right text-xs">
@@ -2079,7 +2243,8 @@ export default function Home() {
                   Arquitectura de distribución
                 </p>
                 <h2 className="text-sm font-semibold sm:text-base">
-                  Jerarquía de Tableros: Acometida → {panels.length} Tablero{panels.length > 1 ? 's' : ''}
+                  Jerarquía de Tableros: Acometida → {panels.length} Tablero
+                  {panels.length > 1 ? 's' : ''}
                 </h2>
               </div>
             </div>
@@ -2087,11 +2252,15 @@ export default function Home() {
             <div className="flex flex-wrap items-center gap-3 text-xs">
               <div className="rounded-lg bg-white/5 px-3 py-1.5 font-mono">
                 <span className="text-slate-400">Demanda global:</span>{' '}
-                <strong className="text-amber-300">{formatPower(globalSummary.totalDemandVA)}</strong>
+                <strong className="text-amber-300">
+                  {formatPower(globalSummary.totalDemandVA)}
+                </strong>
               </div>
               <div className="rounded-lg bg-white/5 px-3 py-1.5 font-mono">
                 <span className="text-slate-400">Potencia total:</span>{' '}
-                <strong className="text-slate-200">{formatPower(globalSummary.totalInstalledVA)}</strong>
+                <strong className="text-slate-200">
+                  {formatPower(globalSummary.totalInstalledVA)}
+                </strong>
               </div>
               <Button
                 size="sm"
@@ -2120,13 +2289,20 @@ export default function Home() {
                 >
                   <button
                     type="button"
-                    onClick={() => setActivePanelId(p.id)}
+                    onClick={() => {
+                      setActivePanelId(p.id);
+                      setOptimizationMessage('');
+                    }}
                     className="flex items-center gap-2.5 px-3.5 py-2 text-left"
                   >
-                    <Layers className={`size-4 ${isActive ? 'text-slate-950' : 'text-amber-400'}`} />
+                    <Layers
+                      className={`size-4 ${isActive ? 'text-slate-950' : 'text-amber-400'}`}
+                    />
                     <div>
                       <div className="flex items-center gap-1.5">
-                        <span className="font-mono text-xs font-bold">{p.name}</span>
+                        <span className="font-mono text-xs font-bold">
+                          {p.name}
+                        </span>
                         <span
                           className={`rounded px-1 text-[9px] font-bold ${
                             isActive
@@ -2138,8 +2314,12 @@ export default function Home() {
                         </span>
                       </div>
                       {calc && (
-                        <p className={`font-mono text-[10px] ${isActive ? 'text-slate-800' : 'text-slate-400'}`}>
-                          {formatPower(calc.demandVA)} · {calc.mainCurrent.toFixed(1)} A · {calc.occupiedModules} M
+                        <p
+                          className={`font-mono text-[10px] ${isActive ? 'text-slate-800' : 'text-slate-400'}`}
+                        >
+                          {formatPower(calc.demandVA)} ·{' '}
+                          {calc.mainCurrent.toFixed(1)} A ·{' '}
+                          {calc.occupiedModules} M
                         </p>
                       )}
                     </div>
@@ -2173,7 +2353,8 @@ export default function Home() {
                         }`}
                         onClick={(e) => {
                           e.stopPropagation();
-                          if (confirm(`¿Eliminar ${p.name}?`)) deletePanel(p.id);
+                          if (confirm(`¿Eliminar ${p.name}?`))
+                            deletePanel(p.id);
                         }}
                         title="Eliminar este tablero seccional"
                       >
@@ -2197,9 +2378,12 @@ export default function Home() {
                   Definir proyecto general
                 </p>
               </div>
-              <h2 className="mt-1 text-lg font-semibold">Del ambiente al tablero en pocos datos</h2>
+              <h2 className="mt-1 text-lg font-semibold">
+                Del ambiente al tablero en pocos datos
+              </h2>
               <p className="mt-1 text-xs text-slate-400">
-                Elegí una base, corregí dimensiones y ocupación; después ajustá los circuitos reales.
+                Elegí una base, corregí dimensiones y ocupación; después ajustá
+                los circuitos reales.
               </p>
             </div>
             <div className="flex rounded-lg border border-white/15 bg-white/5 p-1">
@@ -2266,7 +2450,10 @@ export default function Home() {
 
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8">
               <div className="space-y-1.5 sm:col-span-2">
-                <Label htmlFor="quick-project-name" className="text-xs text-muted-foreground">
+                <Label
+                  htmlFor="quick-project-name"
+                  className="text-xs text-muted-foreground"
+                >
                   Nombre del proyecto
                 </Label>
                 <Input
@@ -2298,18 +2485,26 @@ export default function Home() {
                 onChange={(value) => updateProfile('occupancy', value)}
               />
               <div className="space-y-1.5">
-                <Label htmlFor="active-panel-name" className="text-xs text-muted-foreground">
+                <Label
+                  htmlFor="active-panel-name"
+                  className="text-xs text-muted-foreground"
+                >
                   Nombre del Tablero
                 </Label>
                 <Input
                   id="active-panel-name"
                   value={activePanel.name}
-                  onChange={(event) => updateActivePanel('name', event.target.value)}
+                  onChange={(event) =>
+                    updateActivePanel('name', event.target.value)
+                  }
                   className="font-medium"
                 />
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor="quick-supply" className="text-xs text-muted-foreground">
+                <Label
+                  htmlFor="quick-supply"
+                  className="text-xs text-muted-foreground"
+                >
                   Suministro ({activePanel.type})
                 </Label>
                 <NativeSelect
@@ -2321,10 +2516,14 @@ export default function Home() {
                     changePanelSupply(activePanel.id, nextSupply);
                   }}
                 >
-                  <NativeSelectOption value="mono">220 V mono</NativeSelectOption>
+                  <NativeSelectOption value="mono">
+                    220 V mono
+                  </NativeSelectOption>
                   <NativeSelectOption
                     value="tri"
-                    disabled={activePanel.type === 'TS' && tpPanel.supply === 'mono'}
+                    disabled={
+                      activePanel.type === 'TS' && tpPanel.supply === 'mono'
+                    }
                   >
                     380/220 V tri
                   </NativeSelectOption>
@@ -2334,7 +2533,9 @@ export default function Home() {
                 <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
                   Superficie
                 </p>
-                <p className="mt-1 font-mono text-lg font-bold">{projectArea.toFixed(0)} m²</p>
+                <p className="mt-1 font-mono text-lg font-bold">
+                  {projectArea.toFixed(0)} m²
+                </p>
                 <p className="mt-0.5 text-[10px] text-muted-foreground">
                   {areaPerPerson.toFixed(2)} m²/persona
                 </p>
@@ -2349,15 +2550,18 @@ export default function Home() {
                     <ArrowDownRight className="size-4 text-sky-700" />
                     <div>
                       <p className="text-xs font-bold uppercase tracking-wide text-sky-900">
-                        Línea Seccional (Alimentador desde TP hacia {activePanel.name})
+                        Línea Seccional (Alimentador desde TP hacia{' '}
+                        {activePanel.name})
                       </p>
                       <p className="text-[10px] text-sky-800/80">
-                        Configuración del cable y de la térmica que lo protege dentro del Tablero Principal.
+                        Configuración del cable y de la térmica que lo protege
+                        dentro del Tablero Principal.
                       </p>
                     </div>
                   </div>
                   <Badge className="border-sky-300 bg-white text-sky-900">
-                    ΔV Alimentador: {calculations.feederDrop.percent.toFixed(2)} % ({calculations.feederDrop.volts.toFixed(1)} V)
+                    ΔV Alimentador: {calculations.feederDrop.percent.toFixed(2)}{' '}
+                    % ({calculations.feederDrop.volts.toFixed(1)} V)
                   </Badge>
                 </div>
                 <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -2369,15 +2573,22 @@ export default function Home() {
                     onChange={(val) => updateActivePanel('feederLengthM', val)}
                   />
                   <div className="space-y-1.5">
-                    <Label className="text-xs text-muted-foreground">Sección alimentador</Label>
+                    <Label className="text-xs text-muted-foreground">
+                      Sección alimentador
+                    </Label>
                     <NativeSelect
                       className="w-full bg-white"
                       value={activePanel.feederConductor ?? 6}
-                      onChange={(e) => updateActivePanel('feederConductor', Number(e.target.value))}
+                      onChange={(e) =>
+                        updateActivePanel(
+                          'feederConductor',
+                          Number(e.target.value),
+                        )
+                      }
                     >
                       {[4, 6, 10, 16, 25, 35].map((val) => (
                         <NativeSelectOption key={val} value={val}>
-                          {val} mm² ({CONDUCTOR_CAPACITY[val]} A máx)
+                          {val} mm²
                         </NativeSelectOption>
                       ))}
                     </NativeSelect>
@@ -2389,7 +2600,12 @@ export default function Home() {
                     <NativeSelect
                       className="w-full bg-white"
                       value={activePanel.feederBreaker ?? 32}
-                      onChange={(e) => updateActivePanel('feederBreaker', Number(e.target.value))}
+                      onChange={(e) =>
+                        updateActivePanel(
+                          'feederBreaker',
+                          Number(e.target.value),
+                        )
+                      }
                     >
                       {STANDARD_BREAKERS.map((val) => (
                         <NativeSelectOption key={val} value={val}>
@@ -2399,19 +2615,35 @@ export default function Home() {
                     </NativeSelect>
                   </div>
                   <div className="space-y-1.5">
-                    <Label className="text-xs text-muted-foreground">Fase tomada del TP</Label>
+                    <Label className="text-xs text-muted-foreground">
+                      Fase tomada del TP
+                    </Label>
                     <NativeSelect
                       className="w-full bg-white"
-                      value={activePanel.supply === 'tri' ? '3Φ' : activePanel.feederPhase ?? 'L1'}
-                      disabled={activePanel.supply === 'tri' || tpPanel.supply === 'mono'}
+                      value={
+                        activePanel.supply === 'tri'
+                          ? '3Φ'
+                          : (activePanel.feederPhase ?? 'L1')
+                      }
+                      disabled={
+                        activePanel.supply === 'tri' ||
+                        tpPanel.supply === 'mono'
+                      }
                       onChange={(event) =>
-                        updateActivePanel('feederPhase', event.target.value as Phase)
+                        updateActivePanel(
+                          'feederPhase',
+                          event.target.value as Phase,
+                        )
                       }
                     >
                       {activePanel.supply === 'tri' ? (
-                        <NativeSelectOption value="3Φ">L1 + L2 + L3</NativeSelectOption>
+                        <NativeSelectOption value="3Φ">
+                          L1 + L2 + L3
+                        </NativeSelectOption>
                       ) : tpPanel.supply === 'mono' ? (
-                        <NativeSelectOption value="L1">L1 del TP monofásico</NativeSelectOption>
+                        <NativeSelectOption value="L1">
+                          L1 del TP monofásico
+                        </NativeSelectOption>
                       ) : (
                         <>
                           <NativeSelectOption value="L1">L1</NativeSelectOption>
@@ -2427,18 +2659,49 @@ export default function Home() {
           </div>
         </section>
 
+        {activePanel.type === 'TS' && (
+          <section className="mb-5 rounded-2xl border bg-card p-4">
+            <h3 className="mb-3 font-semibold">Condiciones del alimentador</h3>
+            <AmpacityEditor
+              section={activePanel.feederConductor ?? 6}
+              threeLoaded={activePanel.supply === 'tri'}
+              settings={activePanel.feederAmpacity}
+              onChange={(value) => updateActivePanel('feederAmpacity', value)}
+            />
+            <label htmlFor="feeder-conduit" className="mt-3 block text-xs">
+              Cañería del alimentador: material, diámetro y referencia
+              <Input
+                id="feeder-conduit"
+                className="mt-1"
+                value={activePanel.feederConduit ?? ''}
+                placeholder="Pendiente de dimensionar; no se deduce de la corriente"
+                maxLength={500}
+                onChange={(e) =>
+                  updateActivePanel('feederConduit', e.target.value)
+                }
+              />
+            </label>
+          </section>
+        )}
+
         {/* Technical parameters for active panel */}
         {experienceMode === 'technical' && (
           <div className="print-hide mb-5 grid gap-3 rounded-2xl border bg-card p-4 shadow-sm lg:grid-cols-3 xl:grid-cols-[minmax(240px,1.3fr)_repeat(6,minmax(110px,.55fr))]">
             <div className="space-y-1.5">
-              <Label htmlFor="panel-select-tech" className="text-xs text-muted-foreground">
+              <Label
+                htmlFor="panel-select-tech"
+                className="text-xs text-muted-foreground"
+              >
                 Tablero activo
               </Label>
               <NativeSelect
                 id="panel-select-tech"
                 className="w-full font-medium"
                 value={activePanel.id}
-                onChange={(e) => setActivePanelId(e.target.value)}
+                onChange={(e) => {
+                  setActivePanelId(e.target.value);
+                  setOptimizationMessage('');
+                }}
               >
                 {panels.map((p) => (
                   <NativeSelectOption key={p.id} value={p.id}>
@@ -2448,25 +2711,32 @@ export default function Home() {
               </NativeSelect>
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="supply-tech" className="text-xs text-muted-foreground">
+              <Label
+                htmlFor="supply-tech"
+                className="text-xs text-muted-foreground"
+              >
                 Suministro
               </Label>
               <NativeSelect
                 id="supply-tech"
                 className="w-full"
-                  value={activePanel.supply}
-                  onChange={(event) => {
-                    const nextSupply = event.target.value as Supply;
-                    changePanelSupply(activePanel.id, nextSupply);
-                  }}
+                value={activePanel.supply}
+                onChange={(event) => {
+                  const nextSupply = event.target.value as Supply;
+                  changePanelSupply(activePanel.id, nextSupply);
+                }}
+              >
+                <NativeSelectOption value="mono">
+                  Monofásico · 220 V
+                </NativeSelectOption>
+                <NativeSelectOption
+                  value="tri"
+                  disabled={
+                    activePanel.type === 'TS' && tpPanel.supply === 'mono'
+                  }
                 >
-                  <NativeSelectOption value="mono">Monofásico · 220 V</NativeSelectOption>
-                  <NativeSelectOption
-                    value="tri"
-                    disabled={activePanel.type === 'TS' && tpPanel.supply === 'mono'}
-                  >
-                    Trifásico · 380/220 V
-                  </NativeSelectOption>
+                  Trifásico · 380/220 V
+                </NativeSelectOption>
               </NativeSelect>
             </div>
             <div className="space-y-1.5">
@@ -2480,21 +2750,31 @@ export default function Home() {
                 max="1"
                 step="0.05"
                 value={activePanel.demandFactor}
-                onChange={(event) => updateActivePanel('demandFactor', Number(event.target.value))}
+                onChange={(event) =>
+                  updateActivePanel('demandFactor', Number(event.target.value))
+                }
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="reserve" className="text-xs text-muted-foreground">
-                Reserva modular
+              <Label
+                htmlFor="reserve"
+                className="text-xs text-muted-foreground"
+              >
+                Reserva sobre capacidad total
               </Label>
               <div className="relative">
                 <Input
                   id="reserve"
                   type="number"
-                  min="0"
-                  max="100"
+                  min="20"
+                  max="80"
                   value={activePanel.reservePercent}
-                  onChange={(event) => updateActivePanel('reservePercent', Number(event.target.value))}
+                  onChange={(event) =>
+                    updateActivePanel(
+                      'reservePercent',
+                      Number(event.target.value),
+                    )
+                  }
                   className="pr-8"
                 />
                 <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">
@@ -2503,16 +2783,21 @@ export default function Home() {
               </div>
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="modules-row" className="text-xs text-muted-foreground">
+              <Label
+                htmlFor="modules-row"
+                className="text-xs text-muted-foreground"
+              >
                 Módulos por fila
               </Label>
               <NativeSelect
                 id="modules-row"
                 className="w-full"
                 value={activePanel.modulesPerRow}
-                onChange={(event) => updateActivePanel('modulesPerRow', Number(event.target.value))}
+                onChange={(event) =>
+                  updateActivePanel('modulesPerRow', Number(event.target.value))
+                }
               >
-                {[12, 18, 24].map((value) => (
+                {[12, 16, 18, 24].map((value) => (
                   <NativeSelectOption key={value} value={value}>
                     {value} módulos
                   </NativeSelectOption>
@@ -2520,21 +2805,29 @@ export default function Home() {
               </NativeSelect>
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="dps-local" className="text-xs text-muted-foreground">
+              <Label
+                htmlFor="dps-local"
+                className="text-xs text-muted-foreground"
+              >
                 DPS en este tablero
               </Label>
               <NativeSelect
                 id="dps-local"
                 className="w-full"
                 value={panelHasDps(activePanel) ? 'yes' : 'no'}
-                onChange={(event) => updateActivePanel('includeDps', event.target.value === 'yes')}
+                onChange={(event) =>
+                  updateActivePanel('includeDps', event.target.value === 'yes')
+                }
               >
                 <NativeSelectOption value="yes">Incluido</NativeSelectOption>
                 <NativeSelectOption value="no">No incluido</NativeSelectOption>
               </NativeSelect>
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="differential-type" className="text-xs text-muted-foreground">
+              <Label
+                htmlFor="differential-type"
+                className="text-xs text-muted-foreground"
+              >
                 Tipo diferencial
               </Label>
               <NativeSelect
@@ -2542,7 +2835,10 @@ export default function Home() {
                 className="w-full"
                 value={panelDifferentialType(activePanel)}
                 onChange={(event) =>
-                  updateActivePanel('differentialType', event.target.value as DifferentialType)
+                  updateActivePanel(
+                    'differentialType',
+                    event.target.value as DifferentialType,
+                  )
                 }
               >
                 <NativeSelectOption value="AC">Tipo AC</NativeSelectOption>
@@ -2552,7 +2848,93 @@ export default function Home() {
           </div>
         )}
 
+        <section className="mb-5 rounded-2xl border bg-card p-4 shadow-sm">
+          <Label
+            htmlFor="architecture-choice"
+            className="text-base font-semibold"
+          >
+            Arquitectura de diferenciales · {activePanel.name}
+          </Label>
+          <NativeSelect
+            id="architecture-choice"
+            className="mt-3 w-full"
+            value={activePanel.architecture}
+            onChange={(event) =>
+              updateActivePanel(
+                'architecture',
+                event.target.value as Architecture,
+              )
+            }
+          >
+            {costOptions
+              .filter((option) => option.id !== 'continuity')
+              .map((option) => (
+                <NativeSelectOption key={option.id} value={option.id}>
+                  {option.title} · {option.differentialCount} disyuntor
+                  {option.differentialCount === 1 ? '' : 'es'}
+                </NativeSelectOption>
+              ))}
+            {activePanel.architecture === 'continuity' && (
+              <NativeSelectOption value="continuity">
+                Legado · ID por circuito (conservado)
+              </NativeSelectOption>
+            )}
+          </NativeSelect>
+          <p className="mt-3 text-sm font-semibold">
+            {selectedCost.differentialCount} diferenciales en este tablero ·{' '}
+            {panels.reduce(
+              (sum, panel) => sum + differentialGroups(panel).length,
+              0,
+            )}{' '}
+            en el proyecto
+          </p>
+          <p className="mt-1 text-sm">{selectedCost.continuity}</p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            {selectedCost.groups.map((group) => (
+              <span
+                key={group.label}
+                className="rounded-lg border bg-muted/40 px-3 py-2 text-xs"
+              >
+                <strong>{group.label}:</strong>{' '}
+                {group.circuits.join(' · ') || 'reservado, sin circuitos'}
+              </span>
+            ))}
+          </div>
+          <p className="mt-3 text-xs text-muted-foreground">
+            La elección corresponde a este tablero, no reemplaza las opciones de
+            los demás TP/TS. Grupos reservados incluidos en módulos y precio.
+            Sin circuitos propios: 0 ID terminales; la protección del
+            alimentador se verifica aparte. Asignación según tipo
+            IUG/TUG/TUE/FM/EMG, no según nombre.
+          </p>
+          {isPublicVenue && activePanel.architecture === 'residential' && (
+            <p
+              role="alert"
+              className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm font-semibold text-amber-950"
+            >
+              Atención: opción domiciliaria en salón de pública concurrencia. Un
+              único ID corta también la emergencia si está conectada al tablero.
+              Elegí una arquitectura con EMG independiente y verificá el
+              proyecto; esta opción no se presenta como cumplimiento AEA 718.
+            </p>
+          )}
+          {activePanel.architecture === 'continuity' && (
+            <p className="mt-3 text-xs text-amber-800">
+              Configuración anterior conservada sin quitar equipos. Elegir una
+              de las tres opciones reemplazará la agrupación de este tablero.
+            </p>
+          )}
+        </section>
+
         {/* Panel Metrics */}
+        <p className="mb-3 text-sm text-muted-foreground">
+          Potencia activa instalada estimada:{' '}
+          <strong className="text-foreground">
+            {formatNumber(calculations.activeInstalledW / 1000, 2)} kW
+          </strong>{' '}
+          · Según el factor de potencia declarado; no es una medición ni reduce
+          Ib.
+        </p>
         <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
           <Metric
             label={`Potencia (${activePanel.name})`}
@@ -2567,7 +2949,11 @@ export default function Home() {
             value={`${calculations.mainCurrent.toFixed(1)} A`}
           />
           <Metric
-            label={activePanel.type === 'TP' ? 'IGA sugerido' : 'Corte local sugerido'}
+            label={
+              activePanel.type === 'TP'
+                ? 'IGA sugerido'
+                : 'Corte local sugerido'
+            }
             value={`${calculations.mainBreaker} A`}
             emphasis
           />
@@ -2589,11 +2975,16 @@ export default function Home() {
               <div>
                 <div className="flex items-center gap-2">
                   <Zap className="size-4 text-amber-500" />
-                  <h2 className="font-semibold">Circuitos de {activePanel.name}</h2>
-                  <Badge variant="secondary">{activePanel.circuits.length}</Badge>
+                  <h2 className="font-semibold">
+                    Circuitos de {activePanel.name}
+                  </h2>
+                  <Badge variant="secondary">
+                    {activePanel.circuits.length}
+                  </Badge>
                 </div>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  Pasa el ratón sobre cualquier circuito para resaltarlo en el Riel DIN y el esquema unifilar.
+                  Pasa el ratón sobre cualquier circuito para resaltarlo en el
+                  Riel DIN y el esquema unifilar.
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-1.5">
@@ -2602,7 +2993,8 @@ export default function Home() {
                   size="sm"
                   onClick={optimizeProject}
                 >
-                  <Sparkles data-icon="inline-start" /> Optimizar fases
+                  <Sparkles data-icon="inline-start" /> Optimizar fases y
+                  térmicas
                 </Button>
                 {(Object.keys(TEMPLATES) as CircuitKind[]).map((kind) => (
                   <Button
@@ -2621,7 +3013,9 @@ export default function Home() {
             <div className="overflow-x-auto">
               <table
                 className={`circuit-table w-full text-left text-sm ${
-                  experienceMode === 'technical' ? 'min-w-[1160px]' : 'min-w-[980px]'
+                  experienceMode === 'technical'
+                    ? 'min-w-[1160px]'
+                    : 'min-w-[980px]'
                 }`}
               >
                 <thead>
@@ -2649,11 +3043,14 @@ export default function Home() {
                 </thead>
                 <tbody>
                   {activePanel.circuits.map((circuit, index) => {
-                    const isHighlighted = activeHighlightedCircuitId === circuit.id;
+                    const isHighlighted =
+                      activeHighlightedCircuitId === circuit.id;
                     const cDrop = voltageDrop(circuit, activePanel.supply);
                     const totalDropPercent =
                       cDrop.percent +
-                      (activePanel.type === 'TS' ? calculations.feederDrop.percent : 0);
+                      (activePanel.type === 'TS'
+                        ? calculations.feederDrop.percent
+                        : 0);
 
                     return (
                       <tr
@@ -2685,7 +3082,11 @@ export default function Home() {
                             <Input
                               value={circuit.name}
                               onChange={(event) =>
-                                updateCircuit(circuit.id, 'name', event.target.value)
+                                updateCircuit(
+                                  circuit.id,
+                                  'name',
+                                  event.target.value,
+                                )
                               }
                               className="border-transparent bg-transparent px-1 font-medium shadow-none hover:border-input focus-visible:bg-background"
                             />
@@ -2696,28 +3097,38 @@ export default function Home() {
                             size="sm"
                             value={circuit.kind}
                             onChange={(event) =>
-                              updateCircuit(circuit.id, 'kind', event.target.value as CircuitKind)
+                              updateCircuit(
+                                circuit.id,
+                                'kind',
+                                event.target.value as CircuitKind,
+                              )
                             }
                           >
-                            {(Object.keys(TEMPLATES) as CircuitKind[]).map((kind) => (
-                              <NativeSelectOption key={kind} value={kind}>
-                                {kind}
-                              </NativeSelectOption>
-                            ))}
+                            {(Object.keys(TEMPLATES) as CircuitKind[]).map(
+                              (kind) => (
+                                <NativeSelectOption key={kind} value={kind}>
+                                  {kind}
+                                </NativeSelectOption>
+                              ),
+                            )}
                           </NativeSelect>
                         </td>
                         <td className="px-2 py-2">
                           <CompactNumber
                             value={circuit.points}
                             min={1}
-                            onChange={(value) => updateCircuit(circuit.id, 'points', value)}
+                            onChange={(value) =>
+                              updateCircuit(circuit.id, 'points', value)
+                            }
                           />
                         </td>
                         <td className="px-2 py-2">
                           <CompactNumber
                             value={circuit.unitVA}
                             min={1}
-                            onChange={(value) => updateCircuit(circuit.id, 'unitVA', value)}
+                            onChange={(value) =>
+                              updateCircuit(circuit.id, 'unitVA', value)
+                            }
                           />
                         </td>
                         <td className="px-2 py-2 text-right font-mono text-xs font-semibold">
@@ -2726,24 +3137,43 @@ export default function Home() {
                         <td className="px-2 py-2">
                           <NativeSelect
                             size="sm"
-                            value={activePanel.supply === 'mono' ? 'L1' : circuit.phase}
+                            value={
+                              activePanel.supply === 'mono'
+                                ? 'L1'
+                                : circuit.phase
+                            }
                             disabled={activePanel.supply === 'mono'}
                             onChange={(event) =>
-                              updateCircuit(circuit.id, 'phase', event.target.value as Phase)
+                              updateCircuit(
+                                circuit.id,
+                                'phase',
+                                event.target.value as Phase,
+                              )
                             }
                           >
-                            <NativeSelectOption value="L1">L1</NativeSelectOption>
+                            <NativeSelectOption value="L1">
+                              L1
+                            </NativeSelectOption>
                             {activePanel.supply === 'tri' && (
                               <>
-                                <NativeSelectOption value="L2">L2</NativeSelectOption>
-                                <NativeSelectOption value="L3">L3</NativeSelectOption>
-                                <NativeSelectOption value="3Φ">3Φ</NativeSelectOption>
+                                <NativeSelectOption value="L2">
+                                  L2
+                                </NativeSelectOption>
+                                <NativeSelectOption value="L3">
+                                  L3
+                                </NativeSelectOption>
+                                <NativeSelectOption value="3Φ">
+                                  3Φ
+                                </NativeSelectOption>
                               </>
                             )}
                           </NativeSelect>
                         </td>
                         <td className="px-2 py-2 text-right font-mono text-xs">
-                          {circuitCurrent(circuit, activePanel.supply).toFixed(1)} A
+                          {circuitCurrent(circuit, activePanel.supply).toFixed(
+                            1,
+                          )}{' '}
+                          A
                         </td>
                         <td className="px-2 py-2">
                           <NativeSelect
@@ -2751,10 +3181,14 @@ export default function Home() {
                             className="ml-auto w-20"
                             value={circuit.breaker}
                             onChange={(event) =>
-                              updateCircuit(circuit.id, 'breaker', Number(event.target.value))
+                              updateCircuit(
+                                circuit.id,
+                                'breaker',
+                                Number(event.target.value),
+                              )
                             }
                           >
-                            {STANDARD_BREAKERS.slice(0, 9).map((value) => (
+                            {STANDARD_BREAKERS.map((value) => (
                               <NativeSelectOption key={value} value={value}>
                                 {value} A
                               </NativeSelectOption>
@@ -2767,7 +3201,11 @@ export default function Home() {
                             className="ml-auto w-24"
                             value={circuit.conductor}
                             onChange={(event) =>
-                              updateCircuit(circuit.id, 'conductor', Number(event.target.value))
+                              updateCircuit(
+                                circuit.id,
+                                'conductor',
+                                Number(event.target.value),
+                              )
                             }
                           >
                             {Object.keys(CONDUCTOR_CAPACITY).map((value) => (
@@ -2782,14 +3220,18 @@ export default function Home() {
                             <CompactNumber
                               value={circuit.lengthM}
                               min={1}
-                              onChange={(value) => updateCircuit(circuit.id, 'lengthM', value)}
+                              onChange={(value) =>
+                                updateCircuit(circuit.id, 'lengthM', value)
+                              }
                             />
                           </td>
                         )}
                         {experienceMode === 'technical' && (
                           <td
                             className={`px-2 py-2 text-right font-mono text-xs font-semibold ${
-                              totalDropPercent > 3 ? 'text-amber-700' : 'text-emerald-700'
+                              totalDropPercent > 3
+                                ? 'text-amber-700'
+                                : 'text-emerald-700'
                             }`}
                           >
                             {totalDropPercent.toFixed(1)} %
@@ -2797,10 +3239,12 @@ export default function Home() {
                         )}
                         <td className="px-2 py-2">
                           <CompactNumber
-                            value={circuit.modules}
-                            min={1}
+                            value={circuitModuleSpan(circuit)}
+                            min={circuit.phase === '3Φ' ? 4 : 2}
                             max={8}
-                            onChange={(value) => updateCircuit(circuit.id, 'modules', value)}
+                            onChange={(value) =>
+                              updateCircuit(circuit.id, 'modules', value)
+                            }
                           />
                         </td>
                         <td className="print-hide px-2 py-2">
@@ -2824,7 +3268,9 @@ export default function Home() {
                                 e.stopPropagation();
                                 updateActivePanel(
                                   'circuits',
-                                  activePanel.circuits.filter((item) => item.id !== circuit.id),
+                                  activePanel.circuits.filter(
+                                    (item) => item.id !== circuit.id,
+                                  ),
                                 );
                               }}
                               aria-label={`Eliminar ${circuit.name}`}
@@ -2841,17 +3287,26 @@ export default function Home() {
             </div>
 
             <div className="border-t bg-muted/20 p-4">
+              <p className="mb-3 text-xs leading-relaxed text-muted-foreground">
+                Iz usa la ficha de referencia Cu/PVC en cañería o el valor
+                documentado que declares abajo. La referencia no especifica un
+                cable LS0H para este salón ni verifica armónicos o
+                cortocircuito. “Optimizar” no aumenta una térmica por encima de
+                esa capacidad preliminar ni cambia el cable.
+              </p>
               {optimizationMessage && (
-                <div className="mb-3 flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-800">
-                  <CheckCircle2 className="size-4 shrink-0" /> {optimizationMessage}
-                </div>
+                <output className="mb-3 flex items-start gap-2 rounded-xl border border-sky-200 bg-sky-50 p-3 text-xs leading-relaxed text-sky-900">
+                  <Info className="mt-0.5 size-4 shrink-0" />{' '}
+                  {optimizationMessage}
+                </output>
               )}
               {warnings.length ? (
                 <div className="flex gap-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-amber-950">
                   <AlertTriangle className="mt-0.5 size-4 shrink-0" />
                   <div>
                     <p className="text-xs font-semibold uppercase tracking-wide">
-                      Revisar {warnings.length} observación{warnings.length > 1 ? 'es' : ''}
+                      Revisar {warnings.length} observación
+                      {warnings.length > 1 ? 'es' : ''}
                     </p>
                     <ul className="mt-1 space-y-0.5 text-xs">
                       {warnings.map((warning) => (
@@ -2862,7 +3317,8 @@ export default function Home() {
                 </div>
               ) : (
                 <div className="flex items-center gap-2 text-xs text-emerald-700">
-                  <CheckCircle2 className="size-4" /> Sin alertas preliminares en {activePanel.name}.
+                  <CheckCircle2 className="size-4" /> Sin alertas preliminares
+                  en {activePanel.name}.
                 </div>
               )}
             </div>
@@ -2876,9 +3332,12 @@ export default function Home() {
                   <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
                     Vista frontal de {activePanel.name}
                   </p>
-                  <h2 className="text-lg font-semibold">Tablero DIN · {calculations.rows} filas</h2>
+                  <h2 className="text-lg font-semibold">
+                    Tablero DIN · {calculations.rows} filas
+                  </h2>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    Lectura de izquierda a derecha: cabecera, protección y circuitos de salida.
+                    Lectura de izquierda a derecha: cabecera, protección y
+                    circuitos de salida.
                   </p>
                 </div>
                 <Badge variant="outline">
@@ -2911,13 +3370,20 @@ export default function Home() {
                     </p>
                     <h2 className="font-semibold">Distribución de carga</h2>
                   </div>
-                  <Badge variant={calculations.imbalance > 0.2 ? 'destructive' : 'secondary'}>
+                  <Badge
+                    variant={
+                      calculations.imbalance > 0.2 ? 'destructive' : 'secondary'
+                    }
+                  >
                     {Math.round(calculations.imbalance * 100)} % desbalance
                   </Badge>
                 </div>
                 <div className="space-y-3">
                   {(['L1', 'L2', 'L3'] as const).map((phase) => {
-                    const max = Math.max(...Object.values(calculations.phaseVA), 1);
+                    const max = Math.max(
+                      ...Object.values(calculations.phaseVA),
+                      1,
+                    );
                     return (
                       <PhaseBar
                         key={phase}
@@ -2943,11 +3409,14 @@ export default function Home() {
               <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
                 Generado automáticamente para {activePanel.name}
               </p>
-              <h2 className="text-lg font-semibold">Esquema unifilar preliminar</h2>
+              <h2 className="text-lg font-semibold">
+                Esquema unifilar preliminar
+              </h2>
             </div>
             <p className="max-w-xl text-xs text-muted-foreground">
-              El esquema muestra la arquitectura del tablero. Deben verificarse poder de corte,
-              cortocircuito, selectividad, caída de tensión y método de instalación.
+              El esquema muestra la arquitectura del tablero. Deben verificarse
+              poder de corte, cortocircuito, selectividad, caída de tensión y
+              método de instalación.
             </p>
           </div>
           <SingleLineDiagram
@@ -2966,20 +3435,140 @@ export default function Home() {
               <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-sky-700">
                 Exigencia municipal verificada ({activePanel.name})
               </p>
-              <h2 className="text-lg font-semibold">Esquema multifilar para Ordenanza 72/83</h2>
+              <h2 className="text-lg font-semibold">
+                Esquema multifilar para Ordenanza 72/83
+              </h2>
             </div>
             <p className="max-w-2xl text-xs leading-relaxed text-muted-foreground">
-              La ordenanza pide agrupar fase, neutro y protección por salida, identificar circuitos y
-              secciones. Este cuadro sirve como base; el plano profesional debe completar canalizaciones,
-              diámetros, conductores y conexiones reales.
+              La ordenanza pide agrupar fase, neutro y protección por salida,
+              identificar circuitos y secciones. Este cuadro sirve como base; el
+              plano profesional debe completar canalizaciones, diámetros,
+              conductores y conexiones reales.
             </p>
           </div>
           <MultiLineDiagram
             panel={activePanel}
             childPanels={childPanels}
             calculations={panelCalculations}
+            highlightedCircuitId={activeHighlightedCircuitId}
+            onHoverCircuit={(id) => setHoveredCircuitId(id ?? null)}
           />
         </section>
+
+        <section className="mt-5 rounded-2xl border bg-card p-4 shadow-sm">
+          <h2 className="text-lg font-semibold">
+            Conductores, factor de potencia y cañerías
+          </h2>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Abrí cada circuito para declarar sus condiciones. Cambiar sección o
+            fase invalida una Iz manual; hay que volver a justificarla.
+          </p>
+          <div className="mt-3 space-y-2">
+            {activePanel.circuits.map((circuit, index) => (
+              <details key={circuit.id} className="rounded-xl border p-3">
+                <summary className="cursor-pointer text-sm font-semibold">
+                  C{index + 1} · {circuit.name} · {circuit.conductor} mm² ·{' '}
+                  {Math.round(activePower(circuit))} W
+                </summary>
+                <div className="mt-3">
+                  <AmpacityEditor
+                    section={circuit.conductor}
+                    threeLoaded={circuit.phase === '3Φ'}
+                    settings={circuit.ampacity}
+                    onChange={(value) =>
+                      updateCircuit(circuit.id, 'ampacity', value)
+                    }
+                  />
+                </div>
+                <div className="mt-3 grid gap-3 sm:grid-cols-[160px_1fr]">
+                  <label htmlFor={`fp-${circuit.id}`} className="text-xs">
+                    Factor de potencia declarado
+                    <Input
+                      id={`fp-${circuit.id}`}
+                      type="number"
+                      min="0.1"
+                      max="1"
+                      step="0.01"
+                      value={circuit.powerFactor}
+                      onChange={(e) =>
+                        updateCircuit(
+                          circuit.id,
+                          'powerFactor',
+                          finiteNumber(
+                            e.target.value,
+                            circuit.powerFactor,
+                            0.1,
+                            1,
+                          ),
+                        )
+                      }
+                    />
+                  </label>
+                  <label htmlFor={`conduit-${circuit.id}`} className="text-xs">
+                    Cañería: material, diámetro y referencia
+                    <Input
+                      id={`conduit-${circuit.id}`}
+                      value={circuit.conduit ?? ''}
+                      maxLength={500}
+                      placeholder="Pendiente de dimensionar y verificar ocupación"
+                      onChange={(e) =>
+                        updateCircuit(circuit.id, 'conduit', e.target.value)
+                      }
+                    />
+                  </label>
+                </div>
+              </details>
+            ))}
+          </div>
+        </section>
+
+        {isPublicVenue && (
+          <section className="mt-5 rounded-2xl border border-amber-300 bg-amber-50 p-4 text-amber-950">
+            <h2 className="font-semibold">Emergencia · autonomía declarada</h2>
+            <p className="mt-1 text-xs">
+              Ord. 72/83, III.2.22: para los usos comprendidos, autonomía mínima
+              de 2 h. Confirmar el encuadre del salón; también faltan
+              verificación de iluminancia, encendido automático y pruebas en
+              obra.
+            </p>
+            <div className="mt-3 grid gap-3 sm:grid-cols-[180px_1fr]">
+              <label htmlFor="emergency-hours" className="text-xs">
+                Autonomía (horas)
+                <Input
+                  id="emergency-hours"
+                  type="number"
+                  min="0"
+                  max="168"
+                  step="0.25"
+                  value={profile.emergencyAutonomyHours ?? 0}
+                  onChange={(e) =>
+                    updateProfile(
+                      'emergencyAutonomyHours',
+                      finiteNumber(e.target.value, 0, 0, 168),
+                    )
+                  }
+                />
+              </label>
+              <label htmlFor="emergency-evidence" className="text-xs">
+                Referencia de ensayo o ficha
+                <Input
+                  id="emergency-evidence"
+                  maxLength={1000}
+                  value={profile.emergencyEvidence ?? ''}
+                  placeholder="Modelo, documento, fecha de ensayo…"
+                  onChange={(e) =>
+                    updateProfile('emergencyEvidence', e.target.value)
+                  }
+                />
+              </label>
+            </div>
+            <p className="mt-3 text-sm font-semibold">
+              {emergencyAutonomyDeclared(profile)
+                ? '✓ Autonomía ≥2 h declarada con referencia; evidencia no validada por la herramienta.'
+                : 'Pendiente: autonomía ≥2 h y referencia de respaldo.'}
+            </p>
+          </section>
+        )}
 
         {/* Compliance and Municipal Checks */}
         <section className="mt-5 grid overflow-hidden rounded-2xl border bg-card shadow-sm xl:grid-cols-[minmax(320px,.8fr)_minmax(0,1.7fr)]">
@@ -2990,10 +3579,12 @@ export default function Home() {
                 Datos de verificación
               </p>
             </div>
-            <h2 className="mt-1 text-lg font-semibold">Lo que define la seguridad</h2>
+            <h2 className="mt-1 text-lg font-semibold">
+              Lo que define la seguridad
+            </h2>
             <p className="mt-1 text-xs leading-relaxed text-slate-400">
-              Estos valores deben surgir del proyecto y de mediciones. Los iniciales son supuestos
-              editables, no certificaciones.
+              Estos valores deben surgir del proyecto y de mediciones. Los
+              iniciales son supuestos editables, no certificaciones.
             </p>
             <div className="mt-4 grid grid-cols-2 gap-3">
               <QuickNumber
@@ -3003,7 +3594,9 @@ export default function Home() {
                 suffix="kA"
                 min={0.1}
                 step={0.5}
-                onChange={(value) => updateProfile('prospectiveShortCircuitKa', value)}
+                onChange={(value) =>
+                  updateProfile('prospectiveShortCircuitKa', value)
+                }
               />
               <QuickNumber
                 dark
@@ -3021,7 +3614,9 @@ export default function Home() {
                 suffix="Ω"
                 min={0}
                 step={0.1}
-                onChange={(value) => updateProfile('groundResistanceOhm', value)}
+                onChange={(value) =>
+                  updateProfile('groundResistanceOhm', value)
+                }
               />
               <div className="space-y-1.5">
                 <Label htmlFor="evacuation" className="text-xs text-slate-400">
@@ -3032,13 +3627,22 @@ export default function Home() {
                   className="w-full border-white/15 bg-white/10 text-white"
                   value={profile.evacuation}
                   onChange={(event) =>
-                    updateProfile('evacuation', event.target.value as EvacuationClass)
+                    updateProfile(
+                      'evacuation',
+                      event.target.value as EvacuationClass,
+                    )
                   }
                 >
-                  <NativeSelectOption value="BD1">BD1 · fácil</NativeSelectOption>
+                  <NativeSelectOption value="BD1">
+                    BD1 · fácil
+                  </NativeSelectOption>
                   <NativeSelectOption value="BD2">BD2</NativeSelectOption>
-                  <NativeSelectOption value="BD3">BD3 · público</NativeSelectOption>
-                  <NativeSelectOption value="BD4">BD4 · difícil</NativeSelectOption>
+                  <NativeSelectOption value="BD3">
+                    BD3 · público
+                  </NativeSelectOption>
+                  <NativeSelectOption value="BD4">
+                    BD4 · difícil
+                  </NativeSelectOption>
                 </NativeSelect>
               </div>
               <div className="space-y-1.5">
@@ -3050,11 +3654,16 @@ export default function Home() {
                   className="w-full border-white/15 bg-white/10 text-white"
                   value={profile.planScale}
                   onChange={(event) =>
-                    updateProfile('planScale', event.target.value as ProjectProfile['planScale'])
+                    updateProfile(
+                      'planScale',
+                      event.target.value as ProjectProfile['planScale'],
+                    )
                   }
                 >
                   <NativeSelectOption value="1:50">1:50</NativeSelectOption>
-                  <NativeSelectOption value="1:100">1:100 · salón amplio</NativeSelectOption>
+                  <NativeSelectOption value="1:100">
+                    1:100 · salón amplio
+                  </NativeSelectOption>
                 </NativeSelect>
               </div>
               <div className="flex items-end">
@@ -3065,7 +3674,9 @@ export default function Home() {
                       : 'border border-emerald-300/30 bg-emerald-300/10 text-emerald-200'
                   }`}
                 >
-                  {warnings.length ? `${warnings.length} alertas` : 'Sin alertas'}
+                  {warnings.length
+                    ? `${warnings.length} alertas`
+                    : 'Sin alertas'}
                 </Badge>
               </div>
             </div>
@@ -3078,18 +3689,23 @@ export default function Home() {
                   Expediente y control técnico
                 </p>
                 <h2 className="font-semibold">
-                  {complianceItems.filter((item) => item.ready).length} de {complianceItems.length}{' '}
-                  controles con datos suficientes
+                  {complianceItems.filter((item) => item.ready).length} de{' '}
+                  {complianceItems.length} controles con datos o tareas
+                  declarados
                 </h2>
               </div>
-              <Badge variant="outline">Estado preliminar · no es visación</Badge>
+              <Badge variant="outline">
+                Estado preliminar · no es visación
+              </Badge>
             </div>
             <div className="grid gap-2 md:grid-cols-2">
               {complianceItems.map((item) => (
                 <div
                   key={`${item.group}-${item.label}`}
                   className={`flex gap-3 rounded-xl border p-3 ${
-                    item.ready ? 'border-emerald-200 bg-emerald-50' : 'border-amber-200 bg-amber-50'
+                    item.ready
+                      ? 'border-emerald-200 bg-emerald-50'
+                      : 'border-amber-200 bg-amber-50'
                   }`}
                 >
                   {item.ready ? (
@@ -3102,11 +3718,9 @@ export default function Home() {
                       {item.group}
                     </p>
                     <p className="text-xs font-semibold">{item.label}</p>
-                    {!item.ready && (
-                      <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
-                        {item.action}
-                      </p>
-                    )}
+                    <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+                      {item.action}
+                    </p>
                   </div>
                 </div>
               ))}
@@ -3115,12 +3729,16 @@ export default function Home() {
               <ChecklistToggle
                 label="Memoria preparada"
                 checked={profile.descriptiveMemoryReady}
-                onChange={(checked) => updateProfile('descriptiveMemoryReady', checked)}
+                onChange={(checked) =>
+                  updateProfile('descriptiveMemoryReady', checked)
+                }
               />
               <ChecklistToggle
                 label="Profesional matriculado"
                 checked={profile.registeredProfessionalReady}
-                onChange={(checked) => updateProfile('registeredProfessionalReady', checked)}
+                onChange={(checked) =>
+                  updateProfile('registeredProfessionalReady', checked)
+                }
               />
               <ChecklistToggle
                 label="Ensayos ejecutados"
@@ -3141,38 +3759,64 @@ export default function Home() {
                   Anexo final · Memoria de cálculo ({activePanel.name})
                 </p>
               </div>
-              <h2 className="mt-1 text-lg font-semibold">Fórmulas, valores reemplazados y resultados</h2>
+              <h2 className="mt-1 text-lg font-semibold">
+                Fórmulas, valores reemplazados y resultados
+              </h2>
               <p className="mt-1 max-w-3xl text-xs text-slate-400">
-                Las cargas se ingresan en VA: la potencia aparente ya contempla el factor de potencia.
+                Las cargas se ingresan en VA: la potencia aparente ya contempla
+                el factor de potencia.
               </p>
             </div>
             <Badge className="w-fit border border-amber-300/20 bg-amber-300/10 text-amber-200">
-              ρ cobre = 0,018 Ω·mm²/m
+              Rθ = R20 × [1 + 0,00393 × (θ − 20)]
             </Badge>
           </div>
 
           <div className="grid gap-3 p-4 md:grid-cols-2 xl:grid-cols-3">
             <FormulaCard
+              title="Potencia activa estimada"
+              formula="Pinst = Σ(Si × FPi)"
+              substitution={`Circuitos propios${activePanel.type === 'TP' ? ' y de cada TS, una sola vez' : ''}; FP declarado por circuito`}
+              result={`${formatNumber(calculations.activeInstalledW / 1000, 3)} kW`}
+              note="FP relaciona potencia activa y aparente. Solo coincide con cos φ en las condiciones sinusoidales adecuadas; no se calcula energía ni consumo medido."
+            />
+            <FormulaCard
               title="Potencia instalada"
-              formula={activePanel.type === 'TP' ? 'Sinst,TP = Spropia + ΣSinst,TS' : 'Sinst = Σ(ni × Si)'}
+              formula={
+                activePanel.type === 'TP'
+                  ? 'Sinst,TP = Spropia + ΣSinst,TS'
+                  : 'Sinst = Σ(ni × Si)'
+              }
               substitution={
                 activePanel.type === 'TP'
                   ? `${Math.round(calculations.ownInstalledVA)} + ${childPanels.map((child) => Math.round(panelCalculations.get(child.id)?.ownInstalledVA ?? 0)).join(' + ') || '0'} VA`
                   : `${activePanel.circuits.map((circuit) => Math.round(circuitPower(circuit))).join(' + ') || '0'} VA`
               }
               result={formatPower(calculations.installedVA)}
-              note={activePanel.type === 'TP' ? 'El TP agrega una sola vez la potencia propia de cada TS' : 'ni: cantidad de bocas · Si: VA asignados por boca'}
+              note={
+                activePanel.type === 'TP'
+                  ? 'El TP agrega una sola vez la potencia propia de cada TS'
+                  : 'ni: cantidad de bocas · Si: VA asignados por boca'
+              }
             />
             <FormulaCard
               title="Demanda simultánea"
-              formula={activePanel.type === 'TP' ? 'Sd,TP = Spropia × fsTP + ΣSd,TS' : 'Sd = Sinst × fs'}
+              formula={
+                activePanel.type === 'TP'
+                  ? 'Sd,TP = Spropia × fsTP + ΣSd,TS'
+                  : 'Sd = Sinst × fs'
+              }
               substitution={
                 activePanel.type === 'TP'
                   ? `${Math.round(calculations.ownInstalledVA)} × ${formatNumber(activePanel.demandFactor, 2)} + (${childPanels.map((child) => Math.round(panelCalculations.get(child.id)?.demandVA ?? 0)).join(' + ') || '0'}) VA`
                   : `${Math.round(calculations.installedVA)} VA × ${formatNumber(activePanel.demandFactor, 2)}`
               }
               result={formatPower(calculations.demandVA)}
-              note={activePanel.type === 'TP' ? 'Cada TS conserva su propio factor de simultaneidad' : 'fs: factor de simultaneidad editable'}
+              note={
+                activePanel.type === 'TP'
+                  ? 'Cada TS conserva su propio factor de simultaneidad'
+                  : 'fs: factor de simultaneidad editable'
+              }
             />
             <FormulaCard
               title="Corriente de cabecera"
@@ -3199,30 +3843,30 @@ export default function Home() {
             />
             <FormulaCard
               title="Protección general sugerida"
-              formula="In ≥ 1,15 × Ib"
+              formula="In sugerida = máx(calibre ≥ 1,15 × Ib; mayor derivación)"
               substitution={`1,15 × ${formatNumber(calculations.mainCurrent, 2)} A = ${formatNumber(calculations.mainCurrent * 1.15, 2)} A`}
               result={`${calculations.mainBreaker} A`}
-              note={`Por corriente: ${calculations.currentBasedBreaker} A · mayor derivación: ${calculations.maxBranchBreaker || 0} A · se adopta el mayor y se verifican Iz e Ik`}
+              note={`Por corriente: ${calculations.currentBasedBreaker} A · mayor derivación: ${calculations.maxBranchBreaker || 0} A. El 15 % es un margen de diseño, no una exigencia AEA. Pendientes: Iz real, Ik y selectividad; un mayor calibre no los verifica.`}
             />
             {activePanel.type === 'TS' && (
               <FormulaCard
                 title="Caída del alimentador"
                 formula={
-                  activePanel.supply === 'tri' && activePanel.circuits.every((circuit) => circuit.phase === '3Φ')
-                    ? 'ΔVsec = √3 × ρ × L × Ib / s'
-                    : 'ΔVsec = 2 × ρ × L × Ib / s'
+                  calculations.feederDrop.model === 'balanced-three-phase'
+                    ? 'ΔVsec = √3 × Rθ × L × Ib; ΔV% = 100 × ΔVsec / 380'
+                    : 'ΔVsec = 2 × Rθ × L × Ib; ΔV% = 100 × ΔVsec / 220'
                 }
-                substitution={`${activePanel.supply === 'tri' && activePanel.circuits.every((circuit) => circuit.phase === '3Φ') ? '1,732' : '2'} × 0,018 × ${activePanel.feederLengthM ?? 15} × ${formatNumber(calculations.mainCurrent, 2)} / ${activePanel.feederConductor ?? 6}`}
+                substitution={`${formatNumber(calculations.feederDrop.factor, 3)} × ${formatNumber(calculations.feederDrop.resistanceOhmM, 6)} Ω/m × ${activePanel.feederLengthM ?? 15} m × ${formatNumber(calculations.mainCurrent, 2)} A; % = 100 × ${formatNumber(calculations.feederDrop.volts, 3)} / ${calculations.feederDrop.referenceVoltage}`}
                 result={`${formatNumber(calculations.feederDrop.volts, 2)} V · ${formatNumber(calculations.feederDrop.percent, 2)} %`}
-                note={`Chequeo: Ib ${formatNumber(calculations.mainCurrent, 2)} A ≤ In ${activePanel.feederBreaker ?? 32} A ≤ Iz ${CONDUCTOR_CAPACITY[activePanel.feederConductor ?? 6] ?? 0} A · criterio recomendado ΔVsec ≤ 1 %`}
+                note={`${calculations.feederDrop.model === 'mixed-estimate' ? 'TS trifásico con cargas monofásicas: estimación fase-neutro usando la fase más cargada y neutro de igual sección. No es un cálculo fasorial del desequilibrio.' : calculations.feederDrop.model === 'balanced-three-phase' ? 'Modelo trifásico equilibrado, referencia entre fases.' : 'Modelo fase-neutro, conductor de ida y retorno de igual sección.'} Comparar Ib ${formatNumber(calculations.mainCurrent, 2)} A, In ${activePanel.feederBreaker ?? 32} A e Iz preliminar ${conductorAmpacity(activePanel.feederConductor ?? 6, activePanel.supply === 'tri', activePanel.feederAmpacity) ?? 'pendiente'} A. Rθ a ${calculations.feederDrop.temperatureC} °C. Criterio de diseño: ΔVsec ≤ 1 %.`}
               />
             )}
             <FormulaCard
               title="Reserva del tablero"
-              formula="Mrec = ⌈Mocup × (1 + r/100)⌉"
-              substitution={`⌈${calculations.occupiedModules} × (1 + ${activePanel.reservePercent}/100)⌉`}
+              formula="Mrec = máx(Mocup + 2; ⌈Mocup / (1 − r/100)⌉)"
+              substitution={`máx(${calculations.occupiedModules} + 2; ⌈${calculations.occupiedModules} / (1 − ${activePanel.reservePercent}/100)⌉)`}
               result={`${calculations.recommendedModules} módulos`}
-              note={`Gabinete adoptado: ${calculations.rows} × ${activePanel.modulesPerRow} = ${calculations.cabinetModules} módulos`}
+              note={`Política de diseño: ≥20 % de capacidad total libre y ≥2 módulos. El encaje por filas puede aumentar el gabinete: ${calculations.rows} × ${activePanel.modulesPerRow} = ${calculations.cabinetModules} módulos. Verificar envolvente real.`}
             />
             <FormulaCard
               title="Dimensiones orientativas"
@@ -3259,15 +3903,24 @@ export default function Home() {
                       circuit.phase === '3Φ' && activePanel.supply === 'tri';
                     const current = circuitCurrent(circuit, activePanel.supply);
                     const drop = voltageDrop(circuit, activePanel.supply);
-                    const totalDropVolts =
-                      drop.volts +
-                      (activePanel.type === 'TS' ? calculations.feederDrop.volts : 0);
-                    const totalDropPercent =
-                      drop.percent +
-                      (activePanel.type === 'TS' ? calculations.feederDrop.percent : 0);
-                    const capacity = CONDUCTOR_CAPACITY[circuit.conductor] ?? 0;
+                    const accumulatedDrop = accumulatedVoltageDrop(
+                      drop,
+                      activePanel.type === 'TS'
+                        ? calculations.feederDrop
+                        : { percent: 0 },
+                      threePhase ? 380 : 220,
+                    );
+                    const totalDropVolts = accumulatedDrop.volts;
+                    const totalDropPercent = accumulatedDrop.percent;
+                    const capacity = conductorAmpacity(
+                      circuit.conductor,
+                      threePhase,
+                      circuit.ampacity,
+                    );
                     const protectionOkay =
-                      current <= circuit.breaker && circuit.breaker <= capacity;
+                      capacity !== null &&
+                      current <= circuit.breaker &&
+                      circuit.breaker <= capacity;
                     return (
                       <tr key={circuit.id} className="border-b last:border-0">
                         <td className="px-3 py-3">
@@ -3279,10 +3932,16 @@ export default function Home() {
                         <td className="px-3 py-3 font-mono">
                           {circuit.points} × {circuit.unitVA} ={' '}
                           {Math.round(circuitPower(circuit))} VA
+                          <br />P = S × FP = {Math.round(
+                            activePower(circuit),
+                          )}{' '}
+                          W
                         </td>
                         <td className="px-3 py-3">
                           <code className="block rounded bg-slate-100 px-2 py-1 text-[10px] text-slate-800 dark:bg-slate-800 dark:text-slate-200">
-                            {threePhase ? 'Ib = S / (√3 × 380)' : 'Ib = S / 220'}
+                            {threePhase
+                              ? 'Ib = S / (√3 × 380)'
+                              : 'Ib = S / 220'}
                           </code>
                           <span className="mt-1 block font-mono text-[9px] text-muted-foreground">
                             {threePhase
@@ -3301,21 +3960,26 @@ export default function Home() {
                                 : 'bg-amber-50 text-amber-800'
                             }`}
                           >
-                            Ib ≤ In ≤ Iz
+                            Ib ≤ In ≤ Iz preliminar
                           </code>
                           <span className="mt-1 block font-mono text-[9px] text-muted-foreground">
-                            {formatNumber(current, 2)} ≤ {circuit.breaker} ≤ {capacity} A
+                            {formatNumber(current, 2)} ≤ {circuit.breaker} ≤{' '}
+                            {capacity === null
+                              ? 'Iz pendiente'
+                              : `${formatNumber(capacity, 2)} A`}
                           </span>
                         </td>
                         <td className="px-3 py-3">
                           <code className="block rounded bg-slate-100 px-2 py-1 text-[10px] text-slate-800 dark:bg-slate-800 dark:text-slate-200">
                             {threePhase
-                              ? 'ΔV = √3 × ρ × L × Ib / s'
-                              : 'ΔV = 2 × ρ × L × Ib / s'}
+                              ? 'ΔV = √3 × Rθ × L × Ib'
+                              : 'ΔV = 2 × Rθ × L × Ib'}
                           </code>
                           <span className="mt-1 block font-mono text-[9px] text-muted-foreground">
-                            {threePhase ? '1,732' : '2'} × 0,018 × {circuit.lengthM} ×{' '}
-                            {formatNumber(current, 2)} / {circuit.conductor}
+                            {formatNumber(drop.factor, 3)} ×{' '}
+                            {formatNumber(drop.resistanceOhmM, 6)} ×{' '}
+                            {circuit.lengthM} × {formatNumber(current, 2)} · θ ={' '}
+                            {drop.temperatureC} °C
                           </span>
                         </td>
                         <td
@@ -3325,7 +3989,8 @@ export default function Home() {
                               : 'text-emerald-700'
                           }`}
                         >
-                          {formatNumber(totalDropVolts, 2)} V · {formatNumber(totalDropPercent, 2)} %
+                          {formatNumber(totalDropVolts, 2)} V ·{' '}
+                          {formatNumber(totalDropPercent, 2)} %
                         </td>
                       </tr>
                     );
@@ -3333,8 +3998,20 @@ export default function Home() {
                 </tbody>
               </table>
             </div>
+            <p className="mt-3 text-xs leading-relaxed text-muted-foreground">
+              Modelo resistivo con R20 máxima de ficha Cu flexible y corrección
+              a la temperatura del conductor (70 °C por defecto, no temperatura
+              ambiente). No incluye reactancia, armónicos o arranques. Las
+              caídas de alimentador y circuito se acumulan en porcentaje; los
+              voltios totales se expresan sobre la tensión del circuito terminal
+              (220 o 380 V). En TS mixtos es una estimación de diseño, no una
+              verificación completa.
+            </p>
           </div>
         </section>
+
+        {/* Normative Reference Tables (AEA 90364) */}
+        <NormativeReferenceTables />
 
         {/* Cost Options & References */}
         <section className="mt-5 rounded-2xl border bg-card p-4 shadow-sm print:break-before-page">
@@ -3346,9 +4023,15 @@ export default function Home() {
                   Costo y optimización ({activePanel.name})
                 </p>
               </div>
-              <h2 className="mt-1 text-lg font-semibold">Tres arquitecturas comparables</h2>
+              <h2 className="mt-1 text-lg font-semibold">
+                Tres arquitecturas comparables
+              </h2>
               <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
-                Valores minoristas de referencia en ARS. Incluyen previsión para accesorios y armado.
+                Referencias editables en ARS, no cotizaciones actuales. Incluyen
+                previsión para accesorios y armado. 18/24 M se estimaron
+                proporcionalmente desde 36 M; verificar precio, filas y
+                dimensiones reales del gabinete. Cañerías y conductores de campo
+                no están incluidos.
               </p>
             </div>
             <Badge className="w-fit border border-emerald-200 bg-emerald-50 text-emerald-800">
@@ -3363,31 +4046,42 @@ export default function Home() {
               </p>
               <div className="mt-2 flex flex-wrap gap-2">
                 {projectCostSummary.byPanel.map((item) => (
-                  <span key={item.id} className="rounded-md border border-emerald-200 bg-white px-2 py-1 text-[10px] text-emerald-950">
+                  <span
+                    key={item.id}
+                    className="rounded-md border border-emerald-200 bg-white px-2 py-1 text-[10px] text-emerald-950"
+                  >
                     {item.name}: <strong>{formatMoney(item.total)}</strong>
                   </span>
                 ))}
               </div>
               <p className="mt-2 text-[10px] text-emerald-900/70">
-                Suma gabinetes y dispositivos de todos los tableros. No incluye metros de cable, canalizaciones ni obra civil.
+                Suma gabinetes y dispositivos de todos los tableros. No incluye
+                metros de cable, canalizaciones ni obra civil.
               </p>
             </div>
             <div className="rounded-lg bg-emerald-800 px-4 py-3 text-right text-white">
-              <p className="text-[9px] uppercase tracking-wide text-emerald-100">Total estimado</p>
-              <p className="font-mono text-xl font-black">{formatMoney(projectCostSummary.total)}</p>
+              <p className="text-[9px] uppercase tracking-wide text-emerald-100">
+                Total estimado
+              </p>
+              <p className="font-mono text-xl font-black">
+                {formatMoney(projectCostSummary.total)}
+              </p>
             </div>
           </div>
 
           <div className="grid gap-3 lg:grid-cols-3">
-            {costOptions.map((option) => (
-              <CostOptionCard
-                key={option.id}
-                option={option}
-                selected={activePanel.architecture === option.id}
-                recommended={option.id === recommendedCost.id}
-                onSelect={() => updateActivePanel('architecture', option.id)}
-              />
-            ))}
+            {costOptions
+              .filter((option) => option.id !== 'continuity')
+              .map((option) => (
+                <CostOptionCard
+                  key={option.id}
+                  option={option}
+                  selected={activePanel.architecture === option.id}
+                  recommended={option.id === recommendedCost.id}
+                  publicVenue={isPublicVenue}
+                  onSelect={() => updateActivePanel('architecture', option.id)}
+                />
+              ))}
           </div>
 
           <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,.9fr)_minmax(0,1.4fr)]">
@@ -3397,7 +4091,9 @@ export default function Home() {
                   <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-400">
                     Qué encarece esta propuesta
                   </p>
-                  <h3 className="mt-1 font-semibold">Mayores impulsores de costo</h3>
+                  <h3 className="mt-1 font-semibold">
+                    Mayores impulsores de costo
+                  </h3>
                 </div>
                 <TrendingUp className="size-5 text-amber-300" />
               </div>
@@ -3435,7 +4131,9 @@ export default function Home() {
                   <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
                     Catálogo editable
                   </p>
-                  <h3 className="font-semibold">Ajustá con tus cotizaciones locales</h3>
+                  <h3 className="font-semibold">
+                    Ajustá con tus cotizaciones locales
+                  </h3>
                 </div>
                 <Button
                   variant="ghost"
@@ -3496,6 +4194,20 @@ export default function Home() {
                   }
                 />
                 <PriceInput
+                  label="Gabinete 18 M (estimado)"
+                  value={prices.cabinet18}
+                  onChange={(value) =>
+                    setPrices((current) => ({ ...current, cabinet18: value }))
+                  }
+                />
+                <PriceInput
+                  label="Gabinete 24 M (estimado)"
+                  value={prices.cabinet24}
+                  onChange={(value) =>
+                    setPrices((current) => ({ ...current, cabinet24: value }))
+                  }
+                />
+                <PriceInput
                   label="Gabinete 36 M"
                   value={prices.cabinet36}
                   onChange={(value) =>
@@ -3503,11 +4215,28 @@ export default function Home() {
                   }
                 />
                 <PriceInput
+                  label="Gabinete 54 M"
+                  value={prices.cabinet54}
+                  onChange={(value) =>
+                    setPrices((current) => ({ ...current, cabinet54: value }))
+                  }
+                />
+                <PriceInput
+                  label="Gabinete 72 M"
+                  value={prices.cabinet72}
+                  onChange={(value) =>
+                    setPrices((current) => ({ ...current, cabinet72: value }))
+                  }
+                />
+                <PriceInput
                   label="Recargo diferencial Tipo A"
                   value={prices.typeAPremium}
                   suffix="%"
                   onChange={(value) =>
-                    setPrices((current) => ({ ...current, typeAPremium: value }))
+                    setPrices((current) => ({
+                      ...current,
+                      typeAPremium: value,
+                    }))
                   }
                 />
                 <PriceInput
@@ -3515,7 +4244,10 @@ export default function Home() {
                   value={prices.accessoriesPercent}
                   suffix="%"
                   onChange={(value) =>
-                    setPrices((current) => ({ ...current, accessoriesPercent: value }))
+                    setPrices((current) => ({
+                      ...current,
+                      accessoriesPercent: value,
+                    }))
                   }
                 />
                 <PriceInput
@@ -3523,7 +4255,10 @@ export default function Home() {
                   value={prices.assemblyPercent}
                   suffix="%"
                   onChange={(value) =>
-                    setPrices((current) => ({ ...current, assemblyPercent: value }))
+                    setPrices((current) => ({
+                      ...current,
+                      assemblyPercent: value,
+                    }))
                   }
                 />
               </div>
@@ -3533,7 +4268,9 @@ export default function Home() {
           <div className="mt-4">
             <div className="mb-2 flex items-center gap-2">
               <ExternalLink className="size-3.5 text-muted-foreground" />
-              <h3 className="text-xs font-semibold">Fuentes de precios y comparaciones</h3>
+              <h3 className="text-xs font-semibold">
+                Fuentes de precios y comparaciones
+              </h3>
             </div>
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
               {PRICE_SOURCES.map((source) => (
@@ -3562,11 +4299,14 @@ export default function Home() {
             <Info className="size-5" />
           </div>
           <div>
-            <h2 className="text-sm font-semibold">Marco de cálculo y límites</h2>
+            <h2 className="text-sm font-semibold">
+              Marco de cálculo y límites
+            </h2>
             <p className="mt-1 text-xs leading-relaxed text-sky-900/80">
-              Herramienta de predimensionado basada en AEA 90364 (Partes 0–3 y 6 vigentes, Secciones
-              771 y 718), criterios de tableros IEC 61439 y Ordenanza General 72/83 de Mendoza. No
-              reemplaza proyecto, memoria, firma, ensayos ni visación municipal.
+              Herramienta de predimensionado basada en AEA 90364 (Partes 0–3 y 6
+              vigentes, Secciones 771 y 718), criterios de tableros IEC 61439 y
+              Ordenanza General 72/83 de Mendoza. No reemplaza proyecto,
+              memoria, firma, ensayos ni visación municipal.
             </p>
           </div>
           <div className="flex flex-wrap gap-2 text-xs">
@@ -3593,6 +4333,7 @@ export default function Home() {
         projectName={projectName}
         panels={panels}
         calculations={panelCalculations}
+        publicVenue={isPublicVenue}
       />
     </main>
   );
@@ -3602,10 +4343,12 @@ function ProjectPrintSummary({
   projectName,
   panels,
   calculations,
+  publicVenue = false,
 }: {
   projectName: string;
   panels: Panel[];
   calculations: Map<string, PanelCalculation>;
+  publicVenue?: boolean;
 }) {
   return (
     <section className="print-sheet hidden p-0 print:block">
@@ -3615,46 +4358,107 @@ function ProjectPrintSummary({
           (child) => child.type === 'TS' && child.parentId === panel.id,
         );
         return (
-          <article key={panel.id} className="break-after-page border-2 border-slate-900 p-4 last:break-after-auto">
+          <article
+            key={panel.id}
+            className="break-after-page border-2 border-slate-900 p-4 last:break-after-auto"
+          >
             <div className="flex items-start justify-between border-b-2 border-slate-900 pb-3">
               <div>
-                <p className="text-[10px] font-bold uppercase tracking-[0.14em]">Planilla multi-tablero</p>
+                <p className="text-[10px] font-bold uppercase tracking-[0.14em]">
+                  Planilla multi-tablero
+                </p>
                 <h1 className="text-xl font-bold">{projectName}</h1>
-                <h2 className="mt-1 text-base font-semibold">{panel.name} · {panel.type}</h2>
+                <h2 className="mt-1 text-base font-semibold">
+                  {panel.name} · {panel.type}
+                </h2>
               </div>
               <div className="text-right text-[10px]">
                 <p>San Rafael · Mendoza</p>
-                <p>{panel.supply === 'tri' ? '380/220 V trifásico' : '220 V monofásico'}</p>
+                <p>
+                  {panel.supply === 'tri'
+                    ? '380/220 V trifásico'
+                    : '220 V monofásico'}
+                </p>
               </div>
             </div>
 
             <div className="my-3 grid grid-cols-5 gap-2 text-[10px]">
-              <div className="border p-2"><strong>Instalada</strong><br />{formatPower(calculation?.installedVA ?? 0)}</div>
-              <div className="border p-2"><strong>Demanda</strong><br />{formatPower(calculation?.demandVA ?? 0)}</div>
-              <div className="border p-2"><strong>Ib</strong><br />{formatNumber(calculation?.mainCurrent ?? 0, 1)} A</div>
-              <div className="border p-2"><strong>Cabecera</strong><br />{calculation?.mainBreaker ?? 0} A</div>
-              <div className="border p-2"><strong>Gabinete</strong><br />{calculation?.rows ?? 1} × {panel.modulesPerRow} M</div>
+              <div className="border p-2">
+                <strong>Instalada</strong>
+                <br />
+                {formatPower(calculation?.installedVA ?? 0)} ·{' '}
+                {formatNumber((calculation?.activeInstalledW ?? 0) / 1000, 2)}{' '}
+                kW
+              </div>
+              <div className="border p-2">
+                <strong>Demanda</strong>
+                <br />
+                {formatPower(calculation?.demandVA ?? 0)}
+              </div>
+              <div className="border p-2">
+                <strong>Ib</strong>
+                <br />
+                {formatNumber(calculation?.mainCurrent ?? 0, 1)} A
+              </div>
+              <div className="border p-2">
+                <strong>Cabecera</strong>
+                <br />
+                {calculation?.mainBreaker ?? 0} A
+              </div>
+              <div className="border p-2">
+                <strong>Gabinete</strong>
+                <br />
+                {calculation?.rows ?? 1} × {panel.modulesPerRow} M
+              </div>
             </div>
 
             {panel.type === 'TS' && (
               <p className="mb-3 border border-sky-700 p-2 text-[10px]">
-                <strong>Alimentador desde TP:</strong> TM {panel.feederBreaker ?? 32} A · {panel.feederConductor ?? 6} mm² · {panel.feederLengthM ?? 15} m · {panel.feederPhase ?? (panel.supply === 'tri' ? '3Φ' : 'L1')} · ΔV {formatNumber(calculation?.feederDrop.percent ?? 0, 2)} %
+                <strong>Alimentador desde TP:</strong> TM{' '}
+                {panel.feederBreaker ?? 32} A · {panel.feederConductor ?? 6} mm²
+                · {panel.feederLengthM ?? 15} m ·{' '}
+                {panel.feederPhase ?? (panel.supply === 'tri' ? '3Φ' : 'L1')} ·
+                ΔV {formatNumber(calculation?.feederDrop.percent ?? 0, 2)} %
               </p>
             )}
 
             {children.length > 0 && (
               <div className="mb-3">
-                <h3 className="mb-1 text-xs font-bold">Alimentadores a tableros seccionales</h3>
+                <h3 className="mb-1 text-xs font-bold">
+                  Alimentadores a tableros seccionales
+                </h3>
                 <table className="w-full border-collapse text-[9px]">
-                  <thead><tr><th className="border p-1">Destino</th><th className="border p-1">TM</th><th className="border p-1">Cable</th><th className="border p-1">Fase</th><th className="border p-1">ΔV</th></tr></thead>
+                  <thead>
+                    <tr>
+                      <th className="border p-1">Destino</th>
+                      <th className="border p-1">TM</th>
+                      <th className="border p-1">Cable</th>
+                      <th className="border p-1">Fase</th>
+                      <th className="border p-1">ΔV</th>
+                    </tr>
+                  </thead>
                   <tbody>
                     {children.map((child) => (
                       <tr key={child.id}>
                         <td className="border p-1">{child.name}</td>
-                        <td className="border p-1">{child.feederBreaker ?? 32} A</td>
-                        <td className="border p-1">{child.feederConductor ?? 6} mm² · {child.feederLengthM ?? 15} m</td>
-                        <td className="border p-1">{child.feederPhase ?? (child.supply === 'tri' ? '3Φ' : 'L1')}</td>
-                        <td className="border p-1">{formatNumber(calculations.get(child.id)?.feederDrop.percent ?? 0, 2)} %</td>
+                        <td className="border p-1">
+                          {child.feederBreaker ?? 32} A
+                        </td>
+                        <td className="border p-1">
+                          {child.feederConductor ?? 6} mm² ·{' '}
+                          {child.feederLengthM ?? 15} m
+                        </td>
+                        <td className="border p-1">
+                          {child.feederPhase ??
+                            (child.supply === 'tri' ? '3Φ' : 'L1')}
+                        </td>
+                        <td className="border p-1">
+                          {formatNumber(
+                            calculations.get(child.id)?.feederDrop.percent ?? 0,
+                            2,
+                          )}{' '}
+                          %
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -3666,21 +4470,458 @@ function ProjectPrintSummary({
             <table className="w-full border-collapse text-[9px]">
               <thead>
                 <tr>
-                  <th className="border p-1">ID</th><th className="border p-1">Uso</th><th className="border p-1">Tipo</th><th className="border p-1">Carga</th><th className="border p-1">Fase</th><th className="border p-1">TM</th><th className="border p-1">Cable</th><th className="border p-1">Long.</th><th className="border p-1">ΔV</th>
+                  <th className="border p-1">ID</th>
+                  <th className="border p-1">Uso</th>
+                  <th className="border p-1">Tipo</th>
+                  <th className="border p-1">Carga</th>
+                  <th className="border p-1">Fase</th>
+                  <th className="border p-1">TM</th>
+                  <th className="border p-1">Cable</th>
+                  <th className="border p-1">Long.</th>
+                  <th className="border p-1">ΔV</th>
                 </tr>
               </thead>
               <tbody>
                 {panel.circuits.map((circuit, index) => (
                   <tr key={circuit.id}>
-                    <td className="border p-1">C{index + 1}</td><td className="border p-1">{circuit.name}</td><td className="border p-1">{circuit.kind}</td><td className="border p-1">{formatPower(circuitPower(circuit))}</td><td className="border p-1">{circuit.phase}</td><td className="border p-1">{circuit.breaker} A</td><td className="border p-1">{circuit.conductor} mm²</td><td className="border p-1">{circuit.lengthM} m</td><td className="border p-1">{formatNumber(voltageDrop(circuit, panel.supply).percent + (panel.type === 'TS' ? calculation?.feederDrop.percent ?? 0 : 0), 2)} %</td>
+                    <td className="border p-1">C{index + 1}</td>
+                    <td className="border p-1">{circuit.name}</td>
+                    <td className="border p-1">{circuit.kind}</td>
+                    <td className="border p-1">
+                      {formatPower(circuitPower(circuit))}
+                    </td>
+                    <td className="border p-1">{circuit.phase}</td>
+                    <td className="border p-1">{circuit.breaker} A</td>
+                    <td className="border p-1">{circuit.conductor} mm²</td>
+                    <td className="border p-1">{circuit.lengthM} m</td>
+                    <td className="border p-1">
+                      {formatNumber(
+                        voltageDrop(circuit, panel.supply).percent +
+                          (panel.type === 'TS'
+                            ? (calculation?.feederDrop.percent ?? 0)
+                            : 0),
+                        2,
+                      )}{' '}
+                      %
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
-            <p className="mt-3 text-[8px]">Predimensionado preliminar: verificar instalación, selectividad, cortocircuito, puesta a tierra, canalizaciones y documentación profesional.</p>
+            <p className="mt-3 text-xs font-semibold">
+              {architectureDetails(panel.architecture).title} ·{' '}
+              {differentialGroups(panel).length} diferenciales.{' '}
+              {architectureDetails(panel.architecture).behavior}
+            </p>
+            {publicVenue && panel.architecture === 'residential' && (
+              <p className="mt-2 text-xs font-bold">
+                ADVERTENCIA: ID único domiciliario aplicado a pública
+                concurrencia. No se valida la separación de emergencia ni el
+                cumplimiento de AEA 718.
+              </p>
+            )}
+            <p className="mt-3 text-[8px]">
+              Predimensionado preliminar: verificar instalación, selectividad,
+              cortocircuito, puesta a tierra, canalizaciones y documentación
+              profesional. Las siguientes vistas son esquemáticas, no planos a
+              escala ni conexiones de ejecución.
+            </p>
+            {calculation && (
+              <>
+                <section className="print-diagram mt-6 break-before-page">
+                  <h3 className="mb-3 text-lg font-bold">
+                    {panel.name} · Vista frontal DIN
+                  </h3>
+                  <PanelFront
+                    devices={buildPanelDevices(
+                      panel,
+                      children,
+                      calculation.mainBreaker,
+                    )}
+                    rows={calculation.rows}
+                    modulesPerRow={panel.modulesPerRow}
+                    panelType={panel.type}
+                    hasDps={panelHasDps(panel)}
+                    hasFeeders={children.length > 0}
+                  />
+                </section>
+                <section className="print-diagram mt-6 break-before-page">
+                  <h3 className="mb-3 text-lg font-bold">
+                    {panel.name} · Esquema unifilar funcional
+                  </h3>
+                  <SingleLineDiagram
+                    panel={panel}
+                    calculation={calculation}
+                    childPanels={children}
+                  />
+                </section>
+                <section className="print-diagram mt-6 break-before-page">
+                  <h3 className="mb-3 text-lg font-bold">
+                    {panel.name} · Cuadro multifilar preliminar
+                  </h3>
+                  <MultiLineDiagram
+                    panel={panel}
+                    childPanels={children}
+                    calculations={calculations}
+                  />
+                </section>
+              </>
+            )}
           </article>
         );
       })}
+    </section>
+  );
+}
+
+function NormativeReferenceTables() {
+  const conductorIzRows = [
+    {
+      section: '1,5',
+      mono: '15 A',
+      tri: '14 A',
+      breaker: '10 A (máx. 13 A / 15 A)',
+      r20: '13,30 Ω/km',
+      pe: '2,5 mm²',
+      highlight: false,
+    },
+    {
+      section: '2,5',
+      mono: '21 A',
+      tri: '18 A',
+      breaker: '16 A (máx. 20 A monof.)',
+      r20: '7,98 Ω/km',
+      pe: '2,5 mm²',
+      highlight: true,
+    },
+    {
+      section: '4,0',
+      mono: '28 A',
+      tri: '25 A',
+      breaker: '20 A / 25 A',
+      r20: '4,95 Ω/km',
+      pe: '4,0 mm²',
+      highlight: false,
+    },
+    {
+      section: '6,0',
+      mono: '36 A',
+      tri: '32 A',
+      breaker: '32 A',
+      r20: '3,30 Ω/km',
+      pe: '6,0 mm²',
+      highlight: false,
+    },
+    {
+      section: '10,0',
+      mono: '50 A',
+      tri: '44 A',
+      breaker: '40 A / 50 A',
+      r20: '1,91 Ω/km',
+      pe: '10,0 mm²',
+      highlight: false,
+    },
+    {
+      section: '16,0',
+      mono: '66 A',
+      tri: '59 A',
+      breaker: '50 A / 63 A',
+      r20: '1,21 Ω/km',
+      pe: '16,0 mm²',
+      highlight: false,
+    },
+    {
+      section: '25,0',
+      mono: '88 A',
+      tri: '77 A',
+      breaker: '63 A / 80 A',
+      r20: '0,78 Ω/km',
+      pe: '16,0 mm²',
+      highlight: false,
+    },
+    {
+      section: '35,0',
+      mono: '109 A',
+      tri: '96 A',
+      breaker: '80 A / 100 A',
+      r20: '0,554 Ω/km',
+      pe: '16,0 mm²',
+      highlight: false,
+    },
+  ];
+
+  const circuitTypeRows = [
+    {
+      kind: 'Iluminación de Uso General',
+      code: 'IUG',
+      minSection: '1,5 mm²',
+      maxBreaker: '16 A (sugerida 10 A)',
+      dest: 'Bocas fijas de iluminación y tomas de servicio exclusivos de luminarias (máx. 15 bocas).',
+    },
+    {
+      kind: 'Tomacorrientes de Uso General',
+      code: 'TUG',
+      minSection: '2,5 mm²',
+      maxBreaker: '20 A (sugerida 16 A)',
+      dest: 'Tomacorrientes estándar de 10 A para aparatos portátiles monofásicos (máx. 15 bocas).',
+    },
+    {
+      kind: 'Iluminación de Uso Especial',
+      code: 'IUE',
+      minSection: '2,5 mm²',
+      maxBreaker: '20 A (sugerida 16 A)',
+      dest: 'Iluminación a la intemperie o potencias unitarias elevadas por boca (máx. 12 bocas).',
+    },
+    {
+      kind: 'Tomacorrientes de Uso Especial',
+      code: 'TUE',
+      minSection: '2,5 mm²',
+      maxBreaker: '32 A (sugerida 20 A)',
+      dest: 'Tomas de 20 A para cargas específicas (aire acondicionado, motores, hornos, máx. 12 bocas).',
+    },
+    {
+      kind: 'Líneas Seccionales (Alimentador TP → TS)',
+      code: 'L. Sec.',
+      minSection: '2,5 mm² (770) / 4,0 mm² (771)',
+      maxBreaker: 'Según Iz calculada',
+      dest: 'Conducción entre Tablero Principal y Tableros Seccionales aguas abajo.',
+    },
+    {
+      kind: 'Línea Principal (Medidor → TP)',
+      code: 'L. Princ.',
+      minSection: '4,0 mm²',
+      maxBreaker: 'Según demanda',
+      dest: 'Acometida desde bornes del medidor de energía hasta el interruptor general del TP.',
+    },
+    {
+      kind: 'Conductor de Protección (PE / Tierra)',
+      code: 'PE',
+      minSection: '2,5 mm² / Igual a Fase',
+      maxBreaker: 'Sin interruptor',
+      dest: 'Conductor verde-amarillo continuo a todas las masas metálicas y bornes de tierra de tomas.',
+    },
+    {
+      kind: 'Conductor a Electrodo (Jabalina)',
+      code: 'PAT',
+      minSection: '4,0 mm² (protegido) / 10 mm² (desnudo)',
+      maxBreaker: 'Directo a jabalina',
+      dest: 'Conexión entre barra equipotencial del TP y jabalina de puesta a tierra (RA ≤ 10 Ω).',
+    },
+    {
+      kind: 'Retornos de Interruptores de Efecto',
+      code: 'Retorno',
+      minSection: '1,5 mm²',
+      maxBreaker: 'Protegido por TM de IUG',
+      dest: 'Conductor entre interruptor/llave de efecto y el portalámparas o artefacto.',
+    },
+  ];
+
+  return (
+    <section className="order-last mt-5 overflow-hidden rounded-2xl border bg-card shadow-sm print:break-before-page">
+      {/* Header */}
+      <div className="flex flex-col gap-3 border-b bg-slate-950 p-4 text-white sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <div className="flex items-center gap-2 text-amber-300">
+            <BookOpenCheck className="size-4" />
+            <p className="text-[11px] font-semibold uppercase tracking-[0.12em]">
+              Anexo Normativo · Tablas Oficiales AEA 90364
+            </p>
+          </div>
+          <h2 className="mt-1 text-lg font-semibold">
+            Tablas de Conductores por Amperaje y Secciones Mínimas por Conexión
+          </h2>
+          <p className="mt-1 max-w-3xl text-xs text-slate-400">
+            Valores reglamentarios de referencia según AEA 90364 (Secciones 770 y 771) e IRAM 2183 / NM 247-3 / 62267 para conductores de cobre flexible en cañería embutida en mampostería (Método B1, 40 °C ambiente).
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Badge className="w-fit border border-amber-300/20 bg-amber-300/10 text-amber-200">
+            AEA 90364-7-770 / 771
+          </Badge>
+          <Badge className="w-fit border border-sky-300/20 bg-sky-300/10 text-sky-200">
+            IRAM 2183 · IRAM 62267
+          </Badge>
+        </div>
+      </div>
+
+      <div className="space-y-6 p-4">
+        {/* TABLA 1 */}
+        <div className="space-y-3">
+          <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="flex size-6 items-center justify-center rounded-md bg-amber-100 font-mono text-xs font-bold text-amber-900 dark:bg-amber-900/40 dark:text-amber-200">
+                  1
+                </span>
+                <h3 className="text-sm font-bold sm:text-base">
+                  Tabla 1: Capacidad de Corriente Admisible (Iz) y Protección Recomendada
+                </h3>
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Cables de cobre Cu/PVC 70 °C (IRAM 2183) en cañería embutida (Método B1, temperatura base de referencia 40 °C en aire).
+              </p>
+            </div>
+            <Badge className="w-fit border border-slate-200 bg-slate-100 text-[11px] text-slate-800 dark:border-slate-800 dark:bg-slate-800 dark:text-slate-200">
+              Método B1 · 40 °C
+            </Badge>
+          </div>
+
+          <div className="overflow-x-auto rounded-xl border bg-background">
+            <table className="w-full min-w-[760px] text-left text-xs">
+              <thead>
+                <tr className="border-b bg-muted/50 text-[10px] uppercase tracking-wider text-muted-foreground">
+                  <th className="px-3.5 py-3">Sección Nominal</th>
+                  <th className="px-3.5 py-3">Monofásica (2 cond. activos)</th>
+                  <th className="px-3.5 py-3">Trifásica (3 cond. activos)</th>
+                  <th className="px-3.5 py-3">Térmica (In) sugerida</th>
+                  <th className="px-3.5 py-3">Resistencia R20 máx.</th>
+                  <th className="px-3.5 py-3">Conductor PE</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y font-mono">
+                {conductorIzRows.map((row) => (
+                  <tr
+                    key={row.section}
+                    className={`transition-colors hover:bg-muted/30 ${
+                      row.highlight ? 'bg-amber-50/50 dark:bg-amber-950/10' : ''
+                    }`}
+                  >
+                    <td className="px-3.5 py-2.5 font-bold text-slate-900 dark:text-slate-100">
+                      {row.section} mm²
+                    </td>
+                    <td className="px-3.5 py-2.5 font-bold text-emerald-700 dark:text-emerald-400">
+                      {row.mono}
+                    </td>
+                    <td className="px-3.5 py-2.5 font-bold text-sky-700 dark:text-sky-400">
+                      {row.tri}
+                    </td>
+                    <td className="px-3.5 py-2.5 font-sans font-medium text-slate-800 dark:text-slate-200">
+                      {row.breaker}
+                    </td>
+                    <td className="px-3.5 py-2.5 text-muted-foreground">
+                      {row.r20}
+                    </td>
+                    <td className="px-3.5 py-2.5 font-sans text-muted-foreground">
+                      {row.pe}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Fórmulas asociadas a Tabla 1 */}
+          <div className="grid gap-3 pt-1 md:grid-cols-2 xl:grid-cols-3">
+            <FormulaCard
+              title="1. Corriente admisible corregida (Iz)"
+              formula="Iz = Itabla × ft × fa"
+              substitution="ft (Temp.): 20°C=1,29 · 30°C=1,15 · 40°C=1,00 | fa (Agrup.): 1 cto=1,00 · 2 ctos=0,80 · 3 ctos=0,70"
+              result="Iz real corregida (A)"
+              note="Si los conductores comparten cañería o el ambiente no es de 40 °C, la capacidad de corriente se reduce obligatoriamente por estos factores."
+            />
+            <FormulaCard
+              title="2. Regla de coordinación y protección"
+              formula="Ib ≤ In ≤ Iz  y  I2 ≤ 1,45 × Iz"
+              substitution="Ib (carga) ≤ In (calibre termomagnética) ≤ Iz (capacidad admisible conductor)"
+              result="In coordinada"
+              note="Para termomagnéticas IEC 60898 (curvas B, C, D), I2 = 1,45 × In. Cumplir In ≤ Iz garantiza la protección del conductor contra sobrecargas continuas."
+            />
+            <FormulaCard
+              title="3. Resistencia óhmica con la temperatura"
+              formula="Rθ = R20 × [1 + 0,00393 × (θ − 20)]"
+              substitution="R20 (20 °C) corregida a θ = 70 °C (régimen continuo Cu/PVC) o θ = 90 °C (XLPE/LS0H)"
+              result="R70 = 1,1965 × R20"
+              note="La resistividad del cobre aumenta con la temperatura. El dimensionado por caída de tensión debe evaluar la resistencia a la temperatura de servicio."
+            />
+          </div>
+        </div>
+
+        <Separator />
+
+        {/* TABLA 2 */}
+        <div className="space-y-3">
+          <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="flex size-6 items-center justify-center rounded-md bg-sky-100 font-mono text-xs font-bold text-sky-900 dark:bg-sky-900/40 dark:text-sky-200">
+                  2
+                </span>
+                <h3 className="text-sm font-bold sm:text-base">
+                  Tabla 2: Secciones Mínimas Normativas por Tipo de Circuito / Conexión
+                </h3>
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Calibres mínimos reglamentarios según AEA 90364-7-770 (viviendas unifamiliares) y AEA 90364-7-771 (viviendas, comercios y oficinas).
+              </p>
+            </div>
+            <Badge className="w-fit border border-sky-200 bg-sky-50 text-[11px] text-sky-800 dark:border-sky-900 dark:bg-sky-950/40 dark:text-sky-300">
+              Secciones Mínimas Obligatorias
+            </Badge>
+          </div>
+
+          <div className="overflow-x-auto rounded-xl border bg-background">
+            <table className="w-full min-w-[760px] text-left text-xs">
+              <thead>
+                <tr className="border-b bg-muted/50 text-[10px] uppercase tracking-wider text-muted-foreground">
+                  <th className="px-3.5 py-3">Tipo de Circuito / Conexión</th>
+                  <th className="px-3.5 py-3">Sigla</th>
+                  <th className="px-3.5 py-3">Sección Mínima</th>
+                  <th className="px-3.5 py-3">Térmica (In) Máxima</th>
+                  <th className="px-3.5 py-3">Destino y Criterio Normativo</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {circuitTypeRows.map((row) => (
+                  <tr key={row.code + row.kind} className="transition-colors hover:bg-muted/30">
+                    <td className="px-3.5 py-2.5 font-semibold text-slate-900 dark:text-slate-100">
+                      {row.kind}
+                    </td>
+                    <td className="px-3.5 py-2.5">
+                      <span className="inline-block rounded bg-slate-100 px-2 py-0.5 font-mono text-[10px] font-bold text-slate-800 dark:bg-slate-800 dark:text-slate-200">
+                        {row.code}
+                      </span>
+                    </td>
+                    <td className="px-3.5 py-2.5 font-mono font-bold text-emerald-700 dark:text-emerald-400">
+                      {row.minSection}
+                    </td>
+                    <td className="px-3.5 py-2.5 font-sans font-medium text-slate-800 dark:text-slate-200">
+                      {row.maxBreaker}
+                    </td>
+                    <td className="px-3.5 py-2.5 text-muted-foreground">
+                      {row.dest}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Fórmulas asociadas a Tabla 2 */}
+          <div className="grid gap-3 pt-1 md:grid-cols-2 xl:grid-cols-3">
+            <FormulaCard
+              title="4. Criterio de dimensionamiento de sección"
+              formula="Sadoptada = máx(Smínima_normativa, S_Iz, S_ΔV)"
+              substitution="Smínima (según tipo de cto.) · S_Iz (In ≤ Iz corregida) · S_ΔV (caída ≤ límite)"
+              result="Sección comercial final"
+              note="La sección adoptada debe satisfacer simultáneamente la exigencia mínima reglamentaria, la capacidad térmica admisible y la verificación de caída de tensión."
+            />
+            <FormulaCard
+              title="5. Caída de tensión máxima admisible (ΔV)"
+              formula="1Φ: ΔV = 2×Rθ×L×Ib  ·  3Φ: ΔV = √3×Rθ×L×Ib"
+              substitution="ΔV% = 100 × ΔV / Vnom (220 V en 1Φ · 380 V en 3Φ)"
+              result="ΔV% ≤ Límite AEA"
+              note="Límites reglamentarios AEA: Iluminación y tomas ΔV ≤ 3,0 % · Fuerza motriz (motores) ΔV ≤ 5,0 % · Líneas seccionales (alimentador TP→TS) ΔV ≤ 1,0 % recomendado."
+            />
+            <FormulaCard
+              title="6. Corriente de empleo y potencia (Ib)"
+              formula="1Φ: Ib = S / 220  ·  3Φ: Ib = S / (√3 × 380)"
+              substitution="P = S × FP (Potencia activa en W) · Ib calculada con la potencia aparente S (VA)"
+              result="Ib de diseño (A)"
+              note="La corriente de empleo Ib determina la carga sobre el circuito. El factor de potencia (FP) relaciona la potencia activa con la aparente sin reducir la corriente Ib."
+            />
+          </div>
+        </div>
+      </div>
     </section>
   );
 }
@@ -3697,7 +4938,8 @@ function DistributionArchitectureGuide() {
             </p>
           </div>
           <h2 className="mt-1 text-lg font-bold">
-            Distribución Física y Funcional: Tablero Principal (TP) vs Tableros Seccionales (TS)
+            Distribución Física y Funcional: Tablero Principal (TP) vs Tableros
+            Seccionales (TS)
           </h2>
         </div>
         <Badge className="w-fit border border-amber-400/30 bg-amber-400/10 text-amber-300">
@@ -3710,34 +4952,55 @@ function DistributionArchitectureGuide() {
         <div className="flex flex-col justify-between rounded-xl border border-white/10 bg-white/5 p-4">
           <div>
             <div className="flex items-center justify-between">
-              <Badge className="bg-amber-400 text-slate-950 font-bold">1. Acometida y TP</Badge>
-              <span className="text-[10px] text-slate-400">Ubicación según distribuidora y proyecto</span>
+              <Badge className="bg-amber-400 text-slate-950 font-bold">
+                1. Acometida y TP
+              </Badge>
+              <span className="text-[10px] text-slate-400">
+                Ubicación según distribuidora y proyecto
+              </span>
             </div>
-            <h3 className="mt-2.5 text-sm font-semibold text-white">Tablero Principal (TP)</h3>
+            <h3 className="mt-2.5 text-sm font-semibold text-white">
+              Tablero Principal (TP)
+            </h3>
             <p className="mt-1 text-xs leading-relaxed text-slate-400">
-              Ubicado en nicho exterior o línea municipal. Su función es brindar corte general y proteger la línea seccional (alimentador).
+              Ubicado en nicho exterior o línea municipal. Su función es brindar
+              corte general y proteger la línea seccional (alimentador).
             </p>
             <div className="mt-3.5 space-y-2 text-xs text-slate-300">
               <div className="flex items-start gap-2">
                 <span className="font-mono font-bold text-amber-400">•</span>
-                <span><strong>IGA Cabecera:</strong> Térmica de corte general (curva C, In ≥ 1,15 × Ib).</span>
+                <span>
+                  <strong>IGA Cabecera:</strong> Calibre y curva sujetos a Iz,
+                  cortocircuito y coordinación. El 15 % usado es solo un margen
+                  de diseño.
+                </span>
               </div>
               <div className="flex items-start gap-2">
                 <span className="font-mono font-bold text-violet-400">•</span>
-                <span><strong>DPS (Transitorias):</strong> Configurable según evaluación y esquema adoptado.</span>
+                <span>
+                  <strong>DPS (Transitorias):</strong> Configurable según
+                  evaluación y esquema adoptado.
+                </span>
               </div>
               <div className="flex items-start gap-2">
                 <span className="font-mono font-bold text-sky-400">•</span>
-                <span><strong>Térmica Alimentador:</strong> Protección visible y dedicada del cable hacia el TS1.</span>
+                <span>
+                  <strong>Térmica Alimentador:</strong> Protección visible y
+                  dedicada del cable hacia el TS1.
+                </span>
               </div>
               <div className="flex items-start gap-2">
                 <span className="font-mono font-bold text-emerald-400">•</span>
-                <span><strong>Puesta a Tierra:</strong> Jabalina principal con RA ≤ 10 Ω (Ord. 72/83).</span>
+                <span>
+                  <strong>Puesta a Tierra:</strong> Jabalina principal con RA ≤
+                  10 Ω (Ord. 72/83).
+                </span>
               </div>
             </div>
           </div>
           <div className="mt-3 rounded-lg border border-amber-400/20 bg-amber-400/5 p-2 text-[11px] text-amber-200/90">
-            🛡️ <em>Envolvente:</em> Gabinete estanco (mínimo IP54) con doble aislamiento (Clase II) si está en intemperie.
+            🛡️ <em>Envolvente:</em> Gabinete estanco (mínimo IP54) con doble
+            aislamiento (Clase II) si está en intemperie.
           </div>
         </div>
 
@@ -3745,30 +5008,48 @@ function DistributionArchitectureGuide() {
         <div className="flex flex-col justify-between rounded-xl border border-white/10 bg-white/5 p-4">
           <div>
             <div className="flex items-center justify-between">
-              <Badge className="bg-sky-500 text-white font-bold">2. Línea Seccional</Badge>
-              <span className="text-[10px] text-slate-400">Tramo alimentador</span>
+              <Badge className="bg-sky-500 text-white font-bold">
+                2. Línea Seccional
+              </Badge>
+              <span className="text-[10px] text-slate-400">
+                Tramo alimentador
+              </span>
             </div>
-            <h3 className="mt-2.5 text-sm font-semibold text-white">Alimentador entre TP y TS1</h3>
+            <h3 className="mt-2.5 text-sm font-semibold text-white">
+              Alimentador entre TP y TS1
+            </h3>
             <p className="mt-1 text-xs leading-relaxed text-slate-400">
-              Conductor de sección reforzada (mínimo 4, 6 o 10 mm²) canalizado de forma protegida contra daños mecánicos.
+              Conductor de sección reforzada (mínimo 4, 6 o 10 mm²) canalizado
+              de forma protegida contra daños mecánicos.
             </p>
             <div className="mt-3.5 space-y-2 text-xs text-slate-300">
               <div className="flex items-start gap-2">
                 <span className="font-mono font-bold text-sky-400">•</span>
-                <span><strong>Caída Acumulada:</strong> Se recomienda hasta 1 % en la línea seccional y 3 % total para cargas sin motor.</span>
+                <span>
+                  <strong>Caída Acumulada:</strong> Se recomienda hasta 1 % en
+                  la línea seccional y 3 % total para cargas sin motor.
+                </span>
               </div>
               <div className="flex items-start gap-2">
                 <span className="font-mono font-bold text-sky-400">•</span>
-                <span><strong>Conductores:</strong> Subterráneo (IRAM 2178) o unipolar bajo cañería (IRAM NM 247-3).</span>
+                <span>
+                  <strong>Conductores:</strong> Subterráneo (IRAM 2178) o
+                  unipolar bajo cañería (IRAM NM 247-3).
+                </span>
               </div>
               <div className="flex items-start gap-2">
                 <span className="font-mono font-bold text-sky-400">•</span>
-                <span><strong>Conductor PE:</strong> El conductor de protección debe acompañar por el mismo conducto.</span>
+                <span>
+                  <strong>Conductor PE:</strong> El conductor de protección debe
+                  acompañar por el mismo conducto.
+                </span>
               </div>
             </div>
           </div>
           <div className="mt-3 rounded-lg border border-sky-400/20 bg-sky-400/10 p-2 text-[11px] text-sky-200">
-            ⚡ <em>Selectividad:</em> Los alimentadores a TS se representan antes de los ID de 30 mA que protegen circuitos propios del TP. Cualquier diferencial general debe justificarse y coordinarse.
+            ⚡ <em>Selectividad:</em> Los alimentadores a TS se representan
+            antes de los ID de 30 mA que protegen circuitos propios del TP.
+            Cualquier diferencial general debe justificarse y coordinarse.
           </div>
         </div>
 
@@ -3776,34 +5057,54 @@ function DistributionArchitectureGuide() {
         <div className="flex flex-col justify-between rounded-xl border border-white/10 bg-white/5 p-4">
           <div>
             <div className="flex items-center justify-between">
-              <Badge className="bg-emerald-500 text-white font-bold">3. Tablero Seccional</Badge>
+              <Badge className="bg-emerald-500 text-white font-bold">
+                3. Tablero Seccional
+              </Badge>
               <span className="text-[10px] text-slate-400">Interior local</span>
             </div>
-            <h3 className="mt-2.5 text-sm font-semibold text-white">Tablero Seccional (TS1)</h3>
+            <h3 className="mt-2.5 text-sm font-semibold text-white">
+              Tablero Seccional (TS1)
+            </h3>
             <p className="mt-1 text-xs leading-relaxed text-slate-400">
-              Ubicado en el interior a mano (altura de maniobra 0,90 m a 2,00 m). Distribuye y protege a los usuarios y circuitos finales.
+              Ubicado en el interior a mano (altura de maniobra 0,90 m a 2,00
+              m). Distribuye y protege a los usuarios y circuitos finales.
             </p>
             <div className="mt-3.5 space-y-2 text-xs text-slate-300">
               <div className="flex items-start gap-2">
                 <span className="font-mono font-bold text-emerald-400">•</span>
-                <span><strong>Corte Local:</strong> Interruptor de cabecera para desenergizar el tablero en el lugar.</span>
+                <span>
+                  <strong>Corte Local:</strong> Interruptor de cabecera para
+                  desenergizar el tablero en el lugar.
+                </span>
               </div>
               <div className="flex items-start gap-2">
                 <span className="font-mono font-bold text-emerald-400">•</span>
-                <span><strong>Diferenciales 30 mA:</strong> Separar iluminación de tomas de uso general.</span>
+                <span>
+                  <strong>Diferenciales 30 mA:</strong> Económica: normal + EMG.
+                  Equilibrada: iluminación + tomas/equipos + EMG. La opción
+                  domiciliaria usa un ID común y se advierte en salones.
+                </span>
               </div>
               <div className="flex items-start gap-2">
                 <span className="font-mono font-bold text-emerald-400">•</span>
-                <span><strong>Emergencia (AEA 718):</strong> Circuito EMG independiente que no comparta ID con tomas.</span>
+                <span>
+                  <strong>Emergencia (AEA 718):</strong> Circuito EMG
+                  independiente que no comparta ID con tomas.
+                </span>
               </div>
               <div className="flex items-start gap-2">
                 <span className="font-mono font-bold text-emerald-400">•</span>
-                <span><strong>Reserva DIN:</strong> Mínimo 20 % a 25 % de módulos libres para ampliación.</span>
+                <span>
+                  <strong>Reserva DIN:</strong> Política de diseño: al menos 20
+                  % del total libre y 2 módulos. Verificar disposición y
+                  envolvente real.
+                </span>
               </div>
             </div>
           </div>
           <div className="mt-3 rounded-lg border border-emerald-400/20 bg-emerald-400/10 p-2 text-[11px] text-emerald-200">
-            🔒 <em>Pública Concurrencia:</em> Debe contar con puerta cerrada con llave para evitar acceso de personas no autorizadas.
+            🔒 <em>Pública Concurrencia:</em> Debe contar con puerta cerrada con
+            llave para evitar acceso de personas no autorizadas.
           </div>
         </div>
       </div>
@@ -3871,7 +5172,9 @@ function QuickNumber({
 }) {
   return (
     <div className="space-y-1.5">
-      <Label className={`text-xs ${dark ? 'text-slate-400' : 'text-muted-foreground'}`}>
+      <Label
+        className={`text-xs ${dark ? 'text-slate-400' : 'text-muted-foreground'}`}
+      >
         {label}
       </Label>
       <div className="relative">
@@ -3880,7 +5183,16 @@ function QuickNumber({
           min={min}
           step={step}
           value={value}
-          onChange={(event) => onChange(Number(event.target.value))}
+          onChange={(event) =>
+            onChange(
+              finiteNumber(
+                event.target.value,
+                value,
+                0,
+                suffix === '%' ? 1000 : 1e12,
+              ),
+            )
+          }
           className={`pr-12 font-mono ${dark ? 'border-white/15 bg-white/10 text-white' : ''}`}
         />
         <span
@@ -3921,11 +5233,13 @@ function CostOptionCard({
   option,
   selected,
   recommended,
+  publicVenue,
   onSelect,
 }: {
   option: CostOption;
   selected: boolean;
   recommended: boolean;
+  publicVenue: boolean;
   onSelect: () => void;
 }) {
   return (
@@ -3937,31 +5251,53 @@ function CostOptionCard({
       }`}
     >
       {recommended && (
-        <Badge className="absolute right-3 top-3 bg-emerald-700 text-white">
-          mejor costo/protección
+        <Badge className="mb-3 bg-emerald-700 text-white">
+          Sugerida para este uso
         </Badge>
       )}
       <div className="flex items-center gap-2">
         <div
           className={`grid size-8 place-items-center rounded-lg ${
-            selected ? 'bg-emerald-700 text-white' : 'bg-muted text-muted-foreground'
+            selected
+              ? 'bg-emerald-700 text-white'
+              : 'bg-muted text-muted-foreground'
           }`}
         >
           <ShieldCheck className="size-4" />
         </div>
         <div>
-          <h3 className="text-sm font-semibold">{option.title}</h3>
-          <p className="text-[10px] text-muted-foreground">{option.subtitle}</p>
+          <h3 className="text-base font-semibold">{option.title}</h3>
+          <p className="text-xs text-muted-foreground">{option.subtitle}</p>
         </div>
       </div>
       <p className="mt-4 font-mono text-2xl font-black tracking-tight">
         {formatMoney(option.total)}
       </p>
       <p className="mt-1 text-[10px] text-muted-foreground">
-        Materiales: {formatMoney(option.material)} · {option.cabinetLabel} · {option.modules} M
-        requeridos
+        Materiales: {formatMoney(option.material)} · {option.cabinetLabel} ·{' '}
+        {option.modules} M requeridos
       </p>
       <Separator className="my-3" />
+      <p className="mb-2 text-lg font-bold">
+        {option.differentialCount} disyuntor
+        {option.differentialCount === 1 ? '' : 'es'} · {option.nominalCount}{' '}
+        previstos
+      </p>
+      <ul className="mb-3 space-y-1 text-xs">
+        {option.groups.map((group) => (
+          <li key={group.label}>
+            <strong>{group.label}:</strong>{' '}
+            {group.circuits.join(' · ') || 'reservado, sin circuitos'}
+          </li>
+        ))}
+      </ul>
+      {publicVenue && option.id === 'residential' && (
+        <p className="mb-3 rounded-lg bg-amber-50 p-3 text-xs font-semibold text-amber-950">
+          Solo vivienda como uso previsto. En este salón: todos los circuitos
+          comparten ID, incluida EMG. Revisión obligatoria; no se valida como
+          solución para pública concurrencia.
+        </p>
+      )}
       <div className="space-y-2 text-[11px] leading-relaxed">
         <p>
           <strong>Protección:</strong> {option.protection}
@@ -3970,25 +5306,188 @@ function CostOptionCard({
           <strong>Continuidad:</strong> {option.continuity}
         </p>
       </div>
-      <div className="mt-3 flex items-center gap-2">
-        <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
-          <div
-            className="h-full rounded-full bg-emerald-500"
-            style={{ width: `${option.score}%` }}
-          />
-        </div>
-        <span className="font-mono text-[10px] font-bold">{option.score}/100</span>
-      </div>
+      <p className="mt-3 text-xs text-muted-foreground">
+        La cantidad de ID no certifica un “mínimo reglamentario”. Verificar
+        calibre, tipo, neutros por grupo, selectividad, puesta a tierra y
+        servicios de seguridad.
+      </p>
       <Button
         variant={selected ? 'default' : 'outline'}
         size="sm"
         className={`mt-4 w-full ${selected ? 'bg-emerald-700 hover:bg-emerald-800' : ''}`}
         onClick={onSelect}
+        aria-pressed={selected}
       >
         {selected ? 'Propuesta aplicada' : 'Usar propuesta'}{' '}
         {!selected && <ArrowRight data-icon="inline-end" />}
       </Button>
     </article>
+  );
+}
+
+function emergencyAutonomyDeclared(
+  profile: Pick<ProjectProfile, 'emergencyAutonomyHours' | 'emergencyEvidence'>,
+) {
+  return (
+    (profile.emergencyAutonomyHours ?? 0) >= 2 &&
+    Boolean(profile.emergencyEvidence?.trim())
+  );
+}
+
+function AmpacityEditor({
+  section,
+  threeLoaded,
+  settings = {},
+  onChange,
+}: {
+  section: number;
+  threeLoaded: boolean;
+  settings?: AmpacitySettings;
+  onChange: (settings: AmpacitySettings) => void;
+}) {
+  const fieldId = useId();
+  const declared = settings.mode === 'declared';
+  const capacity = conductorAmpacity(section, threeLoaded, settings);
+  const change = (patch: Partial<AmpacitySettings>) =>
+    onChange({ ...settings, ...patch });
+  return (
+    <div className="space-y-3 text-xs">
+      <label htmlFor={`${fieldId}-mode`} className="block">
+        Base de corriente admisible (Iz)
+        <NativeSelect
+          id={`${fieldId}-mode`}
+          className="mt-1 w-full"
+          value={settings.mode ?? 'reference'}
+          onChange={(e) =>
+            change({
+              mode: e.target.value as 'reference' | 'declared',
+              conductorTemperatureC: 70,
+            })
+          }
+        >
+          <NativeSelectOption value="reference">
+            Referencia Cu/PVC 70 °C · unipolares en cañería
+          </NativeSelectOption>
+          <NativeSelectOption value="declared">
+            Iz corregida declarada · otra instalación / LS0H
+          </NativeSelectOption>
+        </NativeSelect>
+      </label>
+      <div className="grid gap-3 sm:grid-cols-3">
+        {declared ? (
+          <>
+            <label htmlFor={`${fieldId}-iz`}>
+              Iz corregida (A)
+              <Input
+                id={`${fieldId}-iz`}
+                type="number"
+                min="0"
+                max="10000"
+                value={settings.declaredA ?? 0}
+                onChange={(e) =>
+                  change({
+                    declaredA: finiteNumber(e.target.value, 0, 0, 10000),
+                  })
+                }
+              />
+            </label>
+            <label htmlFor={`${fieldId}-basis`}>
+              Fuente y condiciones
+              <Input
+                id={`${fieldId}-basis`}
+                maxLength={1000}
+                value={settings.basis ?? ''}
+                placeholder="Cable, sección, método, factores…"
+                onChange={(e) => change({ basis: e.target.value })}
+              />
+            </label>
+          </>
+        ) : (
+          <>
+            <label>
+              Temperatura ambiente
+              <NativeSelect
+                className="w-full"
+                value={settings.ambientC ?? 40}
+                onChange={(e) =>
+                  change({ ambientC: Number(e.target.value) as 20 | 30 | 40 })
+                }
+              >
+                {[20, 30, 40].map((t) => (
+                  <NativeSelectOption key={t} value={t}>
+                    {t} °C
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            </label>
+            <label>
+              Circuitos agrupados
+              <NativeSelect
+                className="w-full"
+                value={settings.groupedCircuits ?? 1}
+                onChange={(e) =>
+                  change({
+                    groupedCircuits: Number(e.target.value) as 1 | 2 | 3,
+                  })
+                }
+              >
+                {[1, 2, 3].map((n) => (
+                  <NativeSelectOption key={n} value={n}>
+                    {n}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            </label>
+          </>
+        )}
+        <label>
+          Temperatura del conductor para ΔV
+          <NativeSelect
+            className="w-full"
+            value={settings.conductorTemperatureC ?? 70}
+            onChange={(e) =>
+              change({
+                conductorTemperatureC: Number(e.target.value) as 20 | 70 | 90,
+              })
+            }
+          >
+            <NativeSelectOption value="70">
+              70 °C · servicio de referencia
+            </NativeSelectOption>
+            <NativeSelectOption value="20">
+              20 °C · comparación en frío
+            </NativeSelectOption>
+            {declared && (
+              <NativeSelectOption value="90">
+                90 °C · aislación a justificar
+              </NativeSelectOption>
+            )}
+          </NativeSelect>
+        </label>
+      </div>
+      <p className="rounded-lg bg-muted p-2 font-semibold">
+        {section} mm² · {threeLoaded ? 3 : 2} conductores cargados · Iz:{' '}
+        {capacity === null
+          ? 'pendiente de valor y fuente'
+          : `${formatNumber(capacity, 2)} A`}
+      </p>
+      <p className="text-muted-foreground">
+        Referencia:{' '}
+        <a
+          className="underline"
+          href={CABLE_REFERENCE_URL}
+          target="_blank"
+          rel="noreferrer"
+        >
+          Prysmian Superastic, tabla p. 3
+        </a>
+        . Cu flexible/PVC, no LS0H. Se aplican los factores de ambiente y
+        agrupamiento. Otra disposición, cable o neutro cargado por armónicos
+        requiere datos específicos; una Iz declarada no se verifica
+        automáticamente. ΔV conserva R20 de cobre de referencia, no un cálculo
+        fasorial.
+      </p>
+    </div>
   );
 }
 
@@ -4012,11 +5511,18 @@ function PriceInput({
           min="0"
           step="1"
           value={value}
-          onChange={(event) => onChange(Number(event.target.value))}
+          onChange={(event) =>
+            onChange(
+              finiteNumber(
+                event.target.value,
+                value,
+                0,
+                suffix === '%' ? 1000 : 1e12,
+              ),
+            )
+          }
           className={
-            suffix === '$'
-              ? 'pl-7 font-mono text-xs'
-              : 'pr-8 font-mono text-xs'
+            suffix === '$' ? 'pl-7 font-mono text-xs' : 'pr-8 font-mono text-xs'
           }
         />
         <span
@@ -4043,7 +5549,9 @@ function Metric({
   return (
     <div
       className={`rounded-xl border p-3 shadow-sm ${
-        emphasis ? 'border-amber-300 bg-amber-50 dark:bg-amber-950/20' : 'bg-card'
+        emphasis
+          ? 'border-amber-300 bg-amber-50 dark:bg-amber-950/20'
+          : 'bg-card'
       }`}
     >
       <p className="text-[10px] font-semibold uppercase tracking-[0.09em] text-muted-foreground">
@@ -4110,7 +5618,8 @@ function ProtectionGuide({
           {
             code: 'DPS',
             title: 'Dispositivo de Protección contra Sobretensiones',
-            description: 'Limita sobretensiones transitorias y las deriva hacia tierra.',
+            description:
+              'Limita sobretensiones transitorias y las deriva hacia tierra.',
             swatch: 'bg-violet-600',
           },
         ]
@@ -4120,7 +5629,8 @@ function ProtectionGuide({
           {
             code: 'Alim.',
             title: 'Térmica de Alimentador a Tablero Seccional (TS)',
-            description: 'Protege la línea seccional que sale desde el TP hacia un tablero seccional interior.',
+            description:
+              'Protege la línea seccional que sale desde el TP hacia un tablero seccional interior.',
             swatch: 'bg-sky-700',
           },
         ]
@@ -4137,7 +5647,8 @@ function ProtectionGuide({
     {
       code: 'C1…',
       title: 'Interruptor termomagnético de circuito terminal',
-      description: 'Cada C protege una salida final. El verde identifica iluminación de emergencia.',
+      description:
+        'Cada C protege una salida final. El verde identifica iluminación de emergencia.',
       swatch: 'bg-amber-400',
     },
   ];
@@ -4192,7 +5703,9 @@ function PhaseBar({
           style={{ width: `${Math.max(3, percent)}%` }}
         />
       </div>
-      <span className="w-20 text-right font-mono text-xs">{formatPower(value)}</span>
+      <span className="w-20 text-right font-mono text-xs">
+        {formatPower(value)}
+      </span>
     </div>
   );
 }
@@ -4216,26 +5729,20 @@ function PanelFront({
   highlightedCircuitId?: number | null;
   onHoverDevice?: (circuitId: number | undefined) => void;
 }) {
-  const slots: Array<{
-    device?: (typeof devices)[number];
-    start?: boolean;
-    continuation?: boolean;
-  }> = Array.from({ length: rows * modulesPerRow }, () => ({}));
-  let cursor = 0;
-  devices.forEach((device) => {
-    if (cursor >= slots.length) return;
-    const remainingOnRow = modulesPerRow - (cursor % modulesPerRow);
-    if (device.span > remainingOnRow) cursor += remainingOnRow;
-    if (cursor >= slots.length) return;
-    for (let index = 0; index < device.span && cursor + index < slots.length; index += 1) {
-      slots[cursor + index] = {
-        device,
-        start: index === 0,
-        continuation: index > 0,
+  const layout = layoutDin(devices, modulesPerRow, 20);
+  const visibleRows = Math.max(rows, layout.rows);
+  const slots: Array<{ device?: PanelDevice; start?: boolean }> = Array.from(
+    { length: visibleRows * modulesPerRow },
+    () => ({}),
+  );
+  for (const placement of layout.placements) {
+    for (let offset = 0; offset < placement.device.span; offset += 1) {
+      slots[placement.start + offset] = {
+        device: placement.device,
+        start: offset === 0,
       };
     }
-    cursor += device.span;
-  });
+  }
 
   return (
     <div className="panel-shell rounded-2xl border-[10px] border-slate-800 bg-slate-200 p-4 shadow-[inset_0_0_0_1px_rgba(255,255,255,.65),0_10px_28px_rgba(15,23,42,.16)]">
@@ -4246,15 +5753,15 @@ function PanelFront({
           </p>
           <p className="mt-0.5 text-xs font-semibold text-slate-800">
             {panelType === 'TP'
-              ? `IGA${hasDps ? ' → DPS' : ''}${hasFeeders ? ' → alimentadores TS' : ''} · ID → circuitos propios`
-              : `Corte local${hasDps ? ' → DPS' : ''} → ID → circuitos terminales`}
+              ? `IGA${hasDps ? ' · DPS en paralelo' : ''}${hasFeeders ? ' · alimentadores TS' : ''} · ID y circuitos propios`
+              : `Corte local${hasDps ? ' · DPS en paralelo' : ''} · ID y circuitos terminales`}
           </p>
         </div>
         <span className="rounded-md bg-slate-800 px-2 py-1 font-mono text-[9px] font-bold text-white">
           1 módulo = 18 mm
         </span>
       </div>
-      {Array.from({ length: rows }).map((_, rowIndex) => (
+      {Array.from({ length: visibleRows }).map((_, rowIndex) => (
         <div key={rowIndex} className="mb-4 last:mb-0">
           <div className="mb-1.5 flex justify-between font-mono text-[10px] font-black uppercase tracking-[0.1em] text-slate-600">
             <span>Riel DIN {rowIndex + 1}</span>
@@ -4337,142 +5844,124 @@ function SingleLineDiagram({
   calculation: PanelCalculation;
   childPanels?: Panel[];
   highlightedCircuitId?: number | null;
-  onHoverCircuit?: (circuitId: number | undefined) => void;
+  onHoverCircuit?: (id: number | undefined) => void;
 }) {
-  const { circuits, supply, architecture } = panel;
-  const protectionLabel =
-    architecture === 'essential'
-      ? 'ID general'
-      : architecture === 'balanced'
-        ? 'ID A / ID B'
-        : 'ID dedicado';
-
-  const totalBranchesCount = circuits.length + childPanels.length;
-
+  // A continuous vertical bus connects every branch; no column-count-dependent offsets.
   return (
-    <div className="unifilar overflow-x-auto rounded-xl border bg-[#f8fafc] p-5">
-      <div className="mx-auto min-w-[760px] max-w-6xl">
-        <div className="flex items-stretch">
-          <DiagramNode
-            kicker={panel.type === 'TP' ? 'Alimentación' : 'Desde TP'}
-            title={supply === 'tri' ? '3 × 380/220 V' : '1 × 220 V'}
-            detail={
-              panel.type === 'TP'
-                ? `${panel.name} · TT`
-                : `${panel.feederBreaker ?? 32} A · ${panel.feederConductor ?? 6} mm² · ${panel.feederPhase ?? (supply === 'tri' ? '3Φ' : 'L1')}`
-            }
-            tone="dark"
-          />
-          <DiagramWire />
-          <DiagramNode
-            kicker="Cabecera"
-            title={`${panel.type === 'TP' ? 'IGA' : 'Corte local'} ${calculation.mainBreaker} A`}
-            detail={supply === 'tri' ? '4P · Curva C' : '2P · Curva C'}
-          />
-          {panelHasDps(panel) && (
-            <>
-              <DiagramWire />
-              <DiagramNode
-                kicker="Sobretensiones"
-                title="DPS"
-                detail={supply === 'tri' ? '3P+N · Tipo 2' : '1P+N · Tipo 2'}
-                tone="blue"
-              />
-            </>
-          )}
-          <DiagramWire />
-          <DiagramNode
-            kicker="Barras DIN"
-            title={supply === 'tri' ? 'L1 · L2 · L3 · N · PE' : 'L · N · PE'}
-            detail={`Derivaciones · ${protectionLabel}`}
-            tone="amber"
-          />
-        </div>
-        <div className="ml-auto mr-[75px] h-7 w-[2px] bg-slate-700" />
-        <div
-          className="grid gap-x-2 gap-y-4"
-          style={{
-            gridTemplateColumns: `repeat(${Math.min(Math.max(totalBranchesCount, 1), 6)}, minmax(110px, 1fr))`,
-          }}
-        >
-          {/* Child TS feeder branches in TP */}
-          {childPanels.map((child, idx) => (
-            <div key={`feeder-branch-${child.id}`} className="relative pt-7">
-              <span className="absolute left-1/2 top-0 h-7 w-[2px] -translate-x-1/2 bg-sky-600" />
-              <span className="absolute left-0 right-0 top-0 h-[2px] bg-slate-700 first:left-1/2 last:right-1/2" />
-              <div className="rounded-lg border-2 border-sky-400 bg-sky-50 p-2.5 shadow-sm text-sky-950">
-                <div className="mb-2 flex items-center justify-between gap-2">
-                  <span className="rounded bg-sky-700 px-1 py-0.5 font-mono text-[9px] font-bold text-white">
-                    Alim. TS{idx + 1}
-                  </span>
-                  <span className="size-2 rounded-full bg-sky-500" />
-                </div>
-                <p className="truncate text-xs font-bold text-sky-900" title={child.name}>
-                  → {child.name}
+    <div className="unifilar rounded-xl border bg-slate-50 p-4 text-slate-900">
+      <p className="mb-3 text-sm font-semibold">
+        {architectureDetails(panel.architecture).title} ·{' '}
+        {differentialGroups(panel).length} diferenciales
+      </p>
+      <div className="flex flex-wrap items-center gap-3 border-b-2 border-slate-700 pb-4">
+        <DiagramNode
+          kicker={panel.type === 'TP' ? 'Alimentación' : 'Desde TP'}
+          title={panel.supply === 'tri' ? '380/220 V · 3Φ' : '220 V · 1Φ'}
+          detail={panel.name}
+          tone="dark"
+        />
+        <span aria-hidden="true">→</span>
+        <DiagramNode
+          kicker="Cabecera"
+          title={`${panel.type === 'TP' ? 'IGA' : 'Corte local'} ${calculation.mainBreaker} A`}
+          detail={
+            panel.supply === 'tri'
+              ? '4P · calibre preliminar'
+              : '2P · calibre preliminar'
+          }
+        />
+        <span className="text-xs">→ barras activas y N · PE independiente</span>
+      </div>
+      <div className="border-l-2 border-slate-700">
+        {panelHasDps(panel) && (
+          <div className="diagram-branch flex items-center py-3">
+            <span className="h-0.5 w-6 shrink-0 bg-slate-700" />
+            <div className="rounded-lg border border-violet-300 bg-violet-50 p-3 text-xs">
+              <strong>DPS · derivación en paralelo hacia PE</strong>
+              <p>
+                Conexión y protección de respaldo según esquema TT y fabricante.
+                No está en serie con las cargas.
+              </p>
+            </div>
+          </div>
+        )}
+        {differentialGroups(panel)
+          .filter((group) => !group.circuits.length)
+          .map((group) => (
+            <div
+              key={group.key}
+              className="diagram-branch flex items-center py-2"
+            >
+              <span className="h-0.5 w-6 shrink-0 bg-slate-700" />
+              <div className="rounded-lg border border-dashed border-sky-400 bg-sky-50 p-3 text-xs">
+                <strong>
+                  {group.label} · 30 mA · reservado, sin circuitos
+                </strong>
+                <p>
+                  Incluido como equipo en el riel y presupuesto; no demuestra
+                  servicio de emergencia instalado.
                 </p>
-                <Separator className="my-2 bg-sky-200" />
-                <div className="grid grid-cols-2 gap-1 font-mono text-[9px] text-sky-800">
-                  <span>{child.feederBreaker ?? 32} A</span>
-                  <span>{child.feederConductor ?? 6} mm²</span>
-                  <span>{child.supply === 'tri' ? '4P · 3Φ' : `2P · ${child.feederPhase ?? 'L1'}`}</span>
-                  <span>{child.feederLengthM ?? 15} m</span>
-                </div>
               </div>
             </div>
           ))}
-
-          {/* Terminal circuits */}
-          {circuits.map((circuit, index) => {
-            const isHighlighted = highlightedCircuitId === circuit.id;
-
-            return (
-              <div
-                key={circuit.id}
-                onMouseEnter={() => onHoverCircuit?.(circuit.id)}
-                onMouseLeave={() => onHoverCircuit?.(undefined)}
-                className="relative pt-7 cursor-pointer"
-              >
-                <span className="absolute left-1/2 top-0 h-7 w-[2px] -translate-x-1/2 bg-slate-700" />
-                <span className="absolute left-0 right-0 top-0 h-[2px] bg-slate-700 first:left-1/2 last:right-1/2" />
-                <div
-                  className={`rounded-lg border-2 bg-white p-2.5 shadow-sm transition-all ${
-                    isHighlighted
-                      ? 'border-amber-500 ring-2 ring-amber-400 scale-[1.05] shadow-md'
-                      : circuit.kind === 'EMG'
-                        ? 'border-emerald-400'
-                        : 'border-slate-300 hover:border-slate-400'
-                  }`}
-                >
-                  <div className="mb-2 flex items-center justify-between gap-2">
-                    <span className="font-mono text-[10px] font-black">
-                      C{index + 1}
-                    </span>
-                    <span className={`size-2 rounded-full ${phaseColor(circuit.phase)}`} />
-                  </div>
-                  <p className="truncate text-xs font-semibold" title={circuit.name}>
-                    {circuit.name}
-                  </p>
-                  <Separator className="my-2" />
-                  <div className="grid grid-cols-2 gap-1 font-mono text-[9px] text-slate-600">
-                    <span>
-                      {architecture === 'essential'
-                        ? 'ID'
-                        : architecture === 'balanced'
-                          ? circuit.kind === 'EMG' || index % 2 === 1
-                            ? 'ID B'
-                            : 'ID A'
-                          : 'ID propio'}
-                    </span>
-                    <span>{circuit.breaker} A</span>
-                    <span>{circuit.conductor} mm²</span>
-                    <span>{circuit.phase} · {formatPower(circuitPower(circuit))}</span>
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
+        {childPanels.map((child, index) => (
+          <div key={child.id} className="diagram-branch flex items-center py-2">
+            <span className="h-0.5 w-6 shrink-0 bg-slate-700" />
+            <div className="min-w-0 flex-1 rounded-lg border border-sky-300 bg-sky-50 p-3 text-xs">
+              <strong>
+                Alim. TS{index + 1} → {child.name}
+              </strong>
+              <p className="mt-1">
+                TM {child.feederBreaker ?? 32} A ·{' '}
+                {child.supply === 'tri'
+                  ? '4P · 3Φ'
+                  : `2P · ${child.feederPhase ?? 'L1'}`}{' '}
+                · {child.feederConductor ?? 6} mm² · {child.feederLengthM ?? 15}{' '}
+                m
+              </p>
+              <p className="mt-1 break-words">
+                Cañería:{' '}
+                {child.feederConduit?.trim() || 'pendiente de dimensionar'}
+              </p>
+            </div>
+          </div>
+        ))}
+        {panel.circuits.map((circuit, index) => (
+          <div
+            key={circuit.id}
+            onMouseEnter={() => onHoverCircuit?.(circuit.id)}
+            onMouseLeave={() => onHoverCircuit?.(undefined)}
+            onFocus={() => onHoverCircuit?.(circuit.id)}
+            onBlur={() => onHoverCircuit?.(undefined)}
+            className="diagram-branch flex items-center py-2"
+          >
+            <span className="h-0.5 w-6 shrink-0 bg-slate-700" />
+            <div
+              className={`min-w-0 flex-1 rounded-lg border p-3 text-xs ${highlightedCircuitId === circuit.id ? 'border-amber-500 bg-amber-50 ring-2 ring-amber-400' : circuit.kind === 'EMG' ? 'border-emerald-400 bg-emerald-50' : 'border-slate-300 bg-white'}`}
+            >
+              <strong>
+                {differentialLabel(panel, circuit.id)} · 30 mA → TM C{index + 1}{' '}
+                · {circuit.breaker} A → {circuit.name}
+              </strong>
+              <p className="mt-1">
+                {circuit.phase} · {circuit.phase === '3Φ' ? '4P' : '2P'} ·{' '}
+                {circuit.conductor} mm² · PE{' '}
+                {protectiveConductorSection(circuit.conductor)} mm² ·{' '}
+                {circuit.lengthM} m · {formatPower(circuitPower(circuit))}
+              </p>
+              <p className="mt-1 break-words">
+                Cañería: {circuit.conduit?.trim() || 'pendiente de dimensionar'}
+              </p>
+            </div>
+          </div>
+        ))}
       </div>
+      <p className="mt-3 text-[10px] text-slate-600">
+        Esquema funcional, no plano de conexiones. El mismo ID identificado en
+        varias salidas es un único equipo compartido. PE no se interrumpe ni
+        atraviesa el diferencial. Confirmar neutros separados por grupo, bornes,
+        calibre de ID y coordinación.
+      </p>
     </div>
   );
 }
@@ -4481,187 +5970,158 @@ function MultiLineDiagram({
   panel,
   childPanels,
   calculations,
+  highlightedCircuitId,
+  onHoverCircuit,
 }: {
   panel: Panel;
   childPanels: Panel[];
   calculations: Map<string, PanelCalculation>;
+  highlightedCircuitId?: number | null;
+  onHoverCircuit?: (id: number | undefined) => void;
 }) {
-  const { circuits, supply } = panel;
+  const rows = [
+    ...childPanels.map((child, index) => ({
+      key: child.id,
+      id: undefined as number | undefined,
+      title: `A${index + 1} → ${child.name}`,
+      protection: `TM ${child.feederBreaker ?? 32} A en TP`,
+      phase: child.supply === 'tri' ? '3Φ' : (child.feederPhase ?? 'L1'),
+      section: child.feederConductor ?? 6,
+      length: child.feederLengthM ?? 15,
+      power: calculations.get(child.id)?.demandVA ?? 0,
+      conduit: child.feederConduit,
+      feeder: true,
+      drop: calculations.get(child.id)?.feederDrop.percent ?? 0,
+    })),
+    ...panel.circuits.map((circuit, index) => ({
+      key: `c-${circuit.id}`,
+      id: circuit.id,
+      title: `C${index + 1} · ${circuit.name}`,
+      protection: `${differentialLabel(panel, circuit.id)} 30 mA tipo ${panelDifferentialType(panel)} → TM ${circuit.breaker} A`,
+      phase: circuit.phase,
+      section: circuit.conductor,
+      length: circuit.lengthM,
+      power: circuitPower(circuit),
+      conduit: circuit.conduit,
+      feeder: false,
+      drop:
+        voltageDrop(circuit, panel.supply).percent +
+        (panel.type === 'TS'
+          ? (calculations.get(panel.id)?.feederDrop.percent ?? 0)
+          : 0),
+    })),
+  ];
   return (
-    <div className="overflow-x-auto rounded-xl border bg-[#f8fafc]">
+    <div className="multifilar overflow-x-auto rounded-xl border bg-slate-50 text-slate-900">
       <table className="w-full min-w-[860px] border-collapse text-left text-xs">
         <thead>
-          <tr className="border-b-2 border-slate-800 bg-slate-100 text-[10px] uppercase tracking-[0.08em] text-slate-600">
-            <th className="px-3 py-2.5">Salida</th>
-            <th className="px-3 py-2.5">Protección</th>
-            <th className="px-3 py-2.5">Conductores activos</th>
-            <th className="px-3 py-2.5">Neutro</th>
-            <th className="px-3 py-2.5">Protección PE</th>
-            <th className="px-3 py-2.5">Carga / recorrido</th>
+          <tr className="border-b-2 border-slate-700 bg-slate-100">
+            {[
+              'Salida / protección',
+              'Fases',
+              'Neutro',
+              'Protección PE',
+              'Carga / recorrido / cañería',
+            ].map((label) => (
+              <th key={label} className="p-3">
+                {label}
+              </th>
+            ))}
           </tr>
         </thead>
         <tbody>
-          {childPanels.map((child, index) => {
-            const childCalculation = calculations.get(child.id);
-            const threePhase = child.supply === 'tri';
-            return (
-              <tr key={`feeder-${child.id}`} className="border-b bg-sky-50/60">
-                <td
-                  className="px-3 py-3"
-                  aria-label={`Alimentador A${index + 1}: ${child.name}`}
-                >
-                  <div className="flex items-center gap-2">
-                    <span className="grid size-6 place-items-center rounded bg-sky-700 font-mono text-[9px] font-bold text-white">
-                      A{index + 1}
-                    </span>
-                    <div>
-                      <p className="font-semibold">Alimentador a {child.name}</p>
-                      <p className="text-[9px] text-sky-700">Circuito seccional</p>
-                    </div>
-                  </div>
-                </td>
-                <td className="px-3 py-3 font-mono">
-                  TM {child.feederBreaker ?? 32} A · {threePhase ? '4P' : '2P'}
-                  <br />
-                  <span className="text-[9px] text-slate-500">Protección ubicada en el TP</span>
-                </td>
-                <td className="px-3 py-3">
-                  <ConductorLines
-                    count={threePhase ? 3 : 1}
-                    color="bg-amber-500"
-                    label={
-                      threePhase
-                        ? `L1+L2+L3 · ${child.feederConductor ?? 6} mm²`
-                        : `${child.feederPhase ?? 'L1'} · ${child.feederConductor ?? 6} mm²`
-                    }
-                  />
-                </td>
-                <td className="px-3 py-3">
-                  <ConductorLines
-                    count={1}
-                    color="bg-sky-500"
-                    label={`N · ${child.feederConductor ?? 6} mm²`}
-                  />
-                </td>
-                <td className="px-3 py-3">
-                  <ConductorLines
-                    count={1}
-                    color="bg-emerald-500"
-                    label={`PE · ${child.feederConductor ?? 6} mm²*`}
-                  />
-                </td>
-                <td className="px-3 py-3 font-mono">
-                  {formatPower(childCalculation?.demandVA ?? 0)} · {child.feederLengthM ?? 15} m
-                  <br />
-                  <span className={(childCalculation?.feederDrop.percent ?? 0) > 1 ? 'text-amber-700' : 'text-emerald-700'}>
-                    ΔV seccional {(childCalculation?.feederDrop.percent ?? 0).toFixed(2)} %
-                  </span>
-                </td>
-              </tr>
-            );
-          })}
-          {circuits.map((circuit, index) => {
-            const threePhase = circuit.phase === '3Φ' && supply === 'tri';
-            const circuitDrop = voltageDrop(circuit, supply);
-            const totalDropPercent =
-              circuitDrop.percent +
-              (panel.type === 'TS' ? calculations.get(panel.id)?.feederDrop.percent ?? 0 : 0);
-            return (
-              <tr key={circuit.id} className="border-b last:border-0">
-                <td
-                  className="px-3 py-3"
-                  aria-label={`Circuito C${index + 1}: ${circuit.name}`}
-                >
-                  <div className="flex items-center gap-2">
-                    <span className="grid size-6 place-items-center rounded bg-slate-900 font-mono text-[9px] font-bold text-white">
-                      C{index + 1}
-                    </span>
-                    <div>
-                      <p className="font-semibold">{circuit.name}</p>
-                      <p className="text-[9px] text-slate-500">
-                        {circuit.kind} · {circuit.phase}
-                      </p>
-                    </div>
-                  </div>
-                </td>
-                <td className="px-3 py-3 font-mono">
-                  TM {circuit.breaker} A · {threePhase ? '4P' : '2P'}
-                  <br />
-                  <span className="text-[9px] text-slate-500">
-                    {panel.architecture === 'continuity'
-                      ? `ID propio 30 mA tipo ${panelDifferentialType(panel)}`
-                      : `ID 30 mA tipo ${panelDifferentialType(panel)} aguas arriba`}
-                  </span>
-                </td>
-                <td className="px-3 py-3">
-                  <ConductorLines
-                    count={threePhase ? 3 : 1}
-                    color="bg-amber-500"
-                    label={
-                      threePhase
-                        ? `L1+L2+L3 · ${circuit.conductor} mm²`
-                        : `${circuit.phase} · ${circuit.conductor} mm²`
-                    }
-                  />
-                </td>
-                <td className="px-3 py-3">
-                  <ConductorLines
-                    count={1}
-                    color="bg-sky-500"
-                    label={`N · ${circuit.conductor} mm²`}
-                  />
-                </td>
-                <td className="px-3 py-3">
-                  <ConductorLines
-                    count={1}
-                    color="bg-emerald-500"
-                    label={`PE · ${circuit.conductor} mm²*`}
-                  />
-                </td>
-                <td className="px-3 py-3 font-mono">
-                  {formatPower(circuitPower(circuit))} · {circuit.lengthM} m
-                  <br />
-                  <span
-                    className={
-                      totalDropPercent > (circuit.kind === 'FM' ? 5 : 3)
-                        ? 'text-amber-700'
-                        : 'text-emerald-700'
-                    }
-                  >
-                    ΔV total {totalDropPercent.toFixed(1)} %
-                  </span>
-                </td>
-              </tr>
-            );
-          })}
+          {rows.map((row) => (
+            <tr
+              key={row.key}
+              tabIndex={row.id === undefined ? undefined : 0}
+              onMouseEnter={() => onHoverCircuit?.(row.id)}
+              onMouseLeave={() => onHoverCircuit?.(undefined)}
+              onFocus={() => onHoverCircuit?.(row.id)}
+              onBlur={() => onHoverCircuit?.(undefined)}
+              className={`border-b ${row.id !== undefined && highlightedCircuitId === row.id ? 'bg-amber-100 ring-2 ring-inset ring-amber-400' : row.feeder ? 'bg-sky-50' : ''}`}
+            >
+              <td className="p-3">
+                <strong>{row.title}</strong>
+                <p className="mt-1">
+                  {row.protection} · {row.phase === '3Φ' ? '4P' : '2P'}
+                </p>
+              </td>
+              <td className="p-3">
+                <PhaseConductorLines phase={row.phase} section={row.section} />
+              </td>
+              <td className="p-3">
+                <ConductorLine
+                  label={`N · ${row.section} mm²`}
+                  color="#38bdf8"
+                />
+              </td>
+              <td className="p-3">
+                <ConductorLine
+                  label={`PE · ${protectiveConductorSection(row.section)} mm²`}
+                  color="repeating-linear-gradient(90deg, #15803d 0 8px, #facc15 8px 16px)"
+                />
+              </td>
+              <td className="p-3">
+                <p>
+                  {formatPower(row.power)}{' '}
+                  {row.feeder ? '(demanda)' : '(instalada)'} · {row.length} m
+                </p>
+                <p>
+                  ΔV {row.feeder ? 'seccional' : 'total'}{' '}
+                  {formatNumber(row.drop, 2)} %
+                </p>
+                <p className="mt-1 break-words">
+                  Cañería: {row.conduit?.trim() || 'pendiente'}
+                </p>
+              </td>
+            </tr>
+          ))}
         </tbody>
       </table>
-      <p className="border-t bg-amber-50 px-3 py-2 text-[10px] leading-relaxed text-amber-900">
-        * La sección PE mostrada es conservadora e igual a la activa. Verificar su dimensionamiento,
-        continuidad, canalización y la sección mínima del conductor entre tablero y electrodo según
-        proyecto y reglamentación vigente.
+      <p className="border-t bg-amber-50 p-3 text-[10px]">
+        PE de circuito: se adopta máx(2,5 mm²; sección activa), sin cálculo
+        adiabático ni reducción. No confundir con conductor tablero–electrodo
+        (mínimo 4 mm² según III.2.19.7). N de igual sección: verificar
+        armónicos. Colores: L1 marrón, L2 negro, L3 rojo, N celeste, PE
+        verde/amarillo. Este cuadro no sustituye el multifilar de conexiones
+        definitivo.
       </p>
     </div>
   );
 }
 
-function ConductorLines({
-  count,
-  color,
-  label,
+function PhaseConductorLines({
+  phase,
+  section,
 }: {
-  count: number;
-  color: string;
-  label: string;
+  phase: string;
+  section: number;
 }) {
+  const phases =
+    phase === '3Φ'
+      ? (['L1', 'L2', 'L3'] as const)
+      : ([phase === 'L2' ? 'L2' : phase === 'L3' ? 'L3' : 'L1'] as const);
+  return (
+    <div className="space-y-2">
+      {phases.map((name) => (
+        <ConductorLine
+          key={name}
+          label={`${name} · ${section} mm²`}
+          color={PHASE_CONDUCTOR_COLORS[name]}
+        />
+      ))}
+    </div>
+  );
+}
+
+function ConductorLine({ label, color }: { label: string; color: string }) {
   return (
     <div>
-      <div className="space-y-1">
-        {Array.from({ length: count }).map((_, index) => (
-          <span key={index} className={`block h-0.5 w-24 ${color}`} />
-        ))}
-      </div>
-      <p className="mt-1 font-mono text-[9px] text-slate-600">{label}</p>
+      <span
+        className="block h-1 w-24 max-w-full rounded"
+        style={{ background: color }}
+      />
+      <p className="mt-1 whitespace-nowrap font-mono text-[10px]">{label}</p>
     </div>
   );
 }
@@ -4692,14 +6152,6 @@ function DiagramNode({
       </span>
       <strong className="mt-0.5 text-xs">{title}</strong>
       <span className="mt-1 font-mono text-[9px] opacity-70">{detail}</span>
-    </div>
-  );
-}
-
-function DiagramWire() {
-  return (
-    <div className="flex min-w-5 flex-1 items-center">
-      <span className="h-[2px] w-full bg-slate-700" />
     </div>
   );
 }

@@ -44,6 +44,91 @@ test('002: modelo 2P/4P respeta mínimo modular incluso al importar 3Φ con 2M',
   );
 });
 
+test('cabecera sin calibre: conserva IGA/corte y circuitos sin fabricar un amperaje', () => {
+  for (const type of ['TP', 'TS']) {
+    for (const supply of ['mono', 'tri']) {
+      const p = { ...panel('balanced', supply), type };
+      const devices = buildPanelDevices(p, [], null);
+      const head = devices.find((device) => device.key === 'cabecera');
+      assert.equal(head.label, type === 'TP' ? 'IGA' : 'CORTE');
+      assert.equal(head.detail, 'Sin dimensionar');
+      assert.equal(head.span, supply === 'mono' ? 2 : 4);
+      assert.deepEqual(
+        devices
+          .filter((device) => device.circuitId !== undefined)
+          .map((device) => device.circuitId)
+          .sort((a, b) => a - b),
+        p.circuits.map((circuit) => circuit.id).sort((a, b) => a - b),
+      );
+      assert.equal(
+        buildPanelDevices(p, [], 63).find(
+          (device) => device.key === 'cabecera',
+        ).detail,
+        '63 A',
+      );
+    }
+  }
+});
+
+test('alimentadores: borrar o reordenar otro TS no cambia la identidad del destino', () => {
+  const tp = panel();
+  const first = {
+    ...panel(),
+    id: 'ts1',
+    name: 'TS1',
+    type: 'TS',
+    feederBreaker: 32,
+  };
+  const remaining = {
+    ...panel(),
+    id: 'ts2',
+    name: 'TS2 · Cocina',
+    type: 'TS',
+    feederBreaker: 50,
+  };
+  const before = structuredClone([first, remaining]);
+  const expected = {
+    key: 'feeder-ts2',
+    label: 'Alim. TS2 · Cocina',
+    fullName: 'Alimentador a TS2 · Cocina',
+    detail: '50 A · 4P',
+    span: 4,
+    className: 'device-feeder',
+  };
+  for (const children of [
+    [first, remaining],
+    [remaining, first],
+    [remaining],
+  ]) {
+    assert.deepEqual(
+      buildPanelDevices(tp, children, 63).find(
+        (device) => device.key === 'feeder-ts2',
+      ),
+      expected,
+    );
+  }
+  assert.deepEqual([first, remaining], before);
+});
+
+test('alimentador renombrado: actualiza destino y conserva id, fase y calibre declarados', () => {
+  const child = {
+    ...panel('balanced', 'mono'),
+    id: 'ts-estable',
+    name: 'Taller',
+    type: 'TS',
+    feederBreaker: 25,
+    feederPhase: 'L3',
+  };
+  const device = buildPanelDevices(panel(), [child], 63).find(
+    (item) => item.key === 'feeder-ts-estable',
+  );
+  assert.equal(device.label, 'Alim. Taller');
+  assert.equal(device.fullName, 'Alimentador a Taller');
+  assert.equal(device.detail, '25 A · 2P L3');
+  assert.equal(device.span, 2);
+  assert.equal(device.circuitId, undefined);
+});
+
 test('003/013: PE protegido mínimo 2,5 y fases con colores distintos', () => {
   assert.equal(protectiveConductorSection(1.5), 2.5);
   assert.equal(protectiveConductorSection(6), 6);

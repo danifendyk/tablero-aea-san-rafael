@@ -4,13 +4,17 @@ import {
   accumulatedVoltageDrop,
   balancePanelCircuits,
   conductorAmpacity,
+  circuitRequirements,
+  feederRequirements,
   resistanceAtTemperature,
   activePower,
   downstreamPhaseDemand,
   feederVoltageDrop,
   PRELIMINARY_CONDUCTOR_CAPACITY,
   selectPreliminaryBreaker,
+  selectHeadDevice,
   STANDARD_BREAKERS,
+  voltageDropCriteria,
 } from '../lib/electrical.ts';
 
 const circuit = (id, va, phase = 'L1') => ({
@@ -167,6 +171,189 @@ test('protección: todas las selecciones cumplen el intervalo y el catálogo (ba
         }
       }
     }
+  }
+});
+
+test('corte local: protege la maniobra frente a la suma de tres cargas tras térmicas independientes', () => {
+  // Three declared 8 A circuits, diversity 0.5: Ib=12 A, but simultaneous
+  // 24 A is below the 32 A feeder and each 16 A branch protective device.
+  const input = Object.freeze({
+    type: 'TS',
+    current: 12,
+    maxBranchBreaker: 16,
+    feederBreaker: 32,
+  });
+  const selected = selectHeadDevice(input);
+  assert.equal(selected.currentBasedRating, 16);
+  assert.equal(selected.rating, 32);
+  assert.ok(selected.rating >= 3 * 8);
+  assert.equal(input.feederBreaker, 32);
+  assert.equal(input.maxBranchBreaker, 16);
+});
+
+test('corte local: 63 A tras alimentador 32 A sigue válido cuando la demanda exige ese corte', () => {
+  assert.deepEqual(
+    selectHeadDevice({
+      type: 'TS',
+      current: 48.8,
+      maxBranchBreaker: 20,
+      feederBreaker: 32,
+    }),
+    { rating: 63, currentBasedRating: 63 },
+  );
+  // This helper must not silently raise the feeder to resolve its Ib/In/Iz.
+});
+
+test('cabecera: 160 A de demanda no generan una selección ficticia de 125 A', () => {
+  for (const type of ['TP', 'TS']) {
+    const selected = selectHeadDevice({
+      type,
+      current: 160,
+      maxBranchBreaker: 20,
+      feederBreaker: 125,
+    });
+    assert.equal(selected.rating, null);
+    assert.equal(selected.currentBasedRating, null);
+    assert.match(selected.reason, /125 A/);
+  }
+});
+
+test('cabecera: el límite del catálogo aplica también a las protecciones declaradas', () => {
+  const outgoing = selectHeadDevice({
+    type: 'TP',
+    current: 1,
+    maxBranchBreaker: 160,
+  });
+  assert.equal(outgoing.rating, null);
+  assert.equal(outgoing.currentBasedRating, 6);
+  assert.match(outgoing.reason, /protecciones/);
+  const feeder = selectHeadDevice({
+    type: 'TS',
+    current: 1,
+    maxBranchBreaker: 10,
+    feederBreaker: 160,
+  });
+  assert.equal(feeder.rating, null);
+  assert.equal(feeder.currentBasedRating, 6);
+});
+
+test('cabecera: diferencia margen de diseño agotado de un calibre disponible en el límite', () => {
+  assert.equal(
+    selectHeadDevice({
+      type: 'TP',
+      current: 125 / 1.15,
+      maxBranchBreaker: 20,
+    }).rating,
+    125,
+  );
+  const beyond = selectHeadDevice({
+    type: 'TP',
+    current: 109,
+    maxBranchBreaker: 20,
+  });
+  assert.equal(beyond.rating, null);
+  assert.match(beyond.reason, /margen de diseño del 15/);
+});
+
+test('cabecera: no valida corriente desconocida, derivaciones inválidas o TS sin térmica de alimentación', () => {
+  for (const current of [NaN, Infinity, -1, undefined]) {
+    const result = selectHeadDevice({
+      type: 'TP',
+      current,
+      maxBranchBreaker: 20,
+    });
+    assert.equal(result.rating, null);
+    assert.equal(result.currentBasedRating, null);
+  }
+  for (const maxBranchBreaker of [NaN, Infinity, -1, undefined]) {
+    assert.equal(
+      selectHeadDevice({ type: 'TP', current: 10, maxBranchBreaker }).rating,
+      null,
+    );
+  }
+  for (const feederBreaker of [undefined, NaN, Infinity, 0, -1]) {
+    assert.equal(
+      selectHeadDevice({
+        type: 'TS',
+        current: 10,
+        maxBranchBreaker: 16,
+        feederBreaker,
+      }).rating,
+      null,
+    );
+  }
+});
+
+test('cabecera: una selección existente siempre admite demanda, derivaciones y alimentador TS', () => {
+  for (const type of ['TP', 'TS']) {
+    for (let current = 0; current <= 160; current += 0.5) {
+      for (const feederBreaker of [10, 32, 63, 125, 160]) {
+        const selected = selectHeadDevice({
+          type,
+          current,
+          maxBranchBreaker: 20,
+          feederBreaker,
+        });
+        if (selected.rating !== null) {
+          assert.ok(STANDARD_BREAKERS.includes(selected.rating));
+          assert.ok(selected.rating + 1e-9 >= current * 1.15);
+          assert.ok(selected.rating >= 20);
+          if (type === 'TS') assert.ok(selected.rating >= feederBreaker);
+        } else {
+          assert.ok(
+            current * 1.15 > 125 || (type === 'TS' && feederBreaker > 125),
+          );
+        }
+      }
+    }
+  }
+});
+
+test('sección mínima: pasar Ib/In/Iz no habilita 1,5 mm² para TUG ni alimentador', () => {
+  const iz = conductorAmpacity(1.5, false);
+  assert.equal(selectPreliminaryBreaker(1, iz, 10), 10);
+  assert.equal(circuitRequirements('TUG').minimumSectionMm2, 2.5);
+  assert.equal(feederRequirements().minimumSectionMm2, 2.5);
+  assert.ok(1.5 < circuitRequirements('TUG').minimumSectionMm2);
+  assert.ok(1.5 < feederRequirements().minimumSectionMm2);
+});
+
+test('secciones mínimas: distingue iluminación, otros usos modelados y destinos sin encuadre', () => {
+  for (const kind of ['IUG', 'EMG']) {
+    assert.equal(circuitRequirements(kind).minimumSectionMm2, 1.5);
+  }
+  for (const kind of ['TUG', 'TUE', 'FM']) {
+    assert.equal(circuitRequirements(kind).minimumSectionMm2, 2.5);
+  }
+  assert.equal(circuitRequirements('desconocido').minimumSectionMm2, null);
+  assert.match(feederRequirements().sourceUrl, /^https:\/\/aea\.org\.ar\//);
+  assert.match(feederRequirements().basis, /seccional 2,5 mm²/);
+  assert.equal(circuitRequirements('TUG').maximumBreakerA, undefined);
+});
+
+test('criterios de caída: el reparto TS recomendado no se aplica como límite de tramo directo TP', () => {
+  const direct = voltageDropCriteria('TP', 'IUG');
+  const sectional = voltageDropCriteria('TS', 'IUG');
+  assert.equal(direct.terminalLimitPercent, 3);
+  assert.equal(direct.terminalBasis, 'total-from-tp');
+  assert.equal(sectional.terminalLimitPercent, 2);
+  assert.equal(sectional.terminalBasis, 'recommended-allocation');
+  assert.equal(sectional.feederLimitPercent, 1);
+  assert.equal(sectional.totalLimitPercent, 3);
+  // The independent municipal observation still applies above 2% in a TP.
+  assert.ok(2.5 <= direct.terminalLimitPercent);
+  assert.ok(2.5 > direct.municipalTerminalLimitPercent);
+});
+
+test('criterios de caída: motores, iluminación y política de tomas conservan su alcance explícito', () => {
+  assert.equal(voltageDropCriteria('TP', 'FM').terminalLimitPercent, 5);
+  assert.equal(voltageDropCriteria('TS', 'FM').terminalLimitPercent, 4);
+  assert.equal(voltageDropCriteria('TS', 'FM').totalLimitPercent, 5);
+  assert.equal(voltageDropCriteria('TS', 'FM').totalBasis, 'aea-motors-only');
+  assert.equal(voltageDropCriteria('TS', 'EMG').totalBasis, 'aea-lighting');
+  for (const kind of ['TUG', 'TUE']) {
+    assert.equal(voltageDropCriteria('TS', kind).totalLimitPercent, 3);
+    assert.equal(voltageDropCriteria('TS', kind).totalBasis, 'project-design');
   }
 });
 

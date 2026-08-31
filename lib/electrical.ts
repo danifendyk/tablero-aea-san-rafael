@@ -6,6 +6,84 @@ export const COPPER_TEMPERATURE_COEFFICIENT = 0.00393;
 export const DEFAULT_CONDUCTOR_TEMPERATURE_C = 70;
 export const CABLE_REFERENCE_URL =
   'https://latam.prysmian.com/sites/latam.prysmian.com/files/media/documents/PRY2020_Superastic%20Jet.pdf';
+export const AEA_CONDUCTOR_REFERENCE_URL =
+  'https://aea.org.ar/wp-content/uploads/2017/10/aea_90364_7_771_corrigendum_02.pdf';
+
+export type ConductorRequirement = {
+  minimumSectionMm2: number | null;
+  sourceUrl: string;
+  basis: string;
+};
+
+/** AEA 771, Corrigendum 2, table 771.13.I; independent of Ib/In/Iz.
+ * EMG means a lighting circuit in this application's 220 V model, not an MBTF
+ * circuit. Unknown destinations stay pending instead of inheriting a minimum.
+ * No unverified breaker/point-count limits are inferred from the cable table.
+ */
+export function circuitRequirements(kind: string): ConductorRequirement {
+  const lighting = kind === 'IUG' || kind === 'EMG';
+  const otherKnown = kind === 'TUG' || kind === 'TUE' || kind === 'FM';
+  return {
+    minimumSectionMm2: lighting ? 1.5 : otherKnown ? 2.5 : null,
+    sourceUrl: AEA_CONDUCTOR_REFERENCE_URL,
+    basis: lighting
+      ? 'AEA 771, tabla 771.13.I: iluminación de uso general; EMG se trata como iluminación a 220 V, con encuadre a verificar.'
+      : otherKnown
+        ? 'AEA 771, tabla 771.13.I: tomacorrientes generales, usos especiales o uso específico distinto de MBTF.'
+        : 'Destino sin encuadre verificado: definir la sección mínima aplicable.',
+  };
+}
+
+export function feederRequirements(): ConductorRequirement {
+  return {
+    minimumSectionMm2: 2.5,
+    sourceUrl: AEA_CONDUCTOR_REFERENCE_URL,
+    basis:
+      'AEA 771, tabla 771.13.I: circuito seccional 2,5 mm²; no confundir con la línea principal de 4 mm².',
+  };
+}
+
+export type VoltageDropCriteria = {
+  feederLimitPercent: number;
+  terminalLimitPercent: number;
+  totalLimitPercent: number;
+  municipalTerminalLimitPercent: number;
+  terminalBasis: 'total-from-tp' | 'recommended-allocation';
+  totalBasis: 'aea-lighting' | 'aea-motors-only' | 'project-design';
+  sourceUrl: string;
+  municipalBasis: string;
+};
+
+/** Shared display/diagnostic criteria, not certification of the installation.
+ * Corrigendum 2, 771.13(b): 3% lighting / 5% circuits feeding only motors;
+ * 1% feeder and 2%/4% terminal are a recommended allocation. The same 3%
+ * envelope for general/special sockets remains a conservative project policy.
+ * The municipal 2% rule is kept separate and requires case-specific confirmation.
+ */
+export function voltageDropCriteria(
+  panelType: 'TP' | 'TS',
+  kind: string,
+): VoltageDropCriteria {
+  const motor = kind === 'FM';
+  const totalLimitPercent = motor ? 5 : 3;
+  return {
+    feederLimitPercent: 1,
+    terminalLimitPercent:
+      panelType === 'TS' ? totalLimitPercent - 1 : totalLimitPercent,
+    totalLimitPercent,
+    municipalTerminalLimitPercent: 2,
+    terminalBasis:
+      panelType === 'TS' ? 'recommended-allocation' : 'total-from-tp',
+    totalBasis: motor
+      ? 'aea-motors-only'
+      : kind === 'IUG' || kind === 'EMG'
+        ? 'aea-lighting'
+        : 'project-design',
+    sourceUrl: AEA_CONDUCTOR_REFERENCE_URL,
+    municipalBasis:
+      'Ord. 72/83, III.2.9.4: criterio municipal de 2 % para cables de circuitos, a confirmar para el expediente.',
+  };
+}
 
 // Prysmian Superastic Jet/Flex, ed. 2020 p.3: Cu/PVC70, unipolar in conduit,
 // 40°C ambient, 2 loaded conductors + PE. NOT universal or an LS0H specification.
@@ -218,6 +296,82 @@ export function selectPreliminaryBreaker(
   return (
     feasible.find((rating) => rating >= current * 1.15) ?? feasible[0] ?? null
   );
+}
+
+export type HeadDeviceSelection = {
+  rating: number | null;
+  currentBasedRating: number | null;
+  reason?: string;
+};
+
+/** Select an automatic TP breaker or a non-automatic TS switch-disconnector.
+ * The 15% demand margin and largest-branch floor are preliminary design policy.
+ * A TS switch must additionally withstand its upstream breaker's rated current:
+ * the largest individual terminal breaker does not protect their combined load.
+ * This does not verify product/category, short-circuit coordination or Iz.
+ * Missing/invalid inputs and requirements beyond the catalog stay unselected;
+ * user-declared feeder/terminal breakers are never changed by this helper.
+ */
+export function selectHeadDevice({
+  type,
+  current,
+  maxBranchBreaker,
+  feederBreaker,
+}: {
+  type: 'TP' | 'TS';
+  current: number;
+  maxBranchBreaker: number;
+  feederBreaker?: number;
+}): HeadDeviceSelection {
+  if (!Number.isFinite(current) || current < 0)
+    return {
+      rating: null,
+      currentBasedRating: null,
+      reason:
+        'Falta una corriente de demanda válida para dimensionar la cabecera.',
+    };
+  // Tolerance only absorbs binary floating-point noise at a catalog boundary.
+  const atLeast = (required: number) =>
+    STANDARD_BREAKERS.find((rating) => rating + 1e-9 >= required) ?? null;
+  const currentBasedRating = atLeast(current * 1.15);
+  if (
+    (type !== 'TP' && type !== 'TS') ||
+    !Number.isFinite(maxBranchBreaker) ||
+    maxBranchBreaker < 0
+  )
+    return {
+      rating: null,
+      currentBasedRating,
+      reason: 'Faltan datos válidos de tablero y protecciones derivadas.',
+    };
+  if (type === 'TS' && (!Number.isFinite(feederBreaker) || feederBreaker! <= 0))
+    return {
+      rating: null,
+      currentBasedRating,
+      reason:
+        'Falta el calibre válido de la térmica del alimentador para dimensionar el corte local.',
+    };
+  if (currentBasedRating === null)
+    return {
+      rating: null,
+      currentBasedRating,
+      reason:
+        'La demanda con el margen de diseño del 15 % supera el catálogo de cabeceras (125 A); cabecera sin dimensionar.',
+    };
+  const required = Math.max(
+    currentBasedRating,
+    maxBranchBreaker || 10,
+    type === 'TS' ? feederBreaker! : 0,
+  );
+  const rating = atLeast(required);
+  return rating === null
+    ? {
+        rating,
+        currentBasedRating,
+        reason:
+          'El calibre requerido por las protecciones supera el catálogo de cabeceras (125 A); cabecera sin dimensionar.',
+      }
+    : { rating, currentBasedRating };
 }
 
 export type FeederDrop = {

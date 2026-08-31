@@ -61,11 +61,11 @@ test('001: todas las plantillas IUG de código, incluido crear TS, evitan térmi
   assert.ok(count >= 3);
 });
 const appended = `
-export const audit = { normalizePanels, normalizeCircuit, normalizePrices, normalizeProfile, INITIAL_PANELS, INITIAL_PROFILE, DEFAULT_PRICES, PanelFront, SingleLineDiagram, MultiLineDiagram, ProjectPrintSummary, PriceInput, AmpacityEditor, FeederReviews, reviewFeeder, emergencyAutonomyDeclared, cabinetFor, circuitCurrent, voltageDrop };
+export const audit = { normalizePanels, normalizeCircuit, normalizeProject, normalizePrices, normalizeProfile, diagnosePanel, diagnoseProject, INITIAL_PANELS, INITIAL_PROFILE, DEFAULT_PRICES, PanelFront, SingleLineDiagram, MultiLineDiagram, ProjectPrintSummary, PriceInput, AmpacityEditor, FeederReviews, reviewFeeder, emergencyAutonomyDeclared, cabinetFor, circuitCurrent, voltageDrop };
 export function calculatePanels(panels) { return (${memoBody('panelCalculations')})(); }
 export function calculateCosts(activePanel, panels, prices) { return (${memoBody('costOptions')})(); }
 export function calculateProjectCosts(panels, prices) { return (${memoBody('projectCostSummary')})(); }
-export function calculateWarnings(activePanel, calculations, tpPanel, panels, profile, isPublicVenue) { const panelCalculations = calculatePanels(panels); return (${memoBody('warnings')})(); }
+export function calculateWarnings(activePanel, calculations, tpPanel, panels, profile, isPublicVenue) { const panelCalculations = calculatePanels(panels); return [...diagnosePanel(activePanel, calculations, panels, panelCalculations), ...diagnoseProject(panels, profile, isPublicVenue)]; }
 `;
 const compiled = ts.transpileModule(source + appended, {
   compilerOptions: {
@@ -181,7 +181,9 @@ test('TP/TS: 48,8 A con alimentador de 32 A y 6 mm² se advierte desde ambos tab
     panels,
     calculations,
   });
-  assert.equal(printed.split('No aumentar solo la térmica').length - 1, 2);
+  // Each printed panel carries its own scoped warning block. The TP and TS
+  // both expose the feeder issue; later diagrams may repeat the review.
+  assert.ok(printed.split('No aumentar solo la térmica').length - 1 >= 2);
   const front = html(app.PanelFront, {
     devices: buildPanelDevices(child, [], 63),
     rows: 3,
@@ -595,6 +597,48 @@ test('domiciliaria: advertencia global en salón, aunque el tablero activo sea o
     publicVenue: true,
   });
   assert.ok(printed.includes('ADVERTENCIA: ID único domiciliario'));
+});
+
+test('importación: rechaza circuitos dañados y no hereda evidencias ni precios de otro proyecto', () => {
+  assert.throws(
+    () =>
+      app.normalizeProject({
+        version: '3.0',
+        panels: [{ ...clone(app.INITIAL_PANELS[0]), circuits: 'broken' }],
+      }),
+    /circuits|circuitos/i,
+  );
+  const imported = app.normalizeProject({
+    version: '3.0',
+    panels: clone(app.INITIAL_PANELS),
+  });
+  assert.equal(imported.profile.descriptiveMemoryReady, false);
+  assert.equal(imported.profile.registeredProfessionalReady, false);
+  assert.equal(imported.profile.siteTestReady, false);
+  assert.deepEqual(imported.prices, app.DEFAULT_PRICES);
+});
+
+test('impresión: conserva advertencias terminales y deja visible Ib/In/Iz', () => {
+  const unsafe = makePanel({
+    circuits: [
+      makeCircuit(1, {
+        kind: 'TUG',
+        conductor: 1.5,
+        breaker: 20,
+        unitVA: 220,
+      }),
+    ],
+  });
+  const panels = [unsafe];
+  const calculations = calculatePanels(panels);
+  const printed = html(app.ProjectPrintSummary, {
+    projectName: 'Seguridad impresa',
+    panels,
+    calculations,
+  });
+  assert.match(printed, /inferior al mínimo de 2[,.]5 mm²/);
+  assert.match(printed, /Ib \/ TM \/ Iz/);
+  assert.match(printed, /20 \/ 15 A/);
 });
 
 test('2/3/1 equipos, presupuesto y reservas; TP de tránsito no duplica ID de los TS', () => {

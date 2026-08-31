@@ -4,6 +4,10 @@
 
 @custom-variant dark (&:is(.dark *));
 
+html {
+  overflow-x: clip;
+}
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -50,6 +54,7 @@
 
 body {
   font-family: var(--font-ui);
+  overflow-x: clip;
 }
 
 :root {
@@ -169,10 +174,17 @@ body {
   color: #052e2b;
 }
 
+.panel-shell {
+  overflow-x: auto;
+}
+
 @media (max-width: 640px) {
   .panel-shell {
     border-width: 6px;
     padding: 0.5rem;
+  }
+  .panel-shell > div {
+    min-width: 640px;
   }
 }
 
@@ -214,6 +226,13 @@ body {
   }
   .panel-shell {
     box-shadow: none !important;
+    overflow: visible !important;
+  }
+  .panel-shell > div {
+    min-width: 0 !important;
+  }
+  .din-equipment-list {
+    display: none !important;
   }
   .print-diagram {
     color: #0f172a;

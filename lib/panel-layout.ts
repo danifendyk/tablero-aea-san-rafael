@@ -160,7 +160,7 @@ export function differentialLabel(panel: PanelShape, circuitId: number) {
 export function buildPanelDevices(
   panel: PanelShape,
   children: PanelShape[],
-  mainBreaker: number,
+  mainBreaker: number | null,
 ): DinDevice[] {
   const span = panel.supply === 'tri' ? 4 : 2;
   const devices: DinDevice[] = [
@@ -171,7 +171,7 @@ export function buildPanelDevices(
         panel.type === 'TP'
           ? 'Interruptor General Automático'
           : 'Interruptor-seccionador de corte local · sin disparo por sobrecorriente',
-      detail: `${mainBreaker} A`,
+      detail: mainBreaker === null ? 'Sin dimensionar' : `${mainBreaker} A`,
       span,
       className: 'device-main',
     },
@@ -185,10 +185,10 @@ export function buildPanelDevices(
       span,
       className: 'device-spd',
     });
-  for (const [index, child] of children.entries())
+  for (const child of children)
     devices.push({
       key: `feeder-${child.id}`,
-      label: `Alim. TS${index + 1}`,
+      label: `Alim. ${child.name}`,
       fullName: `Alimentador a ${child.name}`,
       detail: `${child.feederBreaker ?? 32} A · ${child.supply === 'tri' ? '4P' : `2P ${child.feederPhase ?? 'L1'}`}`,
       span: child.supply === 'tri' ? 4 : 2,

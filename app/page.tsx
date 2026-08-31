@@ -51,6 +51,11 @@ import {
   feederVoltageDrop,
   PRELIMINARY_CONDUCTOR_CAPACITY as CONDUCTOR_CAPACITY,
   selectPreliminaryBreaker,
+  selectHeadDevice,
+  circuitRequirements,
+  feederRequirements,
+  voltageDropCriteria,
+  AEA_CONDUCTOR_REFERENCE_URL,
   STANDARD_BREAKERS,
   type FeederDrop,
   type AmpacitySettings,
@@ -73,9 +78,16 @@ import {
   finiteNumber,
   highlightedCircuit,
   readStoredProject,
-  resetStoredProject,
-  saveStoredProject,
+  safeCircuitId,
+  nextCircuitId,
+  normalizeCircuitIds,
+  nextSectionalPanelNumber,
+  saveStoredProjectIfUnchanged,
+  STORAGE_KEY,
+  LEGACY_STORAGE_KEY,
+  type ProjectStorageSnapshot,
 } from '@/lib/project-data';
+import { validateProjectStructure } from '@/lib/project-schema';
 
 export type Supply = 'mono' | 'tri';
 export type Phase = 'L1' | 'L2' | 'L3' | '3Φ';
@@ -157,8 +169,8 @@ export type PanelCalculation = {
   installedVA: number;
   demandVA: number;
   mainCurrent: number;
-  mainBreaker: number;
-  currentBasedBreaker: number;
+  mainBreaker: number | null;
+  currentBasedBreaker: number | null;
   maxBranchBreaker: number;
   baseModules: number;
   occupiedModules: number;
@@ -435,10 +447,6 @@ function createPanelId(prefix: string) {
   return `${prefix}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
-function nextBreaker(current: number) {
-  return STANDARD_BREAKERS.find((value) => value >= current) ?? 125;
-}
-
 // One review for the TS and its outgoing feeder in the TP. Never changes ratings.
 function reviewFeeder(panel: Panel, calculation: PanelCalculation) {
   const breaker = panel.feederBreaker ?? 32;
@@ -450,6 +458,11 @@ function reviewFeeder(panel: Panel, calculation: PanelCalculation) {
   );
   const current = calculation.mainCurrent;
   const issues: string[] = [];
+  const minimumSection = feederRequirements().minimumSectionMm2;
+  if (minimumSection !== null && section < minimumSection)
+    issues.push(
+      `La sección ${section} mm² es inferior al mínimo de ${minimumSection} mm² para el alimentador.`,
+    );
   if (current > breaker)
     issues.push(
       `La térmica de ${breaker} A es menor que Ib ${formatNumber(current, 1)} A: el alimentador no alcanza para la demanda.`,
@@ -594,6 +607,23 @@ function phaseColor(phase: Phase) {
   }[phase];
 }
 
+function physicalCircuitPhase(panel: Panel, circuit: Circuit): Phase {
+  if (
+    panel.type === 'TS' &&
+    panel.supply === 'mono' &&
+    ['L1', 'L2', 'L3'].includes(String(panel.feederPhase))
+  )
+    return panel.feederPhase as Phase;
+  return circuit.phase;
+}
+
+function circuitPhaseLabel(panel: Panel, circuit: Circuit) {
+  const physical = physicalCircuitPhase(panel, circuit);
+  return panel.type === 'TS' && panel.supply === 'mono' && physical !== 'L1'
+    ? `L1 local · ${physical} en TP`
+    : circuit.phase;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
@@ -704,7 +734,7 @@ function normalizeCircuit(
     : 'L1';
   const phase = supply === 'mono' ? 'L1' : requestedPhase;
   const requestedBreaker = finiteNumber(raw.breaker, template.breaker, 1);
-  const breaker = nextBreaker(requestedBreaker);
+  const breaker = requestedBreaker;
   const requestedConductor = finiteNumber(
     raw.conductor,
     template.conductor,
@@ -715,7 +745,7 @@ function normalizeCircuit(
     : template.conductor;
 
   return {
-    id: Math.max(1, Math.round(finiteNumber(raw.id, index + 1, 1))),
+    id: safeCircuitId(raw.id, index + 1),
     name:
       typeof raw.name === 'string' && raw.name.trim()
         ? raw.name.trim()
@@ -739,7 +769,8 @@ function normalizeCircuit(
 
 function normalizePanels(value: unknown): Panel[] | null {
   if (!Array.isArray(value) || value.length === 0) return null;
-  const records = value.filter(isRecord);
+  if (value.some((entry) => !isRecord(entry) || !Array.isArray(entry.circuits) || entry.circuits.some((circuit: unknown) => !isRecord(circuit)))) return null;
+  const records = value as Record<string, unknown>[];
   const tpRecords = records.filter((item) => item.type === 'TP');
   if (tpRecords.length !== 1) return null;
 
@@ -752,16 +783,7 @@ function normalizePanels(value: unknown): Panel[] | null {
     while (usedIds.has(id)) id = `${id}-${panelIndex + 1}`;
     usedIds.add(id);
     const supply: Supply = raw.supply === 'mono' ? 'mono' : 'tri';
-    const circuits = Array.isArray(raw.circuits)
-      ? raw.circuits.map((circuit, index) =>
-          normalizeCircuit(circuit, index, supply),
-        )
-      : [];
-    const circuitIds = new Set<number>();
-    circuits.forEach((circuit) => {
-      while (circuitIds.has(circuit.id)) circuit.id += 1;
-      circuitIds.add(circuit.id);
-    });
+    const circuits = normalizeCircuitIds((raw.circuits as unknown[]).map((circuit, index) => normalizeCircuit(circuit, index, supply)));
     const feederPhase: Phase =
       supply === 'tri'
         ? '3Φ'
@@ -817,7 +839,7 @@ function normalizePanels(value: unknown): Panel[] | null {
             : undefined,
       feederBreaker:
         type === 'TS'
-          ? nextBreaker(finiteNumber(raw.feederBreaker, 32, 1))
+          ? finiteNumber(raw.feederBreaker, 32, 1)
           : undefined,
       feederPhase: type === 'TS' ? feederPhase : undefined,
       feederAmpacity:
@@ -849,6 +871,177 @@ function normalizePanels(value: unknown): Panel[] | null {
   });
 }
 
+function normalizeProject(value: unknown, legacy = false) {
+  const result = validateProjectStructure(value, { legacy });
+  if (!result.ok) throw new Error(result.error);
+  const data = result.data;
+  const sourcePanels = legacy ? [{ ...INITIAL_PANELS[0], ...data, id: 'tp', type: 'TP', parentId: null }] : data.panels;
+  const panels = normalizePanels(sourcePanels);
+  if (!panels) throw new Error('Proyecto sin TP válido');
+  return {
+    panels,
+    profile: normalizeProfile(data.profile),
+    prices: normalizePrices(data.prices),
+    projectName: typeof data.projectName === 'string' && data.projectName.trim() ? data.projectName.trim() : 'Proyecto importado',
+    experienceMode: (data.experienceMode === 'technical' ? 'technical' : 'guided') as ExperienceMode,
+    activePanelId: panels.some((panel) => panel.id === data.activePanelId) ? String(data.activePanelId) : panels[0].id,
+  };
+}
+
+function ratingLabel(value: number | null | undefined) { return value == null ? 'Sin dimensionar' : `${value} A`; }
+
+function diagnosePanel(activePanel: Panel, calculations: PanelCalculation, panels: Panel[], panelCalculations: Map<string, PanelCalculation>) {
+  const tpPanel = panels.find((panel) => panel.type === 'TP') ?? activePanel;
+    const messages: string[] = [];
+    activePanel.circuits.forEach((circuit, index) => {
+      const circuitNumber = index + 1;
+      if (
+        (circuit.kind === 'IUG' || circuit.kind === 'TUG') &&
+        circuit.points > 15
+      ) {
+        messages.push(
+          `C${circuitNumber}: supera el criterio conservador de 15 bocas.`,
+        );
+      }
+      if (circuitCurrent(circuit, activePanel.supply) > circuit.breaker) {
+        messages.push(
+          `C${circuitNumber}: la corriente estimada supera la protección seleccionada.`,
+        );
+      }
+      const minimum = circuitRequirements(circuit.kind).minimumSectionMm2;
+      if (minimum !== null && circuit.conductor < minimum) messages.push(`C${circuitNumber}: sección ${circuit.conductor} mm² inferior al mínimo de ${minimum} mm² para ${circuit.kind}; revisar el circuito.`);
+      const cableCapacity = conductorAmpacity(
+        circuit.conductor,
+        circuit.phase === '3Φ',
+        circuit.ampacity,
+      );
+      if (!cableCapacity) {
+        messages.push(
+          `C${circuitNumber}: no hay capacidad preliminar para la sección seleccionada.`,
+        );
+      } else if (circuit.breaker > cableCapacity) {
+        messages.push(
+          `C${circuitNumber}: la térmica de ${circuit.breaker} A supera Iz preliminar ${cableCapacity} A; revisar sección y protección.`,
+        );
+      }
+      const circuitDropPercent = voltageDrop(
+        circuit,
+        activePanel.supply,
+      ).percent;
+      const totalDropPercent =
+        circuitDropPercent +
+        (activePanel.type === 'TS' ? calculations.feederDrop.percent : 0);
+      const criteria = voltageDropCriteria(activePanel.type, circuit.kind);
+      const terminalLimit = criteria.terminalLimitPercent;
+      const totalLimit = criteria.totalLimitPercent;
+      if (circuitDropPercent > terminalLimit) {
+        messages.push(
+          `C${circuitNumber}: caída del circuito ${circuitDropPercent.toFixed(1)} %; supera el criterio de diseño de ${terminalLimit} % desde el ${activePanel.type}.`,
+        );
+      }
+      if (circuitDropPercent > 2)
+        messages.push(
+          `C${circuitNumber}: además supera el 2 % indicado para cables de circuitos por la Ord. 72/83, III.2.9.4. Confirmar el criterio municipal del expediente.`,
+        );
+      if (totalDropPercent > totalLimit) {
+        messages.push(
+          `C${circuitNumber}: caída total estimada ${totalDropPercent.toFixed(1)} % (circuito + alimentador); supera ${totalLimit} %.`,
+        );
+      }
+    });
+
+    const feeders =
+      activePanel.type === 'TS'
+        ? [activePanel]
+        : panels.filter(
+            (panel) => panel.type === 'TS' && panel.parentId === activePanel.id,
+          );
+    for (const feeder of feeders) {
+      const feederCalculation = panelCalculations.get(feeder.id);
+      if (feederCalculation)
+        messages.push(
+          ...reviewFeeder(feeder, feederCalculation).issues.map(
+            (issue) => `Alimentador a ${feeder.name}: ${issue}`,
+          ),
+        );
+    }
+
+    if (activePanel.type === 'TS') {
+      const feederBreaker = activePanel.feederBreaker ?? 32;
+      const maxTerminalBreaker = activePanel.circuits.reduce(
+        (maximum, circuit) => Math.max(maximum, circuit.breaker),
+        0,
+      );
+      if (feederBreaker < maxTerminalBreaker) {
+        messages.push(
+          `Alimentador: revisar selectividad; su térmica de ${feederBreaker} A es menor que una protección terminal de ${maxTerminalBreaker} A.`,
+        );
+      }
+      if (tpPanel.supply === 'mono' && activePanel.supply === 'tri') {
+        messages.push(
+          'Incompatibilidad: un TP monofásico no puede alimentar un TS trifásico.',
+        );
+      }
+      if (
+        activePanel.supply === 'mono' &&
+        tpPanel.supply === 'tri' &&
+        !['L1', 'L2', 'L3'].includes(String(activePanel.feederPhase))
+      ) {
+        messages.push(
+          'Alimentador monofásico: seleccionar la fase L1, L2 o L3 del TP.',
+        );
+      }
+    }
+
+    if (calculations.imbalance > 0.2) {
+      messages.push('El desbalance de fases estimado supera el 20 %.');
+    }
+    if (calculations.mainBreaker === null) {
+      messages.push(
+        'Cabecera sin dimensionar: demanda o protección requerida fuera del rango modelado (125 A), o datos de alimentador incompletos.',
+      );
+    }
+    return messages;
+}
+
+function diagnoseProject(panels: Panel[], profile: ProjectProfile, isPublicVenue: boolean) {
+  const messages: string[] = [];
+    if (profile.breakingCapacityKa < profile.prospectiveShortCircuitKa) {
+      messages.push(
+        'El poder de corte declarado es menor que la corriente de cortocircuito presunta.',
+      );
+    }
+    if (profile.groundResistanceOhm > 10) {
+      messages.push(
+        'La resistencia de puesta a tierra supera 10 Ω, máximo indicado por la Ordenanza 72/83.',
+      );
+    }
+    if (
+      isPublicVenue &&
+      !panels.some((panel) =>
+        panel.circuits.some((circuit) => circuit.kind === 'EMG'),
+      )
+    ) {
+      messages.push(
+        'El proyecto de pública concurrencia no tiene ningún circuito de iluminación de emergencia.',
+      );
+    }
+    if (isPublicVenue) {
+      for (const panel of panels.filter(
+        (item) => item.architecture === 'residential' && item.circuits.length,
+      )) {
+        messages.push(
+          `${panel.name}: arquitectura domiciliaria de ID único en pública concurrencia. No separa iluminación/tomas ni emergencia; revisar AEA 718 y Ordenanza 72/83. No se considera una solución validada para este salón.`,
+        );
+      }
+    }
+    if (isPublicVenue && !emergencyAutonomyDeclared(profile))
+      messages.push(
+        'Emergencia: falta declarar autonomía ≥2 h y una referencia de ensayo/ficha. Un circuito EMG no demuestra autonomía ni iluminancia.',
+      );
+    return messages;
+}
+
 export default function Home() {
   const [experienceMode, setExperienceMode] =
     useState<ExperienceMode>('guided');
@@ -866,6 +1059,31 @@ export default function Home() {
     null,
   );
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const storageSnapshotRef = useRef<ProjectStorageSnapshot | null>(null);
+  const navigationRef = useRef({ activePanelId, experienceMode });
+  useEffect(() => { navigationRef.current = { activePanelId, experienceMode }; }, [activePanelId, experienceMode]);
+
+  function applyProject(project: ReturnType<typeof normalizeProject>) {
+    setPanels(project.panels);
+    setProfile(project.profile);
+    setPrices(project.prices);
+    setProjectName(project.projectName);
+    setExperienceMode(project.experienceMode);
+    setActivePanelId(project.activePanelId);
+  }
+
+  function reloadSavedProject() {
+    if (!window.confirm('Se descartarán los cambios de esta pestaña. Exportá primero el JSON si querés conservarlos. ¿Cargar el proyecto guardado?')) return;
+    const stored = readStoredProject(() => window.localStorage);
+    try {
+      if (stored.error || !stored.data) throw new Error(stored.error ?? 'No hay proyecto guardado.');
+      const project = normalizeProject(stored.data, stored.legacy);
+      storageSnapshotRef.current = stored.snapshot;
+      applyProject(project);
+      setPersistenceError(null);
+      setStorageBlocked(false);
+    } catch (error) { setPersistenceError(error instanceof Error ? error.message : 'No se pudo cargar el proyecto.'); }
+  }
 
   // Active panel helper
   const activePanel = useMemo(() => {
@@ -883,56 +1101,18 @@ export default function Home() {
     [panels],
   );
 
-  // Read and normalize before scheduling React updates; never destroy unreadable data.
+  // Restore only complete, validated projects; leave invalid stored bytes untouched.
   useEffect(() => {
     const stored = readStoredProject(() => window.localStorage);
+    storageSnapshotRef.current = stored.snapshot;
     let error = stored.error;
-    let restored: { panels: Panel[]; data: Record<string, unknown> } | null =
-      null;
+    let restored: ReturnType<typeof normalizeProject> | null = null;
     if (stored.data) {
-      try {
-        const data = stored.data;
-        const sourcePanels = stored.legacy
-          ? [
-              {
-                ...INITIAL_PANELS[0],
-                supply: data.supply,
-                demandFactor: data.demandFactor,
-                reservePercent: data.reservePercent,
-                modulesPerRow: data.modulesPerRow,
-                architecture: data.architecture,
-                circuits: data.circuits ?? INITIAL_CIRCUITS_TP,
-              },
-            ]
-          : data.panels;
-        const normalized = normalizePanels(sourcePanels);
-        if (!normalized) throw new Error('Proyecto sin TP válido');
-        restored = { panels: normalized, data };
-      } catch {
-        error =
-          'El proyecto guardado tiene un formato inválido. No se sobrescribió; importá un JSON válido o restablecé cuando tengas una copia.';
-      }
+      try { restored = normalizeProject(stored.data, stored.legacy); }
+      catch (failure) { error = `Guardado inválido; no se sobrescribió. ${failure instanceof Error ? failure.message : ''} Exportá una copia antes de reemplazarlo.`; }
     }
     queueMicrotask(() => {
-      if (restored) {
-        const { panels: loadedPanels, data } = restored;
-        setPanels(loadedPanels);
-        setExperienceMode(
-          data.experienceMode === 'technical' ? 'technical' : 'guided',
-        );
-        setProfile(normalizeProfile(data.profile));
-        setProjectName(
-          typeof data.projectName === 'string' && data.projectName.trim()
-            ? data.projectName
-            : 'SALÓN · 24 × 10 m',
-        );
-        setPrices(normalizePrices(data.prices));
-        setActivePanelId(
-          loadedPanels.some((panel) => panel.id === data.activePanelId)
-            ? String(data.activePanelId)
-            : loadedPanels[0].id,
-        );
-      }
+      if (restored) applyProject(restored);
       setPersistenceError(error);
       setStorageBlocked(Boolean(error));
       setPersistenceReady(true);
@@ -946,28 +1126,41 @@ export default function Home() {
     });
   }, [activePanelId]);
 
-  // Local draft only; an unavailable/quota-limited store must not crash React.
+  // Navigation never writes a project. Web Locks serialize cooperating tabs;
+  // comparison against the loaded snapshot rejects stale writers.
   useEffect(() => {
     if (!persistenceReady || storageBlocked) return;
-    const error = saveStoredProject(() => window.localStorage, {
-      experienceMode,
-      profile,
-      projectName,
-      panels,
-      activePanelId,
-      prices,
+    let cancelled = false;
+    const save = () => {
+      if (cancelled) return;
+      const result = saveStoredProjectIfUnchanged(() => window.localStorage, {
+        version: '3.0', ...navigationRef.current, profile, projectName, panels, prices,
+      }, storageSnapshotRef.current);
+      if (result.ok) storageSnapshotRef.current = result.snapshot;
+      queueMicrotask(() => {
+        if (cancelled) return;
+        setPersistenceError(result.ok ? null : result.error);
+        if (!result.ok) setStorageBlocked(true);
+      });
+    };
+    if (navigator.locks) void navigator.locks.request(STORAGE_KEY, save).catch(() => {
+      if (!cancelled) { setPersistenceError('No se pudo bloquear el guardado. Exportá el JSON para conservar los cambios.'); setStorageBlocked(true); }
     });
-    queueMicrotask(() => setPersistenceError(error));
-  }, [
-    activePanelId,
-    experienceMode,
-    panels,
-    persistenceReady,
-    prices,
-    profile,
-    projectName,
-    storageBlocked,
-  ]);
+    else save();
+    return () => { cancelled = true; };
+  }, [panels, persistenceReady, prices, profile, projectName, storageBlocked]);
+
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== null && event.key !== STORAGE_KEY && event.key !== LEGACY_STORAGE_KEY) return;
+      const latest = readStoredProject(() => window.localStorage);
+      if (JSON.stringify(latest.snapshot) === JSON.stringify(storageSnapshotRef.current)) return;
+      setStorageBlocked(true);
+      setPersistenceError('Otra pestaña cambió el proyecto guardado. El guardado automático está pausado. Exportá los cambios de esta pestaña o cargá la versión guardada.');
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
 
   // Panel mutations
   const updateActivePanel = <K extends keyof Panel>(
@@ -1056,7 +1249,7 @@ export default function Home() {
 
   const addSectionalPanel = () => {
     setOptimizationMessage('');
-    const nextIndex = panels.filter((p) => p.type === 'TS').length + 1;
+    const nextIndex = nextSectionalPanelNumber(panels);
     const newId = createPanelId('ts');
     const newPanel: Panel = {
       id: newId,
@@ -1095,7 +1288,7 @@ export default function Home() {
           kind: 'TUG',
           points: 6,
           unitVA: 220,
-          phase: 'L2',
+          phase: tpPanel.supply === 'mono' ? 'L1' : 'L2',
           powerFactor: 0.9,
           breaker: 20,
           conductor: 2.5,
@@ -1111,7 +1304,7 @@ export default function Home() {
   const duplicatePanel = (panel: Panel) => {
     setOptimizationMessage('');
     const newId = createPanelId('ts');
-    const nextIndex = panels.filter((p) => p.type === 'TS').length + 1;
+    const nextIndex = nextSectionalPanelNumber(panels);
     const duplicated: Panel = {
       ...panel,
       id: newId,
@@ -1235,9 +1428,9 @@ export default function Home() {
           )
         : 0;
       const maxBranchBreaker = Math.max(maxOutgoingBreaker, maxFeederBreaker);
-      const currentBasedBreaker = nextBreaker(mainCurrent * 1.15);
-      // Preliminary rating heuristic only: this does NOT demonstrate selectivity.
-      const mainBreaker = Math.max(currentBasedBreaker, maxBranchBreaker || 10);
+      const head = selectHeadDevice({ type: panel.type, current: mainCurrent, maxBranchBreaker, feederBreaker: panel.feederBreaker });
+      const currentBasedBreaker = head.currentBasedRating;
+      const mainBreaker = head.rating;
       const includeDps = panelHasDps(panel);
       const baseModules = architectureOccupiedModules(
         panel.architecture,
@@ -1347,7 +1540,7 @@ export default function Home() {
       totalInstalledVA: tpCalc?.installedVA ?? fallbackInstalled,
       totalDemandVA: tpCalc?.demandVA ?? fallbackDemand,
       totalPanels: panels.length,
-      tpMainBreaker: tpCalc?.mainBreaker ?? calculations.mainBreaker,
+      tpMainBreaker: tpCalc ? tpCalc.mainBreaker : calculations.mainBreaker,
     };
   }, [calculations, panelCalculations, panels]);
 
@@ -1360,165 +1553,10 @@ export default function Home() {
   const areaPerPerson =
     profile.occupancy > 0 ? projectArea / profile.occupancy : 0;
 
-  const warnings = useMemo(() => {
-    const messages: string[] = [];
-    activePanel.circuits.forEach((circuit, index) => {
-      const circuitNumber = index + 1;
-      if (
-        (circuit.kind === 'IUG' || circuit.kind === 'TUG') &&
-        circuit.points > 15
-      ) {
-        messages.push(
-          `C${circuitNumber}: supera el criterio conservador de 15 bocas.`,
-        );
-      }
-      if (circuitCurrent(circuit, activePanel.supply) > circuit.breaker) {
-        messages.push(
-          `C${circuitNumber}: la corriente estimada supera la protección seleccionada.`,
-        );
-      }
-      const cableCapacity = conductorAmpacity(
-        circuit.conductor,
-        circuit.phase === '3Φ',
-        circuit.ampacity,
-      );
-      if (!cableCapacity) {
-        messages.push(
-          `C${circuitNumber}: no hay capacidad preliminar para la sección seleccionada.`,
-        );
-      } else if (circuit.breaker > cableCapacity) {
-        messages.push(
-          `C${circuitNumber}: la térmica de ${circuit.breaker} A supera Iz preliminar ${cableCapacity} A; revisar sección y protección.`,
-        );
-      }
-      const circuitDropPercent = voltageDrop(
-        circuit,
-        activePanel.supply,
-      ).percent;
-      const totalDropPercent =
-        circuitDropPercent +
-        (activePanel.type === 'TS' ? calculations.feederDrop.percent : 0);
-      const terminalLimit =
-        activePanel.type === 'TP'
-          ? circuit.kind === 'FM'
-            ? 5
-            : 3
-          : circuit.kind === 'FM'
-            ? 4
-            : 2;
-      const totalLimit = circuit.kind === 'FM' ? 5 : 3;
-      if (circuitDropPercent > terminalLimit) {
-        messages.push(
-          `C${circuitNumber}: caída del circuito ${circuitDropPercent.toFixed(1)} %; supera el criterio AEA de ${terminalLimit} % desde el ${activePanel.type}.`,
-        );
-      }
-      if (circuitDropPercent > 2)
-        messages.push(
-          `C${circuitNumber}: además supera el 2 % indicado para cables de circuitos por la Ord. 72/83, III.2.9.4. Confirmar el criterio municipal del expediente.`,
-        );
-      if (totalDropPercent > totalLimit) {
-        messages.push(
-          `C${circuitNumber}: caída total estimada ${totalDropPercent.toFixed(1)} % (circuito + alimentador); supera ${totalLimit} %.`,
-        );
-      }
-    });
-
-    const feeders =
-      activePanel.type === 'TS'
-        ? [activePanel]
-        : panels.filter(
-            (panel) => panel.type === 'TS' && panel.parentId === activePanel.id,
-          );
-    for (const feeder of feeders) {
-      const feederCalculation = panelCalculations.get(feeder.id);
-      if (feederCalculation)
-        messages.push(
-          ...reviewFeeder(feeder, feederCalculation).issues.map(
-            (issue) => `Alimentador a ${feeder.name}: ${issue}`,
-          ),
-        );
-    }
-
-    if (activePanel.type === 'TS') {
-      const feederBreaker = activePanel.feederBreaker ?? 32;
-      const maxTerminalBreaker = activePanel.circuits.reduce(
-        (maximum, circuit) => Math.max(maximum, circuit.breaker),
-        0,
-      );
-      if (feederBreaker < maxTerminalBreaker) {
-        messages.push(
-          `Alimentador: revisar selectividad; su térmica de ${feederBreaker} A es menor que una protección terminal de ${maxTerminalBreaker} A.`,
-        );
-      }
-      if (tpPanel.supply === 'mono' && activePanel.supply === 'tri') {
-        messages.push(
-          'Incompatibilidad: un TP monofásico no puede alimentar un TS trifásico.',
-        );
-      }
-      if (
-        activePanel.supply === 'mono' &&
-        tpPanel.supply === 'tri' &&
-        !['L1', 'L2', 'L3'].includes(String(activePanel.feederPhase))
-      ) {
-        messages.push(
-          'Alimentador monofásico: seleccionar la fase L1, L2 o L3 del TP.',
-        );
-      }
-    }
-
-    if (calculations.imbalance > 0.2) {
-      messages.push('El desbalance de fases estimado supera el 20 %.');
-    }
-    if (calculations.mainCurrent * 1.15 > STANDARD_BREAKERS.at(-1)!) {
-      messages.push(
-        'La corriente de cabecera supera el rango de calibres modelado (125 A).',
-      );
-    }
-    if (profile.breakingCapacityKa < profile.prospectiveShortCircuitKa) {
-      messages.push(
-        'El poder de corte declarado es menor que la corriente de cortocircuito presunta.',
-      );
-    }
-    if (profile.groundResistanceOhm > 10) {
-      messages.push(
-        'La resistencia de puesta a tierra supera 10 Ω, máximo indicado por la Ordenanza 72/83.',
-      );
-    }
-    if (
-      isPublicVenue &&
-      !panels.some((panel) =>
-        panel.circuits.some((circuit) => circuit.kind === 'EMG'),
-      )
-    ) {
-      messages.push(
-        'El proyecto de pública concurrencia no tiene ningún circuito de iluminación de emergencia.',
-      );
-    }
-    if (isPublicVenue) {
-      for (const panel of panels.filter(
-        (item) => item.architecture === 'residential' && item.circuits.length,
-      )) {
-        messages.push(
-          `${panel.name}: arquitectura domiciliaria de ID único en pública concurrencia. No separa iluminación/tomas ni emergencia; revisar AEA 718 y Ordenanza 72/83. No se considera una solución validada para este salón.`,
-        );
-      }
-    }
-    if (isPublicVenue && !emergencyAutonomyDeclared(profile))
-      messages.push(
-        'Emergencia: falta declarar autonomía ≥2 h y una referencia de ensayo/ficha. Un circuito EMG no demuestra autonomía ni iluminancia.',
-      );
-    return messages;
-  }, [
-    activePanel,
-    calculations.feederDrop.percent,
-    calculations.imbalance,
-    calculations.mainCurrent,
-    isPublicVenue,
-    panelCalculations,
-    panels,
-    profile,
-    tpPanel.supply,
-  ]);
+  const projectDiagnostics = useMemo(() => diagnoseProject(panels, profile, isPublicVenue), [panels, profile, isPublicVenue]);
+  const panelDiagnostics = useMemo(() => new Map(panels.map((panel) => [panel.id, diagnosePanel(panel, panelCalculations.get(panel.id)!, panels, panelCalculations)])), [panels, panelCalculations]);
+  const warnings = useMemo(() => [...(panelDiagnostics.get(activePanel.id) ?? []), ...projectDiagnostics], [activePanel.id, panelDiagnostics, projectDiagnostics]);
+  const projectWarnings = useMemo(() => [...projectDiagnostics, ...panels.flatMap((panel) => (panelDiagnostics.get(panel.id) ?? []).map((message) => `${panel.name}: ${message}`))], [panels, panelDiagnostics, projectDiagnostics]);
 
   const costOptions = useMemo<CostOption[]>(() => {
     const children =
@@ -1831,7 +1869,15 @@ export default function Home() {
               ...circuit,
               phase: 'L1' as Phase,
               modules: Math.min(circuit.modules, 2),
+              ampacity:
+                circuit.ampacity?.mode === 'declared'
+                  ? { ...circuit.ampacity, declaredA: 0, basis: '' }
+                  : circuit.ampacity,
             })),
+            feederAmpacity:
+              panel.feederAmpacity?.mode === 'declared'
+                ? { ...panel.feederAmpacity, declaredA: 0, basis: '' }
+                : panel.feederAmpacity,
           };
         }
         return panel;
@@ -1867,10 +1913,7 @@ export default function Home() {
 
   function addCircuit(kind: CircuitKind) {
     const template = TEMPLATES[kind];
-    const newId =
-      activePanel.circuits.length > 0
-        ? Math.max(...activePanel.circuits.map((item) => item.id)) + 1
-        : 1;
+    const newId = nextCircuitId(activePanel.circuits.map((item) => item.id));
     const defaultPhase: Phase =
       activePanel.supply === 'mono'
         ? 'L1'
@@ -1894,7 +1937,7 @@ export default function Home() {
 
   function duplicateCircuit(circuit: Circuit) {
     const newId =
-      Math.max(...activePanel.circuits.map((item) => item.id), 0) + 1;
+      nextCircuitId(activePanel.circuits.map((item) => item.id));
     const duplicated: Circuit = {
       ...circuit,
       id: newId,
@@ -1939,22 +1982,9 @@ export default function Home() {
   }
 
   function resetProject() {
-    setProfile(INITIAL_PROFILE);
-    setProjectName('SALÓN · 24 × 10 m');
-    setPanels(INITIAL_PANELS);
-    setActivePanelId('tp');
-    setPrices(DEFAULT_PRICES);
-    setOptimizationMessage('');
-    const error = resetStoredProject(() => window.localStorage, {
-      experienceMode,
-      profile: INITIAL_PROFILE,
-      projectName: 'SALÓN · 24 × 10 m',
-      panels: INITIAL_PANELS,
-      activePanelId: 'tp',
-      prices: DEFAULT_PRICES,
-    });
-    setPersistenceError(error);
-    setStorageBlocked(Boolean(error));
+    if (!window.confirm('¿Restablecer el proyecto? Se reemplazarán todos los tableros, circuitos y precios. Exportá un JSON antes si querés conservarlos.')) return;
+    applyProject({ panels: INITIAL_PANELS, profile: INITIAL_PROFILE, prices: DEFAULT_PRICES, projectName: 'SALÓN · 24 × 10 m', experienceMode, activePanelId: 'tp' });
+    setOptimizationMessage('Proyecto restablecido.');
   }
 
   // Export JSON
@@ -1987,33 +2017,9 @@ export default function Home() {
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
-        const data = JSON.parse(e.target?.result as string);
-        if (!isRecord(data)) throw new Error('Formato raíz inválido');
-        const importedPanels = normalizePanels(data.panels);
-        if (!importedPanels) {
-          throw new Error(
-            'Debe existir exactamente un TP y al menos un tablero válido',
-          );
-        }
-        if (typeof data.projectName === 'string' && data.projectName.trim()) {
-          setProjectName(data.projectName.trim());
-        }
-        if (data.profile) setProfile(normalizeProfile(data.profile));
-        if (
-          data.experienceMode === 'guided' ||
-          data.experienceMode === 'technical'
-        ) {
-          setExperienceMode(data.experienceMode);
-        }
-        setPanels(importedPanels);
-        setActivePanelId(
-          importedPanels.some((panel) => panel.id === data.activePanelId)
-            ? String(data.activePanelId)
-            : importedPanels[0].id,
-        );
-        if (data.prices) setPrices(normalizePrices(data.prices));
-        setOptimizationMessage('Proyecto importado correctamente.');
-        setStorageBlocked(false);
+        const project = normalizeProject(JSON.parse(e.target?.result as string));
+        applyProject(project);
+        setOptimizationMessage(storageBlocked ? 'Proyecto importado en memoria. El guardado sigue pausado; exportá el JSON para conservarlo.' : 'Proyecto importado correctamente.');
       } catch (error) {
         alert(
           `Error al leer el proyecto: ${error instanceof Error ? error.message : 'formato inválido'}.`,
@@ -2100,7 +2106,7 @@ export default function Home() {
           c.points,
           c.unitVA,
           power,
-          c.phase,
+          circuitPhaseLabel(panel, c),
           rounded(current),
           c.breaker,
           c.conductor,
@@ -2156,7 +2162,7 @@ export default function Home() {
       />
 
       <header className="print-hide sticky top-0 z-40 border-b border-white/10 bg-slate-950 text-white shadow-lg shadow-slate-950/10">
-        <div className="mx-auto flex max-w-[1680px] items-center justify-between gap-4 px-4 py-3 lg:px-6">
+        <div className="mx-auto flex max-w-[1680px] flex-col items-stretch justify-between gap-3 px-4 py-3 sm:flex-row sm:items-center lg:px-6">
           <div className="flex min-w-0 items-center gap-3">
             <div className="grid size-9 shrink-0 place-items-center rounded-lg bg-amber-400 text-slate-950 shadow-[0_0_24px_rgba(251,191,36,.25)]">
               <CircuitBoard className="size-5" />
@@ -2175,7 +2181,7 @@ export default function Home() {
               </p>
             </div>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-2 overflow-x-auto pb-1 sm:flex-wrap sm:justify-end sm:overflow-visible sm:pb-0">
             <Button
               variant="ghost"
               size="sm"
@@ -2229,12 +2235,17 @@ export default function Home() {
 
       <section className="print-sheet mx-auto flex max-w-[1680px] flex-col px-4 py-5 print:hidden lg:px-6">
         {persistenceError && (
-          <p
+          <div
             role="alert"
-            className="mb-4 rounded-xl border border-amber-400 bg-amber-50 p-4 text-sm text-amber-950"
+            className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-400 bg-amber-50 p-4 text-sm text-amber-950"
           >
-            {persistenceError}
-          </p>
+            <span>{persistenceError}</span>
+            {storageBlocked && (
+              <Button type="button" size="sm" variant="outline" onClick={reloadSavedProject}>
+                Cargar versión guardada
+              </Button>
+            )}
+          </div>
         )}
         {/* Print Header */}
         <div className="mb-4 hidden items-start justify-between border-b-2 border-slate-900 pb-3 print:flex">
@@ -2348,6 +2359,10 @@ export default function Home() {
                           {calc.occupiedModules} M
                         </p>
                       )}
+                      <p className={`text-[9px] ${isActive ? 'text-slate-800' : 'text-slate-400'}`}>
+                        {(panelDiagnostics.get(p.id)?.length ?? 0) + projectDiagnostics.length}{' '}
+                        alertas en este tablero
+                      </p>
                     </div>
                   </button>
 
@@ -2599,10 +2614,11 @@ export default function Home() {
                     onChange={(val) => updateActivePanel('feederLengthM', val)}
                   />
                   <div className="space-y-1.5">
-                    <Label className="text-xs text-muted-foreground">
+                    <Label htmlFor="feeder-section" className="text-xs text-muted-foreground">
                       Sección alimentador
                     </Label>
                     <NativeSelect
+                      id="feeder-section"
                       className="w-full bg-white"
                       value={activePanel.feederConductor ?? 6}
                       onChange={(e) =>
@@ -2620,10 +2636,11 @@ export default function Home() {
                     </NativeSelect>
                   </div>
                   <div className="space-y-1.5">
-                    <Label className="text-xs text-muted-foreground">
+                    <Label htmlFor="feeder-breaker" className="text-xs text-muted-foreground">
                       Térmica en el TP para este alimentador
                     </Label>
                     <NativeSelect
+                      id="feeder-breaker"
                       className="w-full bg-white"
                       value={activePanel.feederBreaker ?? 32}
                       onChange={(e) =>
@@ -2641,10 +2658,11 @@ export default function Home() {
                     </NativeSelect>
                   </div>
                   <div className="space-y-1.5">
-                    <Label className="text-xs text-muted-foreground">
+                    <Label htmlFor="feeder-phase" className="text-xs text-muted-foreground">
                       Fase tomada del TP
                     </Label>
                     <NativeSelect
+                      id="feeder-phase"
                       className="w-full bg-white"
                       value={
                         activePanel.supply === 'tri'
@@ -2980,7 +2998,7 @@ export default function Home() {
                 ? 'IGA sugerido'
                 : 'Corte local sugerido'
             }
-            value={`${calculations.mainBreaker} A`}
+            value={ratingLabel(calculations.mainBreaker)}
             emphasis
           />
           <Metric
@@ -3106,6 +3124,7 @@ export default function Home() {
                               C{index + 1}
                             </span>
                             <Input
+                              aria-label={`Nombre del circuito C${index + 1}`}
                               value={circuit.name}
                               onChange={(event) =>
                                 updateCircuit(
@@ -3120,6 +3139,7 @@ export default function Home() {
                         </td>
                         <td className="px-2 py-2">
                           <NativeSelect
+                            aria-label={`Tipo de circuito de ${circuit.name}`}
                             size="sm"
                             value={circuit.kind}
                             onChange={(event) =>
@@ -3141,6 +3161,7 @@ export default function Home() {
                         </td>
                         <td className="px-2 py-2">
                           <CompactNumber
+                            label={`Bocas de ${circuit.name}`}
                             value={circuit.points}
                             min={1}
                             onChange={(value) =>
@@ -3150,6 +3171,7 @@ export default function Home() {
                         </td>
                         <td className="px-2 py-2">
                           <CompactNumber
+                            label={`VA por boca de ${circuit.name}`}
                             value={circuit.unitVA}
                             min={1}
                             onChange={(value) =>
@@ -3162,6 +3184,7 @@ export default function Home() {
                         </td>
                         <td className="px-2 py-2">
                           <NativeSelect
+                            aria-label={`Fase de ${circuit.name}`}
                             size="sm"
                             value={
                               activePanel.supply === 'mono'
@@ -3203,6 +3226,7 @@ export default function Home() {
                         </td>
                         <td className="px-2 py-2">
                           <NativeSelect
+                            aria-label={`Térmica de ${circuit.name}`}
                             size="sm"
                             className="ml-auto w-20"
                             value={circuit.breaker}
@@ -3223,6 +3247,7 @@ export default function Home() {
                         </td>
                         <td className="px-2 py-2">
                           <NativeSelect
+                            aria-label={`Sección del conductor de ${circuit.name}`}
                             size="sm"
                             className="ml-auto w-24"
                             value={circuit.conductor}
@@ -3244,6 +3269,7 @@ export default function Home() {
                         {experienceMode === 'technical' && (
                           <td className="px-2 py-2">
                             <CompactNumber
+                              label={`Longitud en metros de ${circuit.name}`}
                               value={circuit.lengthM}
                               min={1}
                               onChange={(value) =>
@@ -3255,7 +3281,11 @@ export default function Home() {
                         {experienceMode === 'technical' && (
                           <td
                             className={`px-2 py-2 text-right font-mono text-xs font-semibold ${
-                              totalDropPercent > 3
+                              totalDropPercent >
+                              voltageDropCriteria(
+                                activePanel.type,
+                                circuit.kind,
+                              ).totalLimitPercent
                                 ? 'text-amber-700'
                                 : 'text-emerald-700'
                             }`}
@@ -3265,6 +3295,7 @@ export default function Home() {
                         )}
                         <td className="px-2 py-2">
                           <CompactNumber
+                            label={`Módulos DIN de ${circuit.name}`}
                             value={circuitModuleSpan(circuit)}
                             min={circuit.phase === '3Φ' ? 4 : 2}
                             max={8}
@@ -3351,7 +3382,7 @@ export default function Home() {
           </section>
 
           {/* Visual DIN Panel and Phase Balance */}
-          <div className="grid items-start gap-5 xl:grid-cols-[minmax(520px,1.3fr)_minmax(360px,.7fr)]">
+          <div className="grid min-w-0 grid-cols-1 items-start gap-5 xl:grid-cols-[minmax(520px,1.3fr)_minmax(360px,.7fr)]">
             <section className="rounded-2xl border bg-card p-4 shadow-sm">
               <div className="mb-4 flex items-start justify-between gap-3">
                 <div>
@@ -3700,13 +3731,13 @@ export default function Home() {
               <div className="flex items-end">
                 <Badge
                   className={`mb-1 ${
-                    warnings.length
+                    projectWarnings.length
                       ? 'border border-amber-300/30 bg-amber-300/10 text-amber-200'
                       : 'border border-emerald-300/30 bg-emerald-300/10 text-emerald-200'
                   }`}
                 >
-                  {warnings.length
-                    ? `${warnings.length} alertas`
+                  {projectWarnings.length
+                    ? `${projectWarnings.length} alertas en el proyecto`
                     : 'Sin alertas'}
                 </Badge>
               </div>
@@ -3874,10 +3905,14 @@ export default function Home() {
             />
             <FormulaCard
               title="Protección general sugerida"
-              formula="In sugerida = máx(calibre ≥ 1,15 × Ib; mayor derivación)"
+              formula={
+                activePanel.type === 'TS'
+                  ? 'Corte local = máx(calibre ≥ 1,15 × Ib; mayor salida; térmica del alimentador)'
+                  : 'IGA = máx(calibre ≥ 1,15 × Ib; mayor derivación)'
+              }
               substitution={`1,15 × ${formatNumber(calculations.mainCurrent, 2)} A = ${formatNumber(calculations.mainCurrent * 1.15, 2)} A`}
-              result={`${calculations.mainBreaker} A`}
-              note={`Por corriente: ${calculations.currentBasedBreaker} A · mayor derivación: ${calculations.maxBranchBreaker || 0} A. El 15 % es un margen de diseño, no una exigencia AEA. Pendientes: Iz real, Ik y selectividad; un mayor calibre no los verifica.`}
+              result={ratingLabel(calculations.mainBreaker)}
+              note={`Por corriente: ${ratingLabel(calculations.currentBasedBreaker)} · mayor derivación: ${calculations.maxBranchBreaker || 0} A${activePanel.type === 'TS' ? ` · protección aguas arriba: ${activePanel.feederBreaker ?? 'pendiente'} A` : ''}. El 15 % es un margen de diseño. Pendientes: Iz real, Ik y selectividad; un mayor calibre no los verifica.`}
             />
             {activePanel.type === 'TS' && (
               <FormulaCard
@@ -4364,6 +4399,7 @@ export default function Home() {
         projectName={projectName}
         panels={panels}
         calculations={panelCalculations}
+        profile={profile}
         publicVenue={isPublicVenue}
       />
     </main>
@@ -4374,17 +4410,24 @@ function ProjectPrintSummary({
   projectName,
   panels,
   calculations,
+  profile = INITIAL_PROFILE,
   publicVenue = false,
 }: {
   projectName: string;
   panels: Panel[];
   calculations: Map<string, PanelCalculation>;
+  profile?: ProjectProfile;
   publicVenue?: boolean;
 }) {
+  const projectDiagnostics = diagnoseProject(panels, profile, publicVenue);
   return (
     <section className="print-sheet hidden p-0 print:block">
       {panels.map((panel) => {
         const calculation = calculations.get(panel.id);
+        const panelDiagnostics = calculation
+          ? diagnosePanel(panel, calculation, panels, calculations)
+          : ['No se pudieron calcular los datos de este tablero.'];
+        const printWarnings = [...projectDiagnostics, ...panelDiagnostics];
         const children = panels.filter(
           (child) => child.type === 'TS' && child.parentId === panel.id,
         );
@@ -4434,7 +4477,7 @@ function ProjectPrintSummary({
               <div className="border p-2">
                 <strong>Cabecera</strong>
                 <br />
-                {calculation?.mainBreaker ?? 0} A
+                {ratingLabel(calculation?.mainBreaker)}
               </div>
               <div className="border p-2">
                 <strong>Gabinete</strong>
@@ -4452,6 +4495,22 @@ function ProjectPrintSummary({
                 ΔV {formatNumber(calculation?.feederDrop.percent ?? 0, 2)} %
               </p>
             )}
+
+            <section className={`mb-3 border p-2 text-[10px] ${printWarnings.length ? 'border-amber-700' : 'border-emerald-700'}`}>
+              <strong>
+                {printWarnings.length
+                  ? `Advertencias del proyecto y de ${panel.name}`
+                  : `Sin advertencias preliminares en ${panel.name}`}
+              </strong>
+              {printWarnings.length > 0 && (
+                <ul className="mt-1 list-disc pl-4">
+                  {printWarnings.map((warning) => <li key={warning}>{warning}</li>)}
+                </ul>
+              )}
+              <p className="mt-1">
+                Mínimos de conductores: AEA 90364-7-771, Corrigendum 2 ({AEA_CONDUCTOR_REFERENCE_URL}).
+              </p>
+            </section>
 
             {children.length > 0 && (
               <div className="mb-3">
@@ -4506,7 +4565,7 @@ function ProjectPrintSummary({
                   <th className="border p-1">Tipo</th>
                   <th className="border p-1">Carga</th>
                   <th className="border p-1">Fase</th>
-                  <th className="border p-1">TM</th>
+                  <th className="border p-1">Ib / TM / Iz</th>
                   <th className="border p-1">Cable</th>
                   <th className="border p-1">Long.</th>
                   <th className="border p-1">ΔV</th>
@@ -4521,8 +4580,17 @@ function ProjectPrintSummary({
                     <td className="border p-1">
                       {formatPower(circuitPower(circuit))}
                     </td>
-                    <td className="border p-1">{circuit.phase}</td>
-                    <td className="border p-1">{circuit.breaker} A</td>
+                    <td className="border p-1">{circuitPhaseLabel(panel, circuit)}</td>
+                    <td className="border p-1">
+                      {formatNumber(circuitCurrent(circuit, panel.supply), 1)} /{' '}
+                      {circuit.breaker} /{' '}
+                      {conductorAmpacity(
+                        circuit.conductor,
+                        circuit.phase === '3Φ',
+                        circuit.ampacity,
+                      ) ?? 'pendiente'}{' '}
+                      A
+                    </td>
                     <td className="border p-1">{circuit.conductor} mm²</td>
                     <td className="border p-1">{circuit.lengthM} m</td>
                     <td className="border p-1">
@@ -4616,7 +4684,7 @@ function NormativeReferenceTables() {
       section: '1,5',
       mono: '15 A',
       tri: '14 A',
-      breaker: '10 A (máx. 13 A / 15 A)',
+      breaker: 'Según Ib ≤ In ≤ Iz',
       r20: '13,30 Ω/km',
       pe: '2,5 mm²',
       highlight: false,
@@ -4625,7 +4693,7 @@ function NormativeReferenceTables() {
       section: '2,5',
       mono: '21 A',
       tri: '18 A',
-      breaker: '16 A (máx. 20 A monof.)',
+      breaker: 'Según Ib ≤ In ≤ Iz',
       r20: '7,98 Ω/km',
       pe: '2,5 mm²',
       highlight: true,
@@ -4634,7 +4702,7 @@ function NormativeReferenceTables() {
       section: '4,0',
       mono: '28 A',
       tri: '25 A',
-      breaker: '20 A / 25 A',
+      breaker: 'Según Ib ≤ In ≤ Iz',
       r20: '4,95 Ω/km',
       pe: '4,0 mm²',
       highlight: false,
@@ -4643,7 +4711,7 @@ function NormativeReferenceTables() {
       section: '6,0',
       mono: '36 A',
       tri: '32 A',
-      breaker: '32 A',
+      breaker: 'Según Ib ≤ In ≤ Iz',
       r20: '3,30 Ω/km',
       pe: '6,0 mm²',
       highlight: false,
@@ -4652,7 +4720,7 @@ function NormativeReferenceTables() {
       section: '10,0',
       mono: '50 A',
       tri: '44 A',
-      breaker: '40 A / 50 A',
+      breaker: 'Según Ib ≤ In ≤ Iz',
       r20: '1,91 Ω/km',
       pe: '10,0 mm²',
       highlight: false,
@@ -4661,7 +4729,7 @@ function NormativeReferenceTables() {
       section: '16,0',
       mono: '66 A',
       tri: '59 A',
-      breaker: '50 A / 63 A',
+      breaker: 'Según Ib ≤ In ≤ Iz',
       r20: '1,21 Ω/km',
       pe: '16,0 mm²',
       highlight: false,
@@ -4670,7 +4738,7 @@ function NormativeReferenceTables() {
       section: '25,0',
       mono: '88 A',
       tri: '77 A',
-      breaker: '63 A / 80 A',
+      breaker: 'Según Ib ≤ In ≤ Iz',
       r20: '0,78 Ω/km',
       pe: '16,0 mm²',
       highlight: false,
@@ -4679,7 +4747,7 @@ function NormativeReferenceTables() {
       section: '35,0',
       mono: '109 A',
       tri: '96 A',
-      breaker: '80 A / 100 A',
+      breaker: 'Según Ib ≤ In ≤ Iz',
       r20: '0,554 Ω/km',
       pe: '16,0 mm²',
       highlight: false,
@@ -4691,34 +4759,34 @@ function NormativeReferenceTables() {
       kind: 'Iluminación de Uso General',
       code: 'IUG',
       minSection: '1,5 mm²',
-      maxBreaker: '16 A (sugerida 10 A)',
+      maxBreaker: 'Según Ib ≤ In ≤ Iz',
       dest: 'Bocas fijas de iluminación y tomas de servicio exclusivos de luminarias (máx. 15 bocas).',
     },
     {
       kind: 'Tomacorrientes de Uso General',
       code: 'TUG',
       minSection: '2,5 mm²',
-      maxBreaker: '20 A (sugerida 16 A)',
+      maxBreaker: 'Según Ib ≤ In ≤ Iz',
       dest: 'Tomacorrientes estándar de 10 A para aparatos portátiles monofásicos (máx. 15 bocas).',
     },
     {
       kind: 'Iluminación de Uso Especial',
       code: 'IUE',
       minSection: '2,5 mm²',
-      maxBreaker: '20 A (sugerida 16 A)',
+      maxBreaker: 'Según Ib ≤ In ≤ Iz',
       dest: 'Iluminación a la intemperie o potencias unitarias elevadas por boca (máx. 12 bocas).',
     },
     {
       kind: 'Tomacorrientes de Uso Especial',
       code: 'TUE',
       minSection: '2,5 mm²',
-      maxBreaker: '32 A (sugerida 20 A)',
+      maxBreaker: 'Según Ib ≤ In ≤ Iz',
       dest: 'Tomas de 20 A para cargas específicas (aire acondicionado, motores, hornos, máx. 12 bocas).',
     },
     {
       kind: 'Líneas Seccionales (Alimentador TP → TS)',
       code: 'L. Sec.',
-      minSection: '2,5 mm² (770) / 4,0 mm² (771)',
+      minSection: '2,5 mm²',
       maxBreaker: 'Según Iz calculada',
       dest: 'Conducción entre Tablero Principal y Tableros Seccionales aguas abajo.',
     },
@@ -4760,14 +4828,14 @@ function NormativeReferenceTables() {
           <div className="flex items-center gap-2 text-amber-300">
             <BookOpenCheck className="size-4" />
             <p className="text-[11px] font-semibold uppercase tracking-[0.12em]">
-              Anexo Normativo · Tablas Oficiales AEA 90364
+              Anexo de predimensionado · referencias verificables
             </p>
           </div>
           <h2 className="mt-1 text-lg font-semibold">
             Tablas de Conductores por Amperaje y Secciones Mínimas por Conexión
           </h2>
           <p className="mt-1 max-w-3xl text-xs text-slate-400">
-            Valores reglamentarios de referencia según AEA 90364 (Secciones 770 y 771) e IRAM 2183 / NM 247-3 / 62267 para conductores de cobre flexible en cañería embutida en mampostería (Método B1, 40 °C ambiente).
+            Los mínimos se basan en AEA 90364-7-771 Corrigendum 2. Las capacidades Iz son valores de catálogo para Cu/PVC 70 °C y deben reemplazarse por la ficha del cable y las condiciones reales del proyecto.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -4790,11 +4858,11 @@ function NormativeReferenceTables() {
                   1
                 </span>
                 <h3 className="text-sm font-bold sm:text-base">
-                  Tabla 1: Capacidad de Corriente Admisible (Iz) y Protección Recomendada
+                  Tabla 1: Capacidad Iz preliminar de catálogo
                 </h3>
               </div>
               <p className="mt-1 text-xs text-muted-foreground">
-                Cables de cobre Cu/PVC 70 °C (IRAM 2183) en cañería embutida (Método B1, temperatura base de referencia 40 °C en aire).
+                Referencia de producto Cu/PVC 70 °C. No implica que todo cable LS0H sea de 90 °C ni reemplaza la declaración de fabricante.
               </p>
             </div>
             <Badge className="w-fit border border-slate-200 bg-slate-100 text-[11px] text-slate-800 dark:border-slate-800 dark:bg-slate-800 dark:text-slate-200">
@@ -4883,11 +4951,11 @@ function NormativeReferenceTables() {
                   2
                 </span>
                 <h3 className="text-sm font-bold sm:text-base">
-                  Tabla 2: Secciones Mínimas Normativas por Tipo de Circuito / Conexión
+                  Tabla 2: Mínimos y reglas de diseño por destino
                 </h3>
               </div>
               <p className="mt-1 text-xs text-muted-foreground">
-                Calibres mínimos reglamentarios según AEA 90364-7-770 (viviendas unifamiliares) y AEA 90364-7-771 (viviendas, comercios y oficinas).
+                Secciones mínimas según AEA 90364-7-771 Corrigendum 2. Los máximos de puntos y protecciones aquí indicados son criterios conservadores del proyecto cuando no figura una regla normativa verificada.
               </p>
             </div>
             <Badge className="w-fit border border-sky-200 bg-sky-50 text-[11px] text-sky-800 dark:border-sky-900 dark:bg-sky-950/40 dark:text-sky-300">
@@ -4902,7 +4970,7 @@ function NormativeReferenceTables() {
                   <th className="px-3.5 py-3">Tipo de Circuito / Conexión</th>
                   <th className="px-3.5 py-3">Sigla</th>
                   <th className="px-3.5 py-3">Sección Mínima</th>
-                  <th className="px-3.5 py-3">Térmica (In) Máxima</th>
+                  <th className="px-3.5 py-3">Protección / regla de diseño</th>
                   <th className="px-3.5 py-3">Destino y Criterio Normativo</th>
                 </tr>
               </thead>
@@ -5206,15 +5274,18 @@ function QuickNumber({
   dark?: boolean;
   onChange: (value: number) => void;
 }) {
+  const fieldId = `quick-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
   return (
     <div className="space-y-1.5">
       <Label
+        htmlFor={fieldId}
         className={`text-xs ${dark ? 'text-slate-400' : 'text-muted-foreground'}`}
       >
         {label}
       </Label>
       <div className="relative">
         <Input
+          id={fieldId}
           type="number"
           min={min}
           step={step}
@@ -5538,11 +5609,13 @@ function PriceInput({
   suffix?: string;
   onChange: (value: number) => void;
 }) {
+  const fieldId = `price-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
   return (
     <div className="space-y-1">
-      <Label className="text-[10px] text-muted-foreground">{label}</Label>
+      <Label htmlFor={fieldId} className="text-[10px] text-muted-foreground">{label}</Label>
       <div className="relative">
         <Input
+          id={fieldId}
           type="number"
           min="0"
           step="1"
@@ -5605,11 +5678,13 @@ function Metric({
 }
 
 function CompactNumber({
+  label,
   value,
   min,
   max,
   onChange,
 }: {
+  label: string;
   value: number;
   min?: number;
   max?: number;
@@ -5617,6 +5692,7 @@ function CompactNumber({
 }) {
   return (
     <Input
+      aria-label={label}
       type="number"
       value={value}
       min={min}
@@ -5809,7 +5885,7 @@ function FeederReviews({
               <div>
                 <dt>Corte local · maniobra</dt>
                 <dd className="font-mono font-bold">
-                  {calculation.mainBreaker} A
+                  {ratingLabel(calculation.mainBreaker)}
                 </dd>
               </div>
             </dl>
@@ -5959,6 +6035,16 @@ function PanelFront({
           </div>
         </div>
       ))}
+      <details className="din-equipment-list mt-3 rounded-lg border border-slate-400 bg-white/80 p-2 text-xs text-slate-900">
+        <summary className="cursor-pointer font-semibold">Lista accesible de equipos</summary>
+        <ul className="mt-2 list-disc space-y-1 pl-5">
+          {devices.map((device) => (
+            <li key={device.key}>
+              {device.label}: {device.fullName} · {device.detail} · {device.span} módulos
+            </li>
+          ))}
+        </ul>
+      </details>
     </div>
   );
 }
@@ -5993,7 +6079,7 @@ function SingleLineDiagram({
         <span aria-hidden="true">→</span>
         <DiagramNode
           kicker="Cabecera"
-          title={`${panel.type === 'TP' ? 'IGA' : 'Corte local'} ${calculation.mainBreaker} A`}
+          title={`${panel.type === 'TP' ? 'IGA' : 'Corte local'} ${ratingLabel(calculation.mainBreaker)}`}
           detail={`${panel.supply === 'tri' ? '4P' : '2P'} · ${
             panel.type === 'TP'
               ? 'calibre preliminar'
@@ -6034,12 +6120,12 @@ function SingleLineDiagram({
               </div>
             </div>
           ))}
-        {childPanels.map((child, index) => (
+        {childPanels.map((child) => (
           <div key={child.id} className="diagram-branch flex items-center py-2">
             <span className="h-0.5 w-6 shrink-0 bg-slate-700" />
             <div className="min-w-0 flex-1 rounded-lg border border-sky-300 bg-sky-50 p-3 text-xs">
               <strong>
-                Alim. TS{index + 1} → {child.name}
+                Alimentador → {child.name}
               </strong>
               <p className="mt-1">
                 TM {child.feederBreaker ?? 32} A ·{' '}
@@ -6074,7 +6160,7 @@ function SingleLineDiagram({
                 · {circuit.breaker} A → {circuit.name}
               </strong>
               <p className="mt-1">
-                {circuit.phase} · {circuit.phase === '3Φ' ? '4P' : '2P'} ·{' '}
+                {circuitPhaseLabel(panel, circuit)} · {circuit.phase === '3Φ' ? '4P' : '2P'} ·{' '}
                 {circuit.conductor} mm² · PE{' '}
                 {protectiveConductorSection(circuit.conductor)} mm² ·{' '}
                 {circuit.lengthM} m · {formatPower(circuitPower(circuit))}
@@ -6128,7 +6214,7 @@ function MultiLineDiagram({
       id: circuit.id,
       title: `C${index + 1} · ${circuit.name}`,
       protection: `${differentialLabel(panel, circuit.id)} 30 mA tipo ${panelDifferentialType(panel)} → TM ${circuit.breaker} A`,
-      phase: circuit.phase,
+      phase: physicalCircuitPhase(panel, circuit),
       section: circuit.conductor,
       length: circuit.lengthM,
       power: circuitPower(circuit),

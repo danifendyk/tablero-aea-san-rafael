@@ -61,11 +61,11 @@ test('001: todas las plantillas IUG de código, incluido crear TS, evitan térmi
   assert.ok(count >= 3);
 });
 const appended = `
-export const audit = { normalizePanels, normalizeCircuit, normalizePrices, normalizeProfile, INITIAL_PANELS, INITIAL_PROFILE, DEFAULT_PRICES, PanelFront, SingleLineDiagram, MultiLineDiagram, ProjectPrintSummary, PriceInput, AmpacityEditor, emergencyAutonomyDeclared, cabinetFor, circuitCurrent, voltageDrop };
+export const audit = { normalizePanels, normalizeCircuit, normalizePrices, normalizeProfile, INITIAL_PANELS, INITIAL_PROFILE, DEFAULT_PRICES, PanelFront, SingleLineDiagram, MultiLineDiagram, ProjectPrintSummary, PriceInput, AmpacityEditor, FeederReviews, reviewFeeder, emergencyAutonomyDeclared, cabinetFor, circuitCurrent, voltageDrop };
 export function calculatePanels(panels) { return (${memoBody('panelCalculations')})(); }
 export function calculateCosts(activePanel, panels, prices) { return (${memoBody('costOptions')})(); }
 export function calculateProjectCosts(panels, prices) { return (${memoBody('projectCostSummary')})(); }
-export function calculateWarnings(activePanel, calculations, tpPanel, panels, profile, isPublicVenue) { return (${memoBody('warnings')})(); }
+export function calculateWarnings(activePanel, calculations, tpPanel, panels, profile, isPublicVenue) { const panelCalculations = calculatePanels(panels); return (${memoBody('warnings')})(); }
 `;
 const compiled = ts.transpileModule(source + appended, {
   compilerOptions: {
@@ -126,6 +126,134 @@ const makePanel = (extra = {}) => ({
   name: 'TP',
   circuits: [makeCircuit(1)],
   ...extra,
+});
+
+test('TP/TS: 48,8 A con alimentador de 32 A y 6 mm² se advierte desde ambos tableros y al imprimir', () => {
+  const tp = makePanel({ circuits: [] });
+  const child = makePanel({
+    id: 'ts1',
+    name: 'TS1',
+    type: 'TS',
+    parentId: tp.id,
+    demandFactor: 1,
+    feederBreaker: 32,
+    feederConductor: 6,
+    feederLengthM: 15,
+    circuits: Array.from({ length: 5 }, (_, i) =>
+      makeCircuit(i + 1, {
+        kind: 'TUE',
+        phase: 'L3',
+        unitVA: 2147.2,
+        breaker: 20,
+        conductor: 4,
+      }),
+    ),
+  });
+  const panels = [tp, child];
+  const before = clone(panels);
+  const calculations = calculatePanels(panels);
+  close(calculations.get('ts1').mainCurrent, 48.8);
+  assert.equal(calculations.get('ts1').mainBreaker, 63);
+  assert.equal(calculations.get('tp').mainBreaker, 63);
+  for (const panel of panels) {
+    const warnings = calculateWarnings(
+      panel,
+      calculations.get(panel.id),
+      tp,
+      panels,
+      app.INITIAL_PROFILE,
+      false,
+    );
+    assert.ok(
+      warnings.some(
+        (w) => w.includes('TS1') && w.includes('32 A es menor que Ib 48,8 A'),
+      ),
+    );
+    assert.ok(warnings.some((w) => w.includes('No aumentar solo la térmica')));
+    const review = html(app.FeederReviews, { panel, panels, calculations });
+    assert.ok(review.includes('role="alert"'));
+    assert.ok(review.includes('48,8 A'));
+    assert.ok(review.includes('Cable 6 mm²'));
+    assert.ok(review.includes('32,0 A'));
+  }
+  const printed = html(app.ProjectPrintSummary, {
+    projectName: 'Regresión TP/TS',
+    panels,
+    calculations,
+  });
+  assert.equal(printed.split('No aumentar solo la térmica').length - 1, 2);
+  const front = html(app.PanelFront, {
+    devices: buildPanelDevices(child, [], 63),
+    rows: 3,
+    modulesPerRow: 18,
+    panelType: 'TS',
+    hasDps: false,
+    hasFeeders: false,
+  });
+  assert.ok(front.includes('Maniobra'));
+  assert.ok(front.includes('sin disparo por sobrecorriente'));
+  assert.ok(
+    html(app.SingleLineDiagram, {
+      panel: child,
+      calculation: calculations.get('ts1'),
+    }).includes('maniobra, sin disparo por sobrecorriente'),
+  );
+  assert.deepEqual(
+    panels,
+    before,
+    'No se deben ajustar térmicas ni cables del usuario',
+  );
+});
+
+test('alimentador: un corte local de 63 A no invalida por sí solo una térmica de 32 A', () => {
+  const child = makePanel({
+    id: 'ts1',
+    type: 'TS',
+    feederBreaker: 32,
+    feederConductor: 6,
+  });
+  const calculation = {
+    ...calculatePanels([child]).get('ts1'),
+    mainCurrent: 32,
+    mainBreaker: 63,
+    feederDrop: { percent: 0.5 },
+  };
+  assert.deepEqual(app.reviewFeeder(child, calculation).issues, []);
+  const markup = html(app.FeederReviews, {
+    panel: child,
+    panels: [child],
+    calculations: new Map([['ts1', calculation]]),
+  });
+  assert.ok(!markup.includes('role="alert"'));
+  assert.ok(markup.includes('No valida la instalación'));
+});
+
+test('alimentador: aumentar solo In o desconocer Iz nunca resuelve la revisión', () => {
+  const child = makePanel({
+    id: 'ts1',
+    type: 'TS',
+    feederBreaker: 63,
+    feederConductor: 6,
+  });
+  const calculation = {
+    ...calculatePanels([child]).get('ts1'),
+    mainCurrent: 48.8,
+  };
+  const issues = app.reviewFeeder(child, calculation).issues;
+  assert.ok(
+    issues.some((issue) => issue.includes('La demanda supera Iz 32,0 A')),
+  );
+  assert.ok(issues.some((issue) => issue.includes('63 A supera Iz 32,0 A')));
+  const unknown = {
+    ...child,
+    feederAmpacity: { mode: 'declared', declaredA: 80, basis: '' },
+  };
+  assert.equal(app.reviewFeeder(unknown, calculation).capacity, null);
+  assert.ok(
+    app
+      .reviewFeeder(unknown, calculation)
+      .issues.some((issue) => issue.includes('Falta una Iz')),
+  );
 });
 
 test('001/002/019: normalización real de página, valores vacíos y módulos trifásicos', () => {

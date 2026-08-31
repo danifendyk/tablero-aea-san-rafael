@@ -59,6 +59,14 @@ un óptimo global. Rechaza repartos que empeoren el máximo o la dispersión.
 
 ## Tablero y diagramas
 
+El corte local del TS representa un interruptor-seccionador para maniobra, no una
+protección automática contra sobrecorrientes. Su calibre no habilita esa corriente
+de consumo. La térmica del alimentador se conserva tal como fue elegida: no se
+aumenta para igualarla al corte local. El chequeo `Ib ≤ In ≤ Iz` y la caída del
+alimentador se muestran tanto en su TS como en el TP, junto a la vista DIN y en
+la impresión. Si `Ib > Iz`, se advierte que cambiar solo la térmica no resuelve
+la incompatibilidad. No se certifican categoría de empleo ni coordinación real.
+
 Se modelan térmicas 2P/4P de al menos 2/4 módulos; confirmar ancho del producto.
 Los ID son equipos separados. Económica: 1 ID normal + 1 ID EMG. Equilibrada:
 ID A para IUG, ID B para TUG/TUE/FM e ID EMG. Domiciliaria: 1 ID común, incluida

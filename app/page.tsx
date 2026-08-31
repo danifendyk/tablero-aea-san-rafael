@@ -439,6 +439,40 @@ function nextBreaker(current: number) {
   return STANDARD_BREAKERS.find((value) => value >= current) ?? 125;
 }
 
+// One review for the TS and its outgoing feeder in the TP. Never changes ratings.
+function reviewFeeder(panel: Panel, calculation: PanelCalculation) {
+  const breaker = panel.feederBreaker ?? 32;
+  const section = panel.feederConductor ?? 6;
+  const capacity = conductorAmpacity(
+    section,
+    panel.supply === 'tri',
+    panel.feederAmpacity,
+  );
+  const current = calculation.mainCurrent;
+  const issues: string[] = [];
+  if (current > breaker)
+    issues.push(
+      `La térmica de ${breaker} A es menor que Ib ${formatNumber(current, 1)} A: el alimentador no alcanza para la demanda.`,
+    );
+  if (capacity === null) {
+    issues.push('Falta una Iz de diseño válida y su fuente/condiciones.');
+  } else {
+    if (current > capacity)
+      issues.push(
+        `La demanda supera Iz ${formatNumber(capacity, 1)} A del cable de ${section} mm². No aumentar solo la térmica: revisar cable y demanda.`,
+      );
+    if (breaker > capacity)
+      issues.push(
+        `La térmica de ${breaker} A supera Iz ${formatNumber(capacity, 1)} A del cable de ${section} mm²: protección contra sobrecarga incompatible.`,
+      );
+  }
+  if (calculation.feederDrop.percent > 1)
+    issues.push(
+      `Caída del alimentador ${formatNumber(calculation.feederDrop.percent, 2)} %: supera el criterio de diseño del 1 %.`,
+    );
+  return { breaker, section, capacity, current, issues };
+}
+
 function formatPower(va: number) {
   return va >= 1000
     ? `${new Intl.NumberFormat('es-AR', { maximumFractionDigits: 2 }).format(va / 1000)} kVA`
@@ -1389,28 +1423,24 @@ export default function Home() {
       }
     });
 
+    const feeders =
+      activePanel.type === 'TS'
+        ? [activePanel]
+        : panels.filter(
+            (panel) => panel.type === 'TS' && panel.parentId === activePanel.id,
+          );
+    for (const feeder of feeders) {
+      const feederCalculation = panelCalculations.get(feeder.id);
+      if (feederCalculation)
+        messages.push(
+          ...reviewFeeder(feeder, feederCalculation).issues.map(
+            (issue) => `Alimentador a ${feeder.name}: ${issue}`,
+          ),
+        );
+    }
+
     if (activePanel.type === 'TS') {
       const feederBreaker = activePanel.feederBreaker ?? 32;
-      const feederConductor = activePanel.feederConductor ?? 6;
-      const feederCapacity = conductorAmpacity(
-        feederConductor,
-        activePanel.supply === 'tri',
-        activePanel.feederAmpacity,
-      );
-      if (feederCapacity === null)
-        messages.push(
-          'Alimentador: falta una Iz de diseño válida y su fuente/condiciones.',
-        );
-      if (feederBreaker < calculations.mainCurrent) {
-        messages.push(
-          `Alimentador: la térmica de ${feederBreaker} A es menor que Ib ${calculations.mainCurrent.toFixed(1)} A.`,
-        );
-      }
-      if (feederCapacity !== null && feederBreaker > feederCapacity) {
-        messages.push(
-          `Alimentador: ${feederBreaker} A supera la capacidad preliminar de ${feederCapacity} A para ${feederConductor} mm².`,
-        );
-      }
       const maxTerminalBreaker = activePanel.circuits.reduce(
         (maximum, circuit) => Math.max(maximum, circuit.breaker),
         0,
@@ -1418,11 +1448,6 @@ export default function Home() {
       if (feederBreaker < maxTerminalBreaker) {
         messages.push(
           `Alimentador: revisar selectividad; su térmica de ${feederBreaker} A es menor que una protección terminal de ${maxTerminalBreaker} A.`,
-        );
-      }
-      if (calculations.feederDrop.percent > 1) {
-        messages.push(
-          `Alimentador: caída seccional ${calculations.feederDrop.percent.toFixed(2)} %, supera el criterio recomendado de 1 %.`,
         );
       }
       if (tpPanel.supply === 'mono' && activePanel.supply === 'tri') {
@@ -1489,6 +1514,7 @@ export default function Home() {
     calculations.imbalance,
     calculations.mainCurrent,
     isPublicVenue,
+    panelCalculations,
     panels,
     profile,
     tpPanel.supply,
@@ -3336,7 +3362,7 @@ export default function Home() {
                     Tablero DIN · {calculations.rows} filas
                   </h2>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    Lectura de izquierda a derecha: cabecera, protección y
+                    Lectura de izquierda a derecha: cabecera, protecciones y
                     circuitos de salida.
                   </p>
                 </div>
@@ -3344,6 +3370,11 @@ export default function Home() {
                   ≈ {calculations.widthMm} × {calculations.heightMm} × 120 mm
                 </Badge>
               </div>
+              <FeederReviews
+                panel={activePanel}
+                panels={panels}
+                calculations={panelCalculations}
+              />
               <PanelFront
                 devices={devices}
                 rows={calculations.rows}
@@ -4532,6 +4563,11 @@ function ProjectPrintSummary({
                   <h3 className="mb-3 text-lg font-bold">
                     {panel.name} · Vista frontal DIN
                   </h3>
+                  <FeederReviews
+                    panel={panel}
+                    panels={panels}
+                    calculations={calculations}
+                  />
                   <PanelFront
                     devices={buildPanelDevices(
                       panel,
@@ -5606,11 +5642,11 @@ function ProtectionGuide({
       title:
         panelType === 'TP'
           ? 'Interruptor General Automático'
-          : 'Interruptor de corte local',
+          : 'Interruptor-seccionador de corte local',
       description:
         panelType === 'TP'
           ? 'Corte general y protección principal contra sobrecargas y cortocircuitos.'
-          : 'Permite desenergizar el tablero seccional en el lugar; su alimentador se protege desde el TP.',
+          : 'Maniobra y seccionamiento local, sin disparo automático por sobrecorriente. Su calibre no aumenta la capacidad del alimentador, protegido por la térmica del TP. Verificar categoría de empleo y coordinación con el fabricante.',
       swatch: 'bg-slate-800',
     },
     ...(hasDps
@@ -5706,6 +5742,97 @@ function PhaseBar({
       <span className="w-20 text-right font-mono text-xs">
         {formatPower(value)}
       </span>
+    </div>
+  );
+}
+
+function FeederReviews({
+  panel,
+  panels,
+  calculations,
+}: {
+  panel: Panel;
+  panels: Panel[];
+  calculations: Map<string, PanelCalculation>;
+}) {
+  const feeders =
+    panel.type === 'TS'
+      ? [panel]
+      : panels.filter(
+          (child) => child.type === 'TS' && child.parentId === panel.id,
+        );
+  return (
+    <div className="space-y-3">
+      {feeders.map((feeder) => {
+        const calculation = calculations.get(feeder.id);
+        if (!calculation) return null;
+        const review = reviewFeeder(feeder, calculation);
+        const needsReview = review.issues.length > 0;
+        return (
+          <div
+            key={feeder.id}
+            role={needsReview ? 'alert' : 'note'}
+            aria-label={`Alimentador a ${feeder.name}`}
+            className={`mb-4 rounded-xl border p-3 text-xs print:break-inside-avoid ${
+              needsReview
+                ? 'border-red-400 bg-red-50 text-red-950'
+                : 'border-slate-300 bg-slate-50 text-slate-900'
+            }`}
+          >
+            <p className="font-bold">
+              {needsReview
+                ? 'Revisar alimentador'
+                : 'Chequeo preliminar del alimentador'}{' '}
+              · TP → {feeder.name}
+            </p>
+            <dl className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
+              <div>
+                <dt>
+                  Demanda Ib{feeder.supply === 'tri' ? ' · fase máxima' : ''}
+                </dt>
+                <dd className="font-mono font-bold">
+                  {formatNumber(review.current, 1)} A
+                </dd>
+              </div>
+              <div>
+                <dt>Térmica en TP · In</dt>
+                <dd className="font-mono font-bold">{review.breaker} A</dd>
+              </div>
+              <div>
+                <dt>Cable {review.section} mm² · Iz</dt>
+                <dd className="font-mono font-bold">
+                  {review.capacity === null
+                    ? 'Pendiente'
+                    : `${formatNumber(review.capacity, 1)} A`}
+                </dd>
+              </div>
+              <div>
+                <dt>Corte local · maniobra</dt>
+                <dd className="font-mono font-bold">
+                  {calculation.mainBreaker} A
+                </dd>
+              </div>
+            </dl>
+            {needsReview ? (
+              <ul className="mt-2 list-disc space-y-1 pl-4">
+                {review.issues.map((issue) => (
+                  <li key={issue}>{issue}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-2">
+                Cumple Ib ≤ In ≤ Iz con los datos declarados y el criterio de
+                caída del alimentador. No valida la instalación.
+              </p>
+            )}
+            <p className="mt-2">
+              El corte local no protege contra sobrecorrientes ni habilita esa
+              corriente de consumo. Iz depende del cable y su instalación.
+              Pendientes: coordinación, cortocircuito y revisión profesional.
+            </p>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -5809,7 +5936,10 @@ function PanelFront({
                             </span>
                           </div>
                           <p className="mt-1 text-[8px] font-bold uppercase tracking-[0.1em] opacity-75">
-                            Protección
+                            {slot.device.key === 'cabecera' &&
+                            panelType === 'TS'
+                              ? 'Maniobra'
+                              : 'Protección'}
                           </p>
                         </div>
                         <div className="flex items-end justify-between gap-2 pr-1">
@@ -5864,11 +5994,11 @@ function SingleLineDiagram({
         <DiagramNode
           kicker="Cabecera"
           title={`${panel.type === 'TP' ? 'IGA' : 'Corte local'} ${calculation.mainBreaker} A`}
-          detail={
-            panel.supply === 'tri'
-              ? '4P · calibre preliminar'
-              : '2P · calibre preliminar'
-          }
+          detail={`${panel.supply === 'tri' ? '4P' : '2P'} · ${
+            panel.type === 'TP'
+              ? 'calibre preliminar'
+              : 'maniobra, sin disparo por sobrecorriente'
+          }`}
         />
         <span className="text-xs">→ barras activas y N · PE independiente</span>
       </div>

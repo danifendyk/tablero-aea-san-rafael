@@ -170,7 +170,7 @@ export function buildPanelDevices(
       fullName:
         panel.type === 'TP'
           ? 'Interruptor General Automático'
-          : 'Interruptor de corte local',
+          : 'Interruptor-seccionador de corte local · sin disparo por sobrecorriente',
       detail: `${mainBreaker} A`,
       span,
       className: 'device-main',

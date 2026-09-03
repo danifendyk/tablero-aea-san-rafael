@@ -128,8 +128,11 @@ export type ProjectProfile = {
   siteTestReady: boolean;
   emergencyAutonomyHours?: number;
   emergencyEvidence?: string;
+  emergencySystem?: EmergencySystem;
   interiorCableStandard: InteriorCableStandard;
 };
+
+export type EmergencySystem = 'centralized' | 'autonomous';
 
 export type Circuit = {
   id: number;
@@ -258,6 +261,7 @@ const INITIAL_PROFILE: ProjectProfile = {
   descriptiveMemoryReady: false,
   registeredProfessionalReady: false,
   siteTestReady: false,
+  emergencySystem: 'centralized',
   interiorCableStandard: 'iram62267',
 };
 
@@ -759,6 +763,11 @@ function normalizeProfile(value: unknown): ProjectProfile {
       typeof raw.emergencyEvidence === 'string'
         ? raw.emergencyEvidence.slice(0, 1000)
         : '',
+    emergencySystem: ['centralized', 'autonomous'].includes(
+      String(raw.emergencySystem),
+    )
+      ? (raw.emergencySystem as EmergencySystem)
+      : INITIAL_PROFILE.emergencySystem ?? 'centralized',
     interiorCableStandard: ['iram62267', 'other'].includes(
       String(raw.interiorCableStandard),
     )
@@ -990,6 +999,11 @@ function diagnosePanel(activePanel: Panel, calculations: PanelCalculation, panel
           `C${circuitNumber}: supera el criterio conservador de 15 bocas.`,
         );
       }
+      if (circuit.kind === 'TUE' && circuit.points > 12) {
+        messages.push(
+          `C${circuitNumber}: supera el límite reglamentario de 12 bocas para TUE (AEA 771, Tabla 771.13.I).`,
+        );
+      }
       if (circuitCurrent(circuit, activePanel.supply) > circuit.breaker) {
         messages.push(
           `C${circuitNumber}: la corriente estimada supera la protección seleccionada.`,
@@ -1109,14 +1123,27 @@ function diagnoseProject(panels: Panel[], profile: ProjectProfile, isPublicVenue
         'La resistencia de puesta a tierra supera 10 Ω, máximo indicado por la Ordenanza 72/83.',
       );
     }
+    const isAutonomousEmergency = profile.emergencySystem === 'autonomous';
     if (
       isPublicVenue &&
+      !isAutonomousEmergency &&
       !panels.some((panel) =>
         panel.circuits.some((circuit) => circuit.kind === 'EMG'),
       )
     ) {
       messages.push(
-        'El proyecto de pública concurrencia no tiene ningún circuito de iluminación de emergencia.',
+        'El proyecto de pública concurrencia no tiene ningún circuito de iluminación de emergencia (o seleccione modalidad de equipos autónomos si corresponde).',
+      );
+    }
+    if (
+      isPublicVenue &&
+      isAutonomousEmergency &&
+      !panels.some((panel) =>
+        panel.circuits.some((circuit) => circuit.kind === 'IUG'),
+      )
+    ) {
+      messages.push(
+        'Emergencia autónoma: falta al menos un circuito de iluminación normal (IUG) para alimentar los cargadores de las luminarias autónomas.',
       );
     }
     if (isPublicVenue) {
@@ -1154,7 +1181,9 @@ function diagnoseProject(panels: Panel[], profile: ProjectProfile, isPublicVenue
     }
     if (isPublicVenue && !emergencyAutonomyDeclared(profile))
       messages.push(
-        'Emergencia: falta declarar autonomía ≥2 h y una referencia de ensayo/ficha. Un circuito EMG no demuestra autonomía ni iluminancia.',
+        isAutonomousEmergency
+          ? 'Emergencia autónoma: falta declarar autonomía ≥2 h y ficha técnica de los bloques autónomos (IRAM-AADL J 2027).'
+          : 'Emergencia: falta declarar autonomía ≥2 h y una referencia de ensayo/ficha. Un circuito EMG no demuestra autonomía ni iluminancia.',
       );
     return messages;
 }
@@ -3965,13 +3994,43 @@ export default function Home() {
           <section className="mt-5 rounded-2xl border border-amber-300 bg-amber-50 p-4 text-amber-950">
             <h2 className="font-semibold">Emergencia · autonomía declarada</h2>
             <p className="mt-1 text-xs">
-              Ord. 72/83, III.2.22: para los usos comprendidos, autonomía mínima
-              de 2 h. Confirmar el encuadre del salón; también faltan
-              verificación de iluminancia, encendido automático y pruebas en
-              obra.
+              Ord. 72/83, III.2.22 y AEA 718: para locales de pública concurrencia, autonomía mínima
+              de 2 h. Seleccionar la modalidad del sistema y declarar la referencia técnica.
             </p>
+            <div className="mt-3">
+              <label htmlFor="emergency-system" className="text-xs font-semibold">
+                Modalidad del sistema de emergencia
+                <NativeSelect
+                  id="emergency-system"
+                  value={profile.emergencySystem ?? 'centralized'}
+                  onChange={(e) =>
+                    updateProfile(
+                      'emergencySystem',
+                      e.target.value as EmergencySystem,
+                    )
+                  }
+                  className="mt-1 w-full bg-white text-slate-900"
+                >
+                  <NativeSelectOption value="centralized">
+                    Circuito centralizado de emergencia (circuito EMG dedicado en tablero)
+                  </NativeSelectOption>
+                  <NativeSelectOption value="autonomous">
+                    Equipos autónomos con batería (AEA 718.556.5.2.2 / IRAM-AADL J 2027)
+                  </NativeSelectOption>
+                </NativeSelect>
+              </label>
+              {profile.emergencySystem === 'autonomous' ? (
+                <p className="mt-1.5 text-[11px] text-amber-900">
+                  ℹ️ <strong>Equipos autónomos:</strong> Se alimentan directamente desde los circuitos de iluminación normal (IUG) del sector que protegen. No se exige circuito EMG exclusivo en el tablero ni Tablero Principal de Emergencia (AEA 718.556.5.2.2 y 718.556.6.1.9).
+                </p>
+              ) : (
+                <p className="mt-1.5 text-[11px] text-amber-900">
+                  ℹ️ <strong>Circuito centralizado:</strong> Requiere al menos un circuito tipo EMG en el tablero con protección diferencial independiente (AEA 718.556.2).
+                </p>
+              )}
+            </div>
             <div className="mt-3 grid gap-3 sm:grid-cols-[180px_1fr]">
-              <label htmlFor="emergency-hours" className="text-xs">
+              <label htmlFor="emergency-hours" className="text-xs font-medium">
                 Autonomía (horas)
                 <Input
                   id="emergency-hours"
@@ -3988,13 +4047,17 @@ export default function Home() {
                   }
                 />
               </label>
-              <label htmlFor="emergency-evidence" className="text-xs">
-                Referencia de ensayo o ficha
+              <label htmlFor="emergency-evidence" className="text-xs font-medium">
+                Referencia de ensayo o ficha técnica
                 <Input
                   id="emergency-evidence"
                   maxLength={1000}
                   value={profile.emergencyEvidence ?? ''}
-                  placeholder="Modelo, documento, fecha de ensayo…"
+                  placeholder={
+                    profile.emergencySystem === 'autonomous'
+                      ? 'Modelo de bloque autónomo, norma IRAM-AADL J 2027, fabricante…'
+                      : 'Modelo, documento, fecha de ensayo…'
+                  }
                   onChange={(e) =>
                     updateProfile('emergencyEvidence', e.target.value)
                   }
@@ -4919,11 +4982,19 @@ function ProjectPrintSummary({
                 Mínimos de conductores: AEA 90364-7-771, Corrigendum 2 ({AEA_CONDUCTOR_REFERENCE_URL}).
               </p>
               {publicVenue && (
-                <p className="mt-1">
-                  Cables interiores: {profile.interiorCableStandard === 'iram62267'
-                    ? 'LSOH IRAM 62267 declarado; verificar marcación y certificación.'
-                    : 'especificación LSOH IRAM 62267 pendiente o no declarada.'}
-                </p>
+                <>
+                  <p className="mt-1">
+                    Cables interiores: {profile.interiorCableStandard === 'iram62267'
+                      ? 'LSOH IRAM 62267 declarado; verificar marcación y certificación.'
+                      : 'especificación LSOH IRAM 62267 pendiente o no declarada.'}
+                  </p>
+                  <p className="mt-1">
+                    Iluminación de emergencia:{' '}
+                    {profile.emergencySystem === 'autonomous'
+                      ? 'equipos autónomos con batería incorporada (AEA 718.556.5.2.2 / IRAM-AADL J 2027) alimentados desde circuitos IUG.'
+                      : 'circuito centralizado EMG en tablero con protección diferencial exclusiva (AEA 718.556.2).'}
+                  </p>
+                </>
               )}
             </section>
 

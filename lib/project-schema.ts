@@ -141,6 +141,12 @@ function profile(value: unknown) {
   field(raw, 'emergencyEvidence', path, text);
   field(
     raw,
+    'emergencySystem',
+    path,
+    oneOf(['centralized', 'autonomous']),
+  );
+  field(
+    raw,
     'interiorCableStandard',
     path,
     oneOf(['iram62267', 'other', 'pending']),

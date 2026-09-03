@@ -746,3 +746,51 @@ test('integración: página completa se renderiza sin navegador ni excepciones',
   assert.ok(result.includes('Esencial domiciliaria'));
   assert.ok(!result.includes('Legado · ID por circuito'));
 });
+
+test('integración: emergencia autónoma no exige EMG pero requiere IUG para cargadores', () => {
+  const panelWithIug = makePanel({
+    circuits: [makeCircuit(1, { kind: 'IUG' }), makeCircuit(2, { kind: 'TUG' })],
+  });
+  const panelWithoutIug = makePanel({
+    circuits: [makeCircuit(1, { kind: 'TUG' })],
+  });
+  const profileCentralized = {
+    preset: 'hall',
+    emergencySystem: 'centralized',
+    emergencyAutonomyHours: 2,
+    emergencyEvidence: 'Central',
+  };
+  const profileAutonomous = {
+    preset: 'hall',
+    emergencySystem: 'autonomous',
+    emergencyAutonomyHours: 2,
+    emergencyEvidence: 'Atomlux 2040 LED 2h',
+  };
+
+  // Centralizado sin EMG -> emite advertencia
+  const diagCentralized = app.diagnoseProject([panelWithIug], profileCentralized, true);
+  assert.ok(diagCentralized.some((w) => w.includes('no tiene ningún circuito de iluminación de emergencia')));
+
+  // Autónomo con IUG -> NO emite advertencia de falta de EMG ni de falta de IUG
+  const diagAutonomous = app.diagnoseProject([panelWithIug], profileAutonomous, true);
+  assert.ok(!diagAutonomous.some((w) => w.includes('no tiene ningún circuito de iluminación de emergencia')));
+  assert.ok(!diagAutonomous.some((w) => w.includes('falta al menos un circuito de iluminación normal (IUG)')));
+
+  // Autónomo sin IUG -> advierte que falta IUG para los cargadores
+  const diagAutonomousNoIug = app.diagnoseProject([panelWithoutIug], profileAutonomous, true);
+  assert.ok(diagAutonomousNoIug.some((w) => w.includes('falta al menos un circuito de iluminación normal (IUG)')));
+});
+
+test('integración: diagnosePanel alerta si circuito TUE supera 12 bocas (AEA 771)', () => {
+  const panelWithTue = makePanel({
+    circuits: [makeCircuit(1, { kind: 'TUE', points: 14 })],
+  });
+  const calculations = calculatePanels([panelWithTue]);
+  const messages = app.diagnosePanel(
+    panelWithTue,
+    calculations.get(panelWithTue.id),
+    [panelWithTue],
+    calculations,
+  );
+  assert.ok(messages.some((m) => m.includes('supera el límite reglamentario de 12 bocas para TUE')));
+});

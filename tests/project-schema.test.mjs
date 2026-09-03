@@ -223,3 +223,14 @@ test('esquema: v2 solo entra por migración explícita y nunca sustituye circuit
     false,
   );
 });
+
+test('esquema: emergencySystem valida autonomous y centralized y rechaza valores inválidos', () => {
+  for (const sys of ['autonomous', 'centralized', undefined]) {
+    const data = makeProject();
+    data.profile = { emergencySystem: sys };
+    assert.equal(validateProjectStructure(data).ok, true);
+  }
+  const broken = makeProject();
+  broken.profile = { emergencySystem: 'solar' };
+  assert.equal(validateProjectStructure(broken).ok, false);
+});

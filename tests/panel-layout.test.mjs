@@ -4,6 +4,7 @@ import {
   circuitModuleSpan,
   differentialGroups,
   differentialLabel,
+  tpDifferentialDevice,
   buildPanelDevices,
   layoutDin,
   protectiveConductorSection,
@@ -170,6 +171,33 @@ test('sin circuitos propios no agrega ID; con alguna salida conserva los grupos 
     differentialGroups({ ...p, circuits: [circuit(1, 'EMG')] }).length,
     3,
   );
+});
+
+test('TP: el diferencial general es optativo y se modela separado de los ID terminales', () => {
+  const transit = { ...panel(), circuits: [], tpDifferentialMode: 'none' };
+  assert.equal(tpDifferentialDevice(transit), null);
+  assert.equal(
+    buildPanelDevices(transit, [], 40).some((device) =>
+      device.key.startsWith('id-'),
+    ),
+    false,
+  );
+
+  const selective = {
+    ...transit,
+    tpDifferentialMode: 'selective300',
+  };
+  assert.match(tpDifferentialDevice(selective).detail, /300 mA · tipo S/);
+  assert.equal(
+    buildPanelDevices(selective, [], 40).filter((device) =>
+      device.key.startsWith('id-'),
+    ).length,
+    1,
+  );
+
+  const instant = { ...transit, tpDifferentialMode: 'instant30' };
+  assert.match(tpDifferentialDevice(instant).detail, /30 mA · no selectivo/);
+  assert.equal(differentialGroups(instant).length, 0);
 });
 
 test('arquitecturas 2/3/1: luces y tomas juntas, separadas por uso, o ID único', () => {

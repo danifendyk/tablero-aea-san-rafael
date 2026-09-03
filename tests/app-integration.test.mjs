@@ -684,6 +684,57 @@ test('2/3/1 equipos, presupuesto y reservas; TP de tránsito no duplica ID de lo
   assert.ok(unifilar.includes('ID EMG · 30 mA · reservado'));
 });
 
+test('iglesia base: TP de tránsito, TS1 interior, Clase II y cables LSOH', () => {
+  assert.equal(app.INITIAL_PROFILE.occupancy, 120);
+  assert.equal(app.INITIAL_PROFILE.interiorCableStandard, 'iram62267');
+  assert.equal(app.INITIAL_PANELS.length, 2);
+  const tp = app.INITIAL_PANELS.find((panel) => panel.type === 'TP');
+  const ts = app.INITIAL_PANELS.find((panel) => panel.type === 'TS');
+  assert.deepEqual(tp.circuits, []);
+  assert.equal(tp.tpDifferentialMode, 'none');
+  assert.ok(ts.circuits.length > 0);
+  assert.match(ts.feederWiring, /^classII-/);
+});
+
+test('diagnóstico: 30 mA general advierte corte total; Clase II permite omitirlo', () => {
+  const tp = makePanel({
+    circuits: [],
+    tpDifferentialMode: 'instant30',
+  });
+  const child = makePanel({
+    id: 'ts',
+    type: 'TS',
+    parentId: 'tp',
+    feederWiring: 'classII-underground',
+  });
+  const profile = {
+    ...app.INITIAL_PROFILE,
+    interiorCableStandard: 'iram62267',
+    emergencyAutonomyHours: 2,
+    emergencyEvidence: 'Ficha declarada',
+  };
+  assert.ok(
+    app
+      .diagnoseProject([tp, child], profile, true)
+      .some((warning) => warning.includes('Riesgo de corte total')),
+  );
+  const withoutRcd = { ...tp, tpDifferentialMode: 'none' };
+  assert.ok(
+    !app
+      .diagnoseProject([withoutRcd, child], profile, true)
+      .some((warning) => warning.includes('condición Clase II documentada')),
+  );
+  assert.ok(
+    app
+      .diagnoseProject(
+        [withoutRcd, { ...child, feederWiring: 'pending' }],
+        { ...profile, interiorCableStandard: 'pending' },
+        true,
+      )
+      .some((warning) => warning.includes('IRAM 62267')),
+  );
+});
+
 test('integración: página completa se renderiza sin navegador ni excepciones', () => {
   const result = html(pageModule.exports.default, {});
   assert.ok(result.includes('Memoria de cálculo'));

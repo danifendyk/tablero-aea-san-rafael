@@ -143,6 +143,7 @@ body {
 .device-main,
 .device-spd,
 .device-rcd,
+.device-rcd-selective,
 .device-circuit,
 .device-emergency {
   box-shadow:
@@ -159,6 +160,10 @@ body {
 }
 .device-rcd {
   background: linear-gradient(145deg, #38bdf8, #0369a1);
+  color: white;
+}
+.device-rcd-selective {
+  background: linear-gradient(145deg, #2dd4bf, #0f766e);
   color: white;
 }
 .device-circuit {

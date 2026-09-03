@@ -4,6 +4,13 @@ Herramienta de predimensionado de tableros eléctricos para proyectos en San Raf
 
 Incluye definición rápida por tipo de proyecto, memoria de cálculo con fórmulas y reemplazo de valores, circuitos editables, caída de tensión, cortocircuito y poder de corte, puesta a tierra, balance de fases, vista frontal DIN, esquemas unifilar y multifilar, control del expediente, comparación de arquitecturas, optimización y costos de referencia.
 
+El preajuste de salón/iglesia separa el TP del pilar y el TS1 interior. El
+diferencial general del TP se decide explícitamente (`sin ID`, `300 mA selectivo
+Tipo S` o `30 mA instantáneo`), mientras los diferenciales terminales de 30 mA
+se sectorizan en el TS1. También se declara la condición Clase II de cada línea
+seccional y la especificación LSOH IRAM 62267 de los cables interiores en pública
+concurrencia.
+
 ## Marco normativo
 
 - Ordenanza General 72/83 de Mendoza, utilizada por el Código de Edificación de San Rafael: documentación, cuadro de cargas, esquema multifilar, puesta a tierra, inspecciones y firma profesional.

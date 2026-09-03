@@ -69,6 +69,7 @@ import {
   circuitModuleSpan,
   differentialGroups,
   differentialLabel,
+  tpDifferentialDevice,
   layoutDin,
   protectiveConductorSection,
   PHASE_CONDUCTOR_COLORS,
@@ -103,6 +104,13 @@ export type WorkType = 'new' | 'remodel' | 'survey';
 export type EvacuationClass = 'BD1' | 'BD2' | 'BD3' | 'BD4';
 export type PanelType = 'TP' | 'TS';
 export type DifferentialType = 'AC' | 'A';
+export type TpDifferentialMode = 'none' | 'selective300' | 'instant30';
+export type FeederWiring =
+  | 'classII-underground'
+  | 'classII-conduit'
+  | 'other'
+  | 'pending';
+export type InteriorCableStandard = 'iram62267' | 'other' | 'pending';
 
 export type ProjectProfile = {
   preset: ProjectPreset;
@@ -120,6 +128,7 @@ export type ProjectProfile = {
   siteTestReady: boolean;
   emergencyAutonomyHours?: number;
   emergencyEvidence?: string;
+  interiorCableStandard: InteriorCableStandard;
 };
 
 export type Circuit = {
@@ -155,6 +164,7 @@ export type Panel = {
   architecture: Architecture;
   includeDps?: boolean;
   differentialType?: DifferentialType;
+  tpDifferentialMode?: TpDifferentialMode;
   circuits: Circuit[];
   feederLengthM?: number;
   feederConductor?: number;
@@ -162,6 +172,7 @@ export type Panel = {
   feederPhase?: Phase;
   feederAmpacity?: AmpacitySettings;
   feederConduit?: string;
+  feederWiring?: FeederWiring;
 };
 
 export type PanelCalculation = {
@@ -202,6 +213,8 @@ export type PriceCatalog = {
   typeAPremium: number;
   accessoriesPercent: number;
   assemblyPercent: number;
+  selectiveRcd2P: number;
+  selectiveRcd4P: number;
 };
 
 export type CostLine = { label: string; value: number };
@@ -236,7 +249,7 @@ const INITIAL_PROFILE: ProjectProfile = {
   workType: 'new',
   widthM: 24,
   lengthM: 10,
-  occupancy: 180,
+  occupancy: 120,
   evacuation: 'BD3',
   prospectiveShortCircuitKa: 3,
   breakingCapacityKa: 6,
@@ -245,6 +258,7 @@ const INITIAL_PROFILE: ProjectProfile = {
   descriptiveMemoryReady: false,
   registeredProfessionalReady: false,
   siteTestReady: false,
+  interiorCableStandard: 'iram62267',
 };
 
 const DEFAULT_PRICES: PriceCatalog = {
@@ -263,6 +277,8 @@ const DEFAULT_PRICES: PriceCatalog = {
   typeAPremium: 35,
   accessoriesPercent: 12,
   assemblyPercent: 20,
+  selectiveRcd2P: 0,
+  selectiveRcd4P: 0,
 };
 
 const PRICE_SOURCES = [
@@ -439,6 +455,27 @@ const INITIAL_PANELS: Panel[] = [
     architecture: 'balanced',
     includeDps: true,
     differentialType: 'A',
+    tpDifferentialMode: 'none',
+    circuits: [],
+  },
+  {
+    id: 'ts1',
+    name: 'TS1 · Tablero interior de la iglesia',
+    type: 'TS',
+    parentId: 'tp',
+    supply: 'tri',
+    demandFactor: 0.8,
+    reservePercent: 25,
+    modulesPerRow: 18,
+    architecture: 'balanced',
+    includeDps: false,
+    differentialType: 'A',
+    feederLengthM: 15,
+    feederConductor: 6,
+    feederBreaker: 32,
+    feederPhase: '3Φ',
+    feederWiring: 'classII-underground',
+    feederConduit: 'Cable IRAM 2178 en tendido subterráneo; verificar instalación y envolventes Clase II.',
     circuits: INITIAL_CIRCUITS_TP,
   },
 ];
@@ -636,6 +673,34 @@ function panelDifferentialType(panel: Panel): DifferentialType {
   return panel.differentialType === 'AC' ? 'AC' : 'A';
 }
 
+function panelTpDifferentialMode(panel: Panel): TpDifferentialMode {
+  return panel.type === 'TP' &&
+    ['selective300', 'instant30'].includes(String(panel.tpDifferentialMode))
+    ? (panel.tpDifferentialMode as TpDifferentialMode)
+    : 'none';
+}
+
+function isClassIIFeeder(panel: Panel) {
+  return (
+    panel.feederWiring === 'classII-underground' ||
+    panel.feederWiring === 'classII-conduit'
+  );
+}
+
+function feederWiringLabel(panel: Panel) {
+  if (panel.feederWiring === 'classII-underground')
+    return 'Clase II · cable IRAM 2178 subterráneo';
+  if (panel.feederWiring === 'classII-conduit')
+    return 'Clase II · cañería y envolventes aislantes';
+  if (panel.feederWiring === 'other') return 'Sin condición Clase II declarada';
+  return 'Condición de aislación pendiente';
+}
+
+function panelDifferentialCount(panel: Panel) {
+  return differentialGroups(panel).length +
+    (tpDifferentialDevice(panel) ? 1 : 0);
+}
+
 function normalizePrices(value: unknown): PriceCatalog {
   const raw = isRecord(value) ? value : {};
   return Object.fromEntries(
@@ -694,6 +759,11 @@ function normalizeProfile(value: unknown): ProjectProfile {
       typeof raw.emergencyEvidence === 'string'
         ? raw.emergencyEvidence.slice(0, 1000)
         : '',
+    interiorCableStandard: ['iram62267', 'other'].includes(
+      String(raw.interiorCableStandard),
+    )
+      ? (raw.interiorCableStandard as InteriorCableStandard)
+      : 'pending',
   };
 }
 
@@ -828,6 +898,11 @@ function normalizePanels(value: unknown): Panel[] | null {
       includeDps:
         typeof raw.includeDps === 'boolean' ? raw.includeDps : type === 'TP',
       differentialType: raw.differentialType === 'AC' ? 'AC' : 'A',
+      tpDifferentialMode:
+        type === 'TP' &&
+        ['selective300', 'instant30'].includes(String(raw.tpDifferentialMode))
+          ? (raw.tpDifferentialMode as TpDifferentialMode)
+          : 'none',
       circuits,
       feederLengthM:
         type === 'TS' ? finiteNumber(raw.feederLengthM, 15, 1) : undefined,
@@ -848,6 +923,18 @@ function normalizePanels(value: unknown): Panel[] | null {
         typeof raw.feederConduit === 'string'
           ? raw.feederConduit.slice(0, 300)
           : '',
+      feederWiring:
+        type === 'TS' &&
+        [
+          'classII-underground',
+          'classII-conduit',
+          'other',
+          'pending',
+        ].includes(String(raw.feederWiring))
+          ? (raw.feederWiring as FeederWiring)
+          : type === 'TS'
+            ? 'pending'
+            : undefined,
     } satisfies Panel;
   });
 
@@ -1006,6 +1093,12 @@ function diagnosePanel(activePanel: Panel, calculations: PanelCalculation, panel
 
 function diagnoseProject(panels: Panel[], profile: ProjectProfile, isPublicVenue: boolean) {
   const messages: string[] = [];
+    const tp = panels.find((panel) => panel.type === 'TP');
+    const sectionalPanels = tp
+      ? panels.filter(
+          (panel) => panel.type === 'TS' && panel.parentId === tp.id,
+        )
+      : [];
     if (profile.breakingCapacityKa < profile.prospectiveShortCircuitKa) {
       messages.push(
         'El poder de corte declarado es menor que la corriente de cortocircuito presunta.',
@@ -1027,6 +1120,14 @@ function diagnoseProject(panels: Panel[], profile: ProjectProfile, isPublicVenue
       );
     }
     if (isPublicVenue) {
+      if (profile.interiorCableStandard !== 'iram62267')
+        messages.push(
+          'Pública concurrencia: falta declarar cables interiores LSOH de baja emisión de humos y libres de halógenos (IRAM 62267) o justificar otra especificación con el profesional y la inspección.',
+        );
+      if (tp?.circuits.length)
+        messages.push(
+          'El TP del pilar conserva circuitos terminales. Para continuidad de servicio, revisar su traslado a un tablero interior con diferenciales sectorizados.',
+        );
       for (const panel of panels.filter(
         (item) => item.architecture === 'residential' && item.circuits.length,
       )) {
@@ -1034,6 +1135,22 @@ function diagnoseProject(panels: Panel[], profile: ProjectProfile, isPublicVenue
           `${panel.name}: arquitectura domiciliaria de ID único en pública concurrencia. No separa iluminación/tomas ni emergencia; revisar AEA 718 y Ordenanza 72/83. No se considera una solución validada para este salón.`,
         );
       }
+    }
+    if (tp && sectionalPanels.length) {
+      const tpMode = panelTpDifferentialMode(tp);
+      const allFeedersClassII = sectionalPanels.every(isClassIIFeeder);
+      if (tpMode === 'instant30')
+        messages.push(
+          'Riesgo de corte total: un diferencial instantáneo de 30 mA en el TP queda aguas arriba de los diferenciales interiores y puede apagar toda la instalación. Revisar selectividad y exigencias de la autoridad.',
+        );
+      if (tpMode === 'none' && !allFeedersClassII)
+        messages.push(
+          'TP sin diferencial general: al menos una línea seccional no tiene condición Clase II documentada. Confirmar protección contra contactos indirectos y criterio de la autoridad.',
+        );
+      if (tpMode === 'selective300')
+        messages.push(
+          'TP con diferencial selectivo de 300 mA: documentar curvas, tiempos y coordinación con los diferenciales de 30 mA aguas abajo; la etiqueta Tipo S no demuestra selectividad por sí sola.',
+        );
     }
     if (isPublicVenue && !emergencyAutonomyDeclared(profile))
       messages.push(
@@ -1046,9 +1163,9 @@ export default function Home() {
   const [experienceMode, setExperienceMode] =
     useState<ExperienceMode>('guided');
   const [profile, setProfile] = useState<ProjectProfile>(INITIAL_PROFILE);
-  const [projectName, setProjectName] = useState('SALÓN · 24 × 10 m');
+  const [projectName, setProjectName] = useState('IGLESIA · SALÓN 24 × 10 m');
   const [panels, setPanels] = useState<Panel[]>(INITIAL_PANELS);
-  const [activePanelId, setActivePanelId] = useState<string>('tp');
+  const [activePanelId, setActivePanelId] = useState<string>('ts1');
   const [prices, setPrices] = useState<PriceCatalog>(DEFAULT_PRICES);
   const [optimizationMessage, setOptimizationMessage] = useState('');
   const [persistenceReady, setPersistenceReady] = useState(false);
@@ -1268,6 +1385,7 @@ export default function Home() {
       feederConductor: 6,
       feederBreaker: 32,
       feederPhase: tpPanel.supply === 'tri' ? '3Φ' : 'L1',
+      feederWiring: 'pending',
       circuits: [
         {
           id: 1,
@@ -1579,6 +1697,7 @@ export default function Home() {
           panel.reservePercent,
         );
         const cabinet = cabinetFor(layout.cabinetModules, prices);
+        const tpDifferential = tpDifferentialDevice(panel);
         const lines: CostLine[] = [
           { label: `Gabinete DIN (${cabinet.label})`, value: cabinet.value },
           {
@@ -1603,6 +1722,20 @@ export default function Home() {
             ),
           },
         ];
+        if (tpDifferential)
+          lines.splice(2, 0, {
+            label:
+              panelTpDifferentialMode(panel) === 'selective300'
+                ? 'Diferencial general TP 300 mA · Tipo S'
+                : 'Diferencial general TP 30 mA · instantáneo',
+            value:
+              panelTpDifferentialMode(panel) === 'selective300'
+                ? panel.supply === 'tri'
+                  ? prices.selectiveRcd4P
+                  : prices.selectiveRcd2P
+                : (panel.supply === 'tri' ? prices.rcd4P : prices.rcd2P) *
+                  typeFactor,
+          });
         if (panelHasDps(panel))
           lines.splice(2, 0, {
             label: `DPS ${panel.supply === 'tri' ? '3P+N' : '1P+N'} transitorias`,
@@ -1692,6 +1825,15 @@ export default function Home() {
         (sum, group) => sum + (group.span === 4 ? rcd4P : rcd2P),
         0,
       );
+      const tpDifferentialCost = tpDifferentialDevice(panel)
+        ? panelTpDifferentialMode(panel) === 'selective300'
+          ? panel.supply === 'tri'
+            ? prices.selectiveRcd4P
+            : prices.selectiveRcd2P
+          : panel.supply === 'tri'
+            ? rcd4P
+            : rcd2P
+        : 0;
       const terminalBreakers = panel.circuits.reduce(
         (total, circuit) =>
           total + (circuit.phase === '3Φ' ? prices.mcb4P : prices.mcb2P),
@@ -1706,6 +1848,7 @@ export default function Home() {
         cabinet.value +
         head +
         (panelHasDps(panel) ? spd : 0) +
+        tpDifferentialCost +
         differentialCost +
         terminalBreakers +
         feederBreakers;
@@ -1732,6 +1875,15 @@ export default function Home() {
     return [
       ...(isPublicVenue
         ? [
+            {
+              group: 'AEA 90364-7-718 · pública concurrencia',
+              label: 'Cables interiores LSOH · IRAM 62267',
+              ready: profile.interiorCableStandard === 'iram62267',
+              action:
+                profile.interiorCableStandard === 'iram62267'
+                  ? 'Especificación declarada; verificar marcación, certificación y alcance en obra.'
+                  : 'Falta declarar la especificación LSOH o justificar otra solución con el profesional y la inspección.',
+            },
             {
               group: 'Ordenanza 72/83 · III.2.22',
               label: 'Autonomía de emergencia ≥2 h declarada',
@@ -1803,16 +1955,19 @@ export default function Home() {
       return;
     }
     const nextCircuits = projectCircuits(preset);
+    const existingInterior = panels.find((panel) => panel.type === 'TS');
+    const interiorId = existingInterior?.id ?? createPanelId('ts');
     const config = {
       hall: {
-        name: 'SALÓN · 24 × 10 m',
+        name: 'IGLESIA · SALÓN 24 × 10 m',
         widthM: 24,
         lengthM: 10,
-        occupancy: 180,
+        occupancy: 120,
         evacuation: 'BD3' as EvacuationClass,
         supply: 'tri' as Supply,
         architecture: 'balanced' as Architecture,
         differentialType: 'A' as DifferentialType,
+        interiorCableStandard: 'iram62267' as InteriorCableStandard,
       },
       commercial: {
         name: 'LOCAL COMERCIAL · 12 × 8 m',
@@ -1823,6 +1978,7 @@ export default function Home() {
         supply: 'tri' as Supply,
         architecture: 'balanced' as Architecture,
         differentialType: 'A' as DifferentialType,
+        interiorCableStandard: 'iram62267' as InteriorCableStandard,
       },
       residential: {
         name: 'VIVIENDA UNIFAMILIAR',
@@ -1833,6 +1989,7 @@ export default function Home() {
         supply: 'mono' as Supply,
         architecture: 'residential' as Architecture,
         differentialType: 'AC' as DifferentialType,
+        interiorCableStandard: 'other' as InteriorCableStandard,
       },
     }[preset];
 
@@ -1843,10 +2000,11 @@ export default function Home() {
       lengthM: config.lengthM,
       occupancy: config.occupancy,
       evacuation: config.evacuation,
+      interiorCableStandard: config.interiorCableStandard,
     }));
     setProjectName(config.name);
-    setPanels((current) =>
-      current.map((panel) => {
+    setPanels((current) => {
+      const next = current.map((panel) => {
         if (panel.type === 'TP') {
           return {
             ...panel,
@@ -1854,17 +2012,38 @@ export default function Home() {
             architecture: config.architecture,
             includeDps: true,
             differentialType: config.differentialType,
+            tpDifferentialMode: 'none' as TpDifferentialMode,
+            circuits: [],
+          };
+        }
+        if (panel.id === interiorId) {
+          return {
+            ...panel,
+            name:
+              preset === 'hall'
+                ? 'TS1 · Tablero interior de la iglesia'
+                : panel.name,
+            parentId: tpPanel.id,
+            supply: config.supply,
+            architecture: config.architecture,
+            differentialType: config.differentialType,
+            feederPhase: config.supply === 'tri' ? ('3Φ' as Phase) : ('L1' as Phase),
+            feederWiring: 'classII-conduit' as FeederWiring,
             circuits: nextCircuits.map((circuit) => ({
               ...circuit,
               phase: config.supply === 'mono' ? ('L1' as Phase) : circuit.phase,
+              modules:
+                config.supply === 'mono'
+                  ? Math.min(circuit.modules, 2)
+                  : circuit.modules,
             })),
           };
         }
         if (config.supply === 'mono') {
           return {
             ...panel,
-            supply: 'mono',
-            feederPhase: 'L1',
+            supply: 'mono' as Supply,
+            feederPhase: 'L1' as Phase,
             circuits: panel.circuits.map((circuit) => ({
               ...circuit,
               phase: 'L1' as Phase,
@@ -1881,11 +2060,42 @@ export default function Home() {
           };
         }
         return panel;
-      }),
-    );
-    setActivePanelId(tpPanel.id);
+      });
+      if (!existingInterior)
+        next.push({
+          id: interiorId,
+          name:
+            preset === 'hall'
+              ? 'TS1 · Tablero interior de la iglesia'
+              : 'TS1 · Tablero interior',
+          type: 'TS',
+          parentId: tpPanel.id,
+          supply: config.supply,
+          demandFactor: 0.85,
+          reservePercent: 25,
+          modulesPerRow: 18,
+          architecture: config.architecture,
+          includeDps: false,
+          differentialType: config.differentialType,
+          feederLengthM: 15,
+          feederConductor: 6,
+          feederBreaker: 32,
+          feederPhase: config.supply === 'tri' ? '3Φ' : 'L1',
+          feederWiring: 'classII-conduit',
+          circuits: nextCircuits.map((circuit) => ({
+            ...circuit,
+            phase: config.supply === 'mono' ? ('L1' as Phase) : circuit.phase,
+            modules:
+              config.supply === 'mono'
+                ? Math.min(circuit.modules, 2)
+                : circuit.modules,
+          })),
+        });
+      return next;
+    });
+    setActivePanelId(interiorId);
     setOptimizationMessage(
-      'Preajuste aplicado al proyecto y al Tablero Principal.',
+      'Preajuste aplicado: TP de tránsito y circuitos terminales en el tablero interior.',
     );
   }
 
@@ -1983,7 +2193,7 @@ export default function Home() {
 
   function resetProject() {
     if (!window.confirm('¿Restablecer el proyecto? Se reemplazarán todos los tableros, circuitos y precios. Exportá un JSON antes si querés conservarlos.')) return;
-    applyProject({ panels: INITIAL_PANELS, profile: INITIAL_PROFILE, prices: DEFAULT_PRICES, projectName: 'SALÓN · 24 × 10 m', experienceMode, activePanelId: 'tp' });
+    applyProject({ panels: INITIAL_PANELS, profile: INITIAL_PROFILE, prices: DEFAULT_PRICES, projectName: 'IGLESIA · SALÓN 24 × 10 m', experienceMode, activePanelId: 'ts1' });
     setOptimizationMessage('Proyecto restablecido.');
   }
 
@@ -2054,6 +2264,7 @@ export default function Home() {
         'FP declarado',
         'P instalada [W]',
         'Cañería declarada',
+        'Especificación de cable / aislación',
       ],
     ];
     const rounded = (value: number) => Number(value.toFixed(2));
@@ -2085,6 +2296,7 @@ export default function Home() {
               '',
               rounded(childCalculation?.activeInstalledW ?? 0),
               child.feederConduit ?? '',
+              feederWiringLabel(child),
             ]);
           });
       }
@@ -2117,6 +2329,11 @@ export default function Home() {
           c.powerFactor,
           rounded(activePower(c)),
           c.conduit ?? '',
+          profile.interiorCableStandard === 'iram62267'
+            ? 'LSOH · IRAM 62267'
+            : profile.interiorCableStandard === 'other'
+              ? 'Otra especificación declarada'
+              : 'Pendiente',
         ]);
       });
     });
@@ -2583,6 +2800,51 @@ export default function Home() {
               </div>
             </div>
 
+            {isPublicVenue && (
+              <div className="mt-4 grid gap-3 rounded-xl border border-emerald-200 bg-emerald-50/70 p-3.5 text-emerald-950 sm:grid-cols-[minmax(0,1fr)_minmax(240px,.45fr)] sm:items-end">
+                <div className="flex items-start gap-3">
+                  <ShieldCheck className="mt-0.5 size-5 shrink-0 text-emerald-700" />
+                  <div>
+                    <p className="text-sm font-bold">
+                      Cables interiores en pública concurrencia
+                    </p>
+                    <p className="mt-1 text-sm leading-relaxed text-emerald-900/80">
+                      Para el salón se adopta cable LSOH, no propagador del
+                      incendio, libre de halógenos y de baja emisión de humos.
+                      Verificá marcación IRAM 62267 y la exigencia concreta del
+                      expediente.
+                    </p>
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="interior-cable-standard" className="text-sm">
+                    Especificación declarada
+                  </Label>
+                  <NativeSelect
+                    id="interior-cable-standard"
+                    className="w-full bg-white"
+                    value={profile.interiorCableStandard}
+                    onChange={(event) =>
+                      updateProfile(
+                        'interiorCableStandard',
+                        event.target.value as InteriorCableStandard,
+                      )
+                    }
+                  >
+                    <NativeSelectOption value="iram62267">
+                      LSOH · IRAM 62267
+                    </NativeSelectOption>
+                    <NativeSelectOption value="pending">
+                      Pendiente de definir
+                    </NativeSelectOption>
+                    <NativeSelectOption value="other">
+                      Otra especificación
+                    </NativeSelectOption>
+                  </NativeSelect>
+                </div>
+              </div>
+            )}
+
             {/* Feeder configuration if Seccional */}
             {activePanel.type === 'TS' && (
               <div className="mt-4 rounded-xl border border-sky-200 bg-sky-50/70 p-3.5 text-sky-950">
@@ -2712,6 +2974,39 @@ export default function Home() {
               settings={activePanel.feederAmpacity}
               onChange={(value) => updateActivePanel('feederAmpacity', value)}
             />
+            <div className="mt-3 space-y-1.5">
+              <Label htmlFor="feeder-wiring" className="text-sm">
+                Condición de aislación de la línea TP → {activePanel.name}
+              </Label>
+              <NativeSelect
+                id="feeder-wiring"
+                className="w-full"
+                value={activePanel.feederWiring ?? 'pending'}
+                onChange={(event) =>
+                  updateActivePanel(
+                    'feederWiring',
+                    event.target.value as FeederWiring,
+                  )
+                }
+              >
+                <NativeSelectOption value="classII-underground">
+                  Clase II · cable IRAM 2178 subterráneo
+                </NativeSelectOption>
+                <NativeSelectOption value="classII-conduit">
+                  Clase II · cañería plástica + envolventes aislantes
+                </NativeSelectOption>
+                <NativeSelectOption value="other">
+                  No cumple condición Clase II declarada
+                </NativeSelectOption>
+                <NativeSelectOption value="pending">
+                  Pendiente de verificar
+                </NativeSelectOption>
+              </NativeSelect>
+              <p className="text-xs text-muted-foreground">
+                Esta declaración gobierna la recomendación del diferencial en el
+                TP; no reemplaza la inspección de todo el recorrido.
+              </p>
+            </div>
             <label htmlFor="feeder-conduit" className="mt-3 block text-xs">
               Cañería del alimentador: material, diámetro y referencia
               <Input
@@ -2892,6 +3187,87 @@ export default function Home() {
           </div>
         )}
 
+        {activePanel.type === 'TP' && (
+          <section className="mb-5 overflow-hidden rounded-2xl border border-sky-200 bg-card shadow-sm">
+            <div className="grid gap-4 bg-sky-950 p-4 text-white lg:grid-cols-[minmax(0,1fr)_minmax(280px,.5fr)] lg:items-end">
+              <div className="flex items-start gap-3">
+                <div className="grid size-10 shrink-0 place-items-center rounded-xl bg-sky-400/15 text-sky-300">
+                  <ShieldCheck className="size-5" />
+                </div>
+                <div>
+                  <p className="text-sm font-bold">
+                    Protección diferencial general del TP
+                  </p>
+                  <p className="mt-1 max-w-3xl text-sm leading-relaxed text-sky-100/80">
+                    La termomagnética omnipolar de cabecera se mantiene siempre.
+                    El diferencial del pilar se configura aparte de los 30 mA de
+                    los circuitos interiores para no confundir protección con
+                    selectividad.
+                  </p>
+                </div>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="tp-differential-mode" className="text-sm text-sky-100">
+                  Decisión de proyecto
+                </Label>
+                <NativeSelect
+                  id="tp-differential-mode"
+                  className="w-full border-sky-700 bg-sky-900 text-white"
+                  value={panelTpDifferentialMode(activePanel)}
+                  onChange={(event) =>
+                    updateActivePanel(
+                      'tpDifferentialMode',
+                      event.target.value as TpDifferentialMode,
+                    )
+                  }
+                >
+                  <NativeSelectOption value="none">
+                    Sin diferencial en TP · línea Clase II
+                  </NativeSelectOption>
+                  <NativeSelectOption value="selective300">
+                    Selectivo Tipo S · 300 mA
+                  </NativeSelectOption>
+                  <NativeSelectOption value="instant30">
+                    Instantáneo · 30 mA (tablero único)
+                  </NativeSelectOption>
+                </NativeSelect>
+              </div>
+            </div>
+            <div className="grid gap-3 p-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
+              <div>
+                <p className="text-sm font-semibold">
+                  {panelTpDifferentialMode(activePanel) === 'none'
+                    ? 'TP de tránsito: IGA → línea seccional → diferenciales de 30 mA en TS1.'
+                    : panelTpDifferentialMode(activePanel) === 'selective300'
+                      ? 'ID selectivo de 300 mA aguas arriba: requiere coordinación documentada con los 30 mA interiores.'
+                      : 'ID instantáneo de 30 mA aguas arriba: puede producir el corte total del edificio.'}
+                </p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  {childPanels.length
+                    ? `${childPanels.filter(isClassIIFeeder).length} de ${childPanels.length} líneas seccionales declaradas Clase II.`
+                    : 'No hay tableros seccionales vinculados al TP.'}
+                </p>
+              </div>
+              <Badge
+                className={
+                  panelTpDifferentialMode(activePanel) === 'instant30'
+                    ? 'border-red-300 bg-red-50 text-red-900'
+                    : childPanels.length > 0 && childPanels.every(isClassIIFeeder)
+                      ? 'border-emerald-300 bg-emerald-50 text-emerald-900'
+                      : 'border-amber-300 bg-amber-50 text-amber-900'
+                }
+              >
+                {panelTpDifferentialMode(activePanel) === 'instant30'
+                  ? 'Riesgo de apagado total'
+                  : childPanels.length > 0 && childPanels.every(isClassIIFeeder)
+                    ? 'Recorrido Clase II declarado'
+                    : 'Verificación pendiente'}
+              </Badge>
+            </div>
+          </section>
+        )}
+
+        {(activePanel.type !== 'TP' || activePanel.circuits.length > 0) && (
         <section className="mb-5 rounded-2xl border bg-card p-4 shadow-sm">
           <Label
             htmlFor="architecture-choice"
@@ -2925,9 +3301,9 @@ export default function Home() {
             )}
           </NativeSelect>
           <p className="mt-3 text-sm font-semibold">
-            {selectedCost.differentialCount} diferenciales en este tablero ·{' '}
+            {selectedCost.differentialCount} diferenciales terminales en este tablero ·{' '}
             {panels.reduce(
-              (sum, panel) => sum + differentialGroups(panel).length,
+              (sum, panel) => sum + panelDifferentialCount(panel),
               0,
             )}{' '}
             en el proyecto
@@ -2969,6 +3345,7 @@ export default function Home() {
             </p>
           )}
         </section>
+        )}
 
         {/* Panel Metrics */}
         <p className="mb-3 text-sm text-muted-foreground">
@@ -4239,6 +4616,26 @@ export default function Home() {
                   }
                 />
                 <PriceInput
+                  label="Diferencial selectivo S 2P"
+                  value={prices.selectiveRcd2P}
+                  onChange={(value) =>
+                    setPrices((current) => ({
+                      ...current,
+                      selectiveRcd2P: value,
+                    }))
+                  }
+                />
+                <PriceInput
+                  label="Diferencial selectivo S 4P"
+                  value={prices.selectiveRcd4P}
+                  onChange={(value) =>
+                    setPrices((current) => ({
+                      ...current,
+                      selectiveRcd4P: value,
+                    }))
+                  }
+                />
+                <PriceInput
                   label="DPS 1P+N / 2P"
                   value={prices.spd2P}
                   onChange={(value) =>
@@ -4492,7 +4889,18 @@ function ProjectPrintSummary({
                 {panel.feederBreaker ?? 32} A · {panel.feederConductor ?? 6} mm²
                 · {panel.feederLengthM ?? 15} m ·{' '}
                 {panel.feederPhase ?? (panel.supply === 'tri' ? '3Φ' : 'L1')} ·
-                ΔV {formatNumber(calculation?.feederDrop.percent ?? 0, 2)} %
+                ΔV {formatNumber(calculation?.feederDrop.percent ?? 0, 2)} % ·{' '}
+                {feederWiringLabel(panel)}
+              </p>
+            )}
+            {panel.type === 'TP' && (
+              <p className="mb-3 border border-sky-700 p-2 text-[10px]">
+                <strong>Diferencial general del TP:</strong>{' '}
+                {panelTpDifferentialMode(panel) === 'none'
+                  ? 'no incluido; criterio condicionado a líneas seccionales Clase II.'
+                  : panelTpDifferentialMode(panel) === 'selective300'
+                    ? '300 mA, Tipo S; coordinación pendiente de demostrar.'
+                    : '30 mA instantáneo; revisar riesgo de corte total y uso exclusivo como tablero único.'}
               </p>
             )}
 
@@ -4510,6 +4918,13 @@ function ProjectPrintSummary({
               <p className="mt-1">
                 Mínimos de conductores: AEA 90364-7-771, Corrigendum 2 ({AEA_CONDUCTOR_REFERENCE_URL}).
               </p>
+              {publicVenue && (
+                <p className="mt-1">
+                  Cables interiores: {profile.interiorCableStandard === 'iram62267'
+                    ? 'LSOH IRAM 62267 declarado; verificar marcación y certificación.'
+                    : 'especificación LSOH IRAM 62267 pendiente o no declarada.'}
+                </p>
+              )}
             </section>
 
             {children.length > 0 && (
@@ -4608,9 +5023,9 @@ function ProjectPrintSummary({
               </tbody>
             </table>
             <p className="mt-3 text-xs font-semibold">
-              {architectureDetails(panel.architecture).title} ·{' '}
-              {differentialGroups(panel).length} diferenciales.{' '}
-              {architectureDetails(panel.architecture).behavior}
+              {panel.type === 'TP' && panel.circuits.length === 0
+                ? `TP de tránsito · ${tpDifferentialDevice(panel) ? '1 diferencial general' : 'sin diferencial general'}. Los ID de 30 mA se resuelven aguas abajo.`
+                : `${architectureDetails(panel.architecture).title} · ${differentialGroups(panel).length} diferenciales terminales. ${architectureDetails(panel.architecture).behavior}`}
             </p>
             {publicVenue && panel.architecture === 'residential' && (
               <p className="mt-2 text-xs font-bold">
@@ -5082,8 +5497,9 @@ function DistributionArchitectureGuide() {
               <div className="flex items-start gap-2">
                 <span className="font-mono font-bold text-violet-400">•</span>
                 <span>
-                  <strong>DPS (Transitorias):</strong> Configurable según
-                  evaluación y esquema adoptado.
+                  <strong>Diferencial general:</strong> Configurable. Sin ID si
+                  la línea seccional es Clase II; si la autoridad lo exige,
+                  evaluar 300 mA selectivo Tipo S y documentar coordinación.
                 </span>
               </div>
               <div className="flex items-start gap-2">
@@ -5103,8 +5519,9 @@ function DistributionArchitectureGuide() {
             </div>
           </div>
           <div className="mt-3 rounded-lg border border-amber-400/20 bg-amber-400/5 p-2 text-[11px] text-amber-200/90">
-            🛡️ <em>Envolvente:</em> Gabinete estanco (mínimo IP54) con doble
-            aislamiento (Clase II) si está en intemperie.
+            🛡️ <em>Envolvente:</em> Gabinete aislante, estanco según exposición,
+            con señalización de riesgo eléctrico y selección verificada para
+            intemperie.
           </div>
         </div>
 
@@ -5123,8 +5540,8 @@ function DistributionArchitectureGuide() {
               Alimentador entre TP y TS1
             </h3>
             <p className="mt-1 text-xs leading-relaxed text-slate-400">
-              Conductor de sección reforzada (mínimo 4, 6 o 10 mm²) canalizado
-              de forma protegida contra daños mecánicos.
+              Cable y canalización dimensionados por Ib/In/Iz, caída de tensión,
+              cortocircuito y condiciones reales del recorrido.
             </p>
             <div className="mt-3.5 space-y-2 text-xs text-slate-300">
               <div className="flex items-start gap-2">
@@ -5137,8 +5554,9 @@ function DistributionArchitectureGuide() {
               <div className="flex items-start gap-2">
                 <span className="font-mono font-bold text-sky-400">•</span>
                 <span>
-                  <strong>Conductores:</strong> Subterráneo (IRAM 2178) o
-                  unipolar bajo cañería (IRAM NM 247-3).
+                  <strong>Clase II:</strong> Cable IRAM 2178 subterráneo, o
+                  conductores dentro de cañería plástica continua con
+                  envolventes aislantes, según el proyecto verificado.
                 </span>
               </div>
               <div className="flex items-start gap-2">
@@ -5151,9 +5569,10 @@ function DistributionArchitectureGuide() {
             </div>
           </div>
           <div className="mt-3 rounded-lg border border-sky-400/20 bg-sky-400/10 p-2 text-[11px] text-sky-200">
-            ⚡ <em>Selectividad:</em> Los alimentadores a TS se representan
-            antes de los ID de 30 mA que protegen circuitos propios del TP.
-            Cualquier diferencial general debe justificarse y coordinarse.
+            ⚡ <em>Continuidad:</em> Un ID instantáneo de 30 mA en el pilar puede
+            apagar iluminación, audio y climatización a la vez. En pública
+            concurrencia, esa pérdida total de servicio debe evitarse mediante
+            arquitectura y coordinación verificadas.
           </div>
         </div>
 
@@ -5179,6 +5598,14 @@ function DistributionArchitectureGuide() {
                 <span>
                   <strong>Corte Local:</strong> Interruptor de cabecera para
                   desenergizar el tablero en el lugar.
+                </span>
+              </div>
+              <div className="flex items-start gap-2">
+                <span className="font-mono font-bold text-emerald-400">•</span>
+                <span>
+                  <strong>Cables interiores:</strong> Para pública concurrencia,
+                  el proyecto adopta LSOH IRAM 62267; verificar marcación,
+                  certificación y alcance exigido en la inspección.
                 </span>
               </div>
               <div className="flex items-start gap-2">
@@ -5933,6 +6360,10 @@ function PanelFront({
   onHoverDevice?: (circuitId: number | undefined) => void;
 }) {
   const layout = layoutDin(devices, modulesPerRow, 20);
+  const hasTpDifferential = devices.some(
+    (device) =>
+      device.key === 'id-selective-tp' || device.key === 'id-general-tp',
+  );
   const visibleRows = Math.max(rows, layout.rows);
   const slots: Array<{ device?: PanelDevice; start?: boolean }> = Array.from(
     { length: visibleRows * modulesPerRow },
@@ -5956,7 +6387,7 @@ function PanelFront({
           </p>
           <p className="mt-0.5 text-xs font-semibold text-slate-800">
             {panelType === 'TP'
-              ? `IGA${hasDps ? ' · DPS en paralelo' : ''}${hasFeeders ? ' · alimentadores TS' : ''} · ID y circuitos propios`
+              ? `IGA${hasTpDifferential ? ' · ID general configurable' : ' · sin ID general'}${hasDps ? ' · DPS en paralelo' : ''}${hasFeeders ? ' · alimentadores TS' : ''} · circuitos propios si corresponde`
               : `Corte local${hasDps ? ' · DPS en paralelo' : ''} · ID y circuitos terminales`}
           </p>
         </div>
@@ -6066,8 +6497,10 @@ function SingleLineDiagram({
   return (
     <div className="unifilar rounded-xl border bg-slate-50 p-4 text-slate-900">
       <p className="mb-3 text-sm font-semibold">
-        {architectureDetails(panel.architecture).title} ·{' '}
-        {differentialGroups(panel).length} diferenciales
+        {panel.type === 'TP' && panel.circuits.length === 0
+          ? 'TP de tránsito'
+          : architectureDetails(panel.architecture).title}{' '}
+        · {panelDifferentialCount(panel)} diferenciales en el tablero
       </p>
       <div className="flex flex-wrap items-center gap-3 border-b-2 border-slate-700 pb-4">
         <DiagramNode
@@ -6086,6 +6519,21 @@ function SingleLineDiagram({
               : 'maniobra, sin disparo por sobrecorriente'
           }`}
         />
+        {tpDifferentialDevice(panel) && (
+          <>
+            <span aria-hidden="true">→</span>
+            <DiagramNode
+              kicker="Diferencial TP"
+              title={tpDifferentialDevice(panel)!.label}
+              detail={tpDifferentialDevice(panel)!.detail}
+              tone={
+                panelTpDifferentialMode(panel) === 'instant30'
+                  ? 'amber'
+                  : 'blue'
+              }
+            />
+          </>
+        )}
         <span className="text-xs">→ barras activas y N · PE independiente</span>
       </div>
       <div className="border-l-2 border-slate-700">
@@ -6135,6 +6583,7 @@ function SingleLineDiagram({
                 · {child.feederConductor ?? 6} mm² · {child.feederLengthM ?? 15}{' '}
                 m
               </p>
+              <p className="mt-1">{feederWiringLabel(child)}</p>
               <p className="mt-1 break-words">
                 Cañería:{' '}
                 {child.feederConduit?.trim() || 'pendiente de dimensionar'}
@@ -6206,6 +6655,7 @@ function MultiLineDiagram({
       length: child.feederLengthM ?? 15,
       power: calculations.get(child.id)?.demandVA ?? 0,
       conduit: child.feederConduit,
+      wiring: feederWiringLabel(child),
       feeder: true,
       drop: calculations.get(child.id)?.feederDrop.percent ?? 0,
     })),
@@ -6219,6 +6669,7 @@ function MultiLineDiagram({
       length: circuit.lengthM,
       power: circuitPower(circuit),
       conduit: circuit.conduit,
+      wiring: '',
       feeder: false,
       drop:
         voltageDrop(circuit, panel.supply).percent +
@@ -6289,6 +6740,7 @@ function MultiLineDiagram({
                 <p className="mt-1 break-words">
                   Cañería: {row.conduit?.trim() || 'pendiente'}
                 </p>
+                {row.wiring && <p className="mt-1">{row.wiring}</p>}
               </td>
             </tr>
           ))}

@@ -175,6 +175,25 @@ test('esquema: perfil/precios ausentes permiten compatibilidad; tipos presentes 
     );
 });
 
+test('esquema: valida opciones nuevas de selectividad, Clase II y cable LSOH', () => {
+  const data = makeProject();
+  data.panels[0].tpDifferentialMode = 'none';
+  data.panels[0].feederWiring = 'classII-underground';
+  data.profile = { interiorCableStandard: 'iram62267' };
+  assert.equal(validateProjectStructure(data).ok, true);
+
+  for (const [target, key, value] of [
+    ['panel', 'tpDifferentialMode', 'automatic'],
+    ['panel', 'feederWiring', 'underground'],
+    ['profile', 'interiorCableStandard', 'pvc'],
+  ]) {
+    const invalid = structuredClone(data);
+    if (target === 'panel') invalid.panels[0][key] = value;
+    else invalid.profile[key] = value;
+    assert.equal(validateProjectStructure(invalid).ok, false, key);
+  }
+});
+
 test('esquema: v2 solo entra por migración explícita y nunca sustituye circuitos ausentes', () => {
   const data = {
     version: '2.0',

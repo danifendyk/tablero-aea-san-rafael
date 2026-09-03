@@ -14,8 +14,10 @@ type PanelShape = {
   architecture: string;
   includeDps?: boolean;
   differentialType?: string;
+  tpDifferentialMode?: string;
   feederBreaker?: number;
   feederPhase?: string;
+  feederWiring?: string;
   circuits: CircuitShape[];
 };
 export type DinDevice = {
@@ -157,6 +159,30 @@ export function differentialLabel(panel: PanelShape, circuitId: number) {
   );
 }
 
+export function tpDifferentialDevice(panel: PanelShape): DinDevice | null {
+  if (panel.type !== 'TP' || panel.tpDifferentialMode === 'none') return null;
+  const span = panel.supply === 'tri' ? 4 : 2;
+  if (panel.tpDifferentialMode === 'selective300')
+    return {
+      key: 'id-selective-tp',
+      label: 'ID-S',
+      fullName: 'Interruptor diferencial general selectivo del TP',
+      detail: '300 mA · tipo S',
+      span,
+      className: 'device-rcd-selective',
+    };
+  if (panel.tpDifferentialMode === 'instant30')
+    return {
+      key: 'id-general-tp',
+      label: 'ID-G',
+      fullName: 'Interruptor diferencial general instantáneo del TP',
+      detail: '30 mA · no selectivo',
+      span,
+      className: 'device-rcd',
+    };
+  return null;
+}
+
 export function buildPanelDevices(
   panel: PanelShape,
   children: PanelShape[],
@@ -176,6 +202,8 @@ export function buildPanelDevices(
       className: 'device-main',
     },
   ];
+  const tpDifferential = tpDifferentialDevice(panel);
+  if (tpDifferential) devices.push(tpDifferential);
   if (panel.includeDps ?? panel.type === 'TP')
     devices.push({
       key: 'spd',

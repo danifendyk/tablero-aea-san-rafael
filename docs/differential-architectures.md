@@ -19,6 +19,25 @@ tránsito, sin circuitos terminales propios, tiene 0 de estos diferenciales: las
 protecciones necesarias de sus alimentadores requieren verificación específica.
 Se muestra el número del tablero y la suma de los TP/TS del proyecto.
 
+## Diferencial general del TP
+
+El diferencial del pilar no se deduce de la arquitectura 2/3/1 de los circuitos
+terminales. Se guarda como una decisión independiente:
+
+| Opción TP | Uso modelado | Advertencia |
+| --- | --- | --- |
+| Sin diferencial (`none`) | Línea seccional con condición Clase II documentada. | Si algún alimentador queda pendiente o no es Clase II, el diagnóstico exige revisar la protección contra contactos indirectos. |
+| 300 mA selectivo (`selective300`) | Alternativa cuando la autoridad exige diferencial aguas arriba. | Requiere curvas, tiempos y coordinación documentados con los 30 mA interiores. |
+| 30 mA instantáneo (`instant30`) | Sólo se presenta para un eventual tablero único. | Con TS aguas abajo se advierte riesgo de corte total del edificio. |
+
+La termomagnética omnipolar de cabecera permanece en las tres opciones. El
+selector no certifica la aceptación de la distribuidora, municipio o inspección.
+
+Cada alimentador a TS registra además si se ejecuta con cable IRAM 2178
+subterráneo, con cañería y envolventes aislantes, o si su condición está pendiente.
+En pública concurrencia el perfil registra por separado la especificación de
+cables interiores LSOH IRAM 62267.
+
 ## Sincronización y proyectos guardados
 
 `differentialGroups` en `lib/panel-layout.ts` es la fuente común para la asignación,
@@ -58,5 +77,6 @@ diseño, no una visación automática.
 
 Pruebas de grupos 2/3/1, clasificación por uso independiente del orden y fase,
 grupos reservados, ID único con EMG, compatibilidad JSON y modo legado,
-advertencia global/impresa, TP de tránsito, y coincidencia entre presupuesto,
-dimensiones y vistas. Se mantienen las pruebas de la auditoría anterior.
+advertencia global/impresa, TP de tránsito, diferencial general configurable,
+condición Clase II, cables LSOH, y coincidencia entre presupuesto, dimensiones y
+vistas. Se mantienen las pruebas de la auditoría anterior.

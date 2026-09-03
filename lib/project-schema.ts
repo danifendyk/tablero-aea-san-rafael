@@ -89,6 +89,18 @@ function panel(value: unknown, path: string) {
   field(raw, 'parentId', path, (entry) => entry === null || text(entry));
   field(raw, 'includeDps', path, boolean);
   field(raw, 'differentialType', path, oneOf(['AC', 'A']));
+  field(
+    raw,
+    'tpDifferentialMode',
+    path,
+    oneOf(['none', 'selective300', 'instant30']),
+  );
+  field(
+    raw,
+    'feederWiring',
+    path,
+    oneOf(['classII-underground', 'classII-conduit', 'other', 'pending']),
+  );
   for (const key of ['feederLengthM', 'feederConductor', 'feederBreaker'])
     field(raw, key, path, positive);
   field(raw, 'feederPhase', path, oneOf(phases));
@@ -127,6 +139,12 @@ function profile(value: unknown) {
   ])
     field(raw, key, path, boolean);
   field(raw, 'emergencyEvidence', path, text);
+  field(
+    raw,
+    'interiorCableStandard',
+    path,
+    oneOf(['iram62267', 'other', 'pending']),
+  );
 }
 
 /**

@@ -794,3 +794,39 @@ test('integración: diagnosePanel alerta si circuito TUE supera 12 bocas (AEA 77
   );
   assert.ok(messages.some((m) => m.includes('supera el límite reglamentario de 12 bocas para TUE')));
 });
+
+test('integración: AEA 718.556.5.2.12 prohíbe gabinete compartido entre normal y EMG centralizado', () => {
+  const mixedPanel = makePanel({
+    id: 'ts1',
+    name: 'TS1',
+    circuits: [
+      makeCircuit(1, { kind: 'IUG' }),
+      makeCircuit(2, { kind: 'TUG' }),
+      makeCircuit(3, { kind: 'EMG' }),
+    ],
+  });
+  const separatedTs = makePanel({
+    id: 'ts1',
+    name: 'TS1',
+    circuits: [makeCircuit(1, { kind: 'IUG' }), makeCircuit(2, { kind: 'TUG' })],
+  });
+  const exclusiveTse = makePanel({
+    id: 'tse',
+    name: 'TSE',
+    circuits: [makeCircuit(1, { kind: 'EMG' })],
+  });
+  const profileCentralized = {
+    preset: 'hall',
+    emergencySystem: 'centralized',
+    emergencyAutonomyHours: 2,
+    emergencyEvidence: 'Central',
+  };
+
+  // Gabinete compartido -> advierte infracción a AEA 718.556.5.2.12
+  const diagMixed = app.diagnoseProject([mixedPanel], profileCentralized, true);
+  assert.ok(diagMixed.some((w) => w.includes('718.556.5.2.12')));
+
+  // Tableros físicamente separados -> NO advierte infracción a 718.556.5.2.12
+  const diagSeparated = app.diagnoseProject([separatedTs, exclusiveTse], profileCentralized, true);
+  assert.ok(!diagSeparated.some((w) => w.includes('718.556.5.2.12')));
+});

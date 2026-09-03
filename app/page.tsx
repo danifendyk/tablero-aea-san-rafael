@@ -1146,6 +1146,18 @@ function diagnoseProject(panels: Panel[], profile: ProjectProfile, isPublicVenue
         'Emergencia autónoma: falta al menos un circuito de iluminación normal (IUG) para alimentar los cargadores de las luminarias autónomas.',
       );
     }
+    if (isPublicVenue && !isAutonomousEmergency) {
+      const mixedPanels = panels.filter(
+        (panel) =>
+          panel.circuits.some((c) => c.kind === 'EMG') &&
+          panel.circuits.some((c) => c.kind !== 'EMG'),
+      );
+      for (const panel of mixedPanels) {
+        messages.push(
+          `${panel.name}: comparte circuitos normales y de emergencia centralizada en el mismo gabinete. Prohibido por AEA 718.556.5.2.12 (el sistema centralizado exige un Tablero de Emergencia TSE físicamente independiente y cañerías exclusivas). Para evitar el tablero y canalizaciones exclusivos, adopte Luminarias Autónomas (AEA 718.556.5.2.2).`,
+        );
+      }
+    }
     if (isPublicVenue) {
       if (profile.interiorCableStandard !== 'iram62267')
         messages.push(
@@ -1186,6 +1198,22 @@ function diagnoseProject(panels: Panel[], profile: ProjectProfile, isPublicVenue
           : 'Emergencia: falta declarar autonomía ≥2 h y una referencia de ensayo/ficha. Un circuito EMG no demuestra autonomía ni iluminancia.',
       );
     return messages;
+}
+
+function findProjectEmergencyCircuit(panels: Panel[]) {
+  for (const p of panels) {
+    const idx = p.circuits.findIndex((c) => c.kind === 'EMG');
+    if (idx !== -1) {
+      const isMixed = p.circuits.some((c) => c.kind !== 'EMG');
+      return {
+        panel: p,
+        circuit: p.circuits[idx],
+        circuitNumber: idx + 1,
+        isMixed,
+      };
+    }
+  }
+  return null;
 }
 
 export default function Home() {
@@ -1705,6 +1733,8 @@ export default function Home() {
   const warnings = useMemo(() => [...(panelDiagnostics.get(activePanel.id) ?? []), ...projectDiagnostics], [activePanel.id, panelDiagnostics, projectDiagnostics]);
   const projectWarnings = useMemo(() => [...projectDiagnostics, ...panels.flatMap((panel) => (panelDiagnostics.get(panel.id) ?? []).map((message) => `${panel.name}: ${message}`))], [panels, panelDiagnostics, projectDiagnostics]);
 
+  const emgCircuitInfo = findProjectEmergencyCircuit(panels);
+
   const costOptions = useMemo<CostOption[]>(() => {
     const children =
       activePanel.type === 'TP'
@@ -2183,6 +2213,71 @@ export default function Home() {
       name: `${circuit.name} (copia)`,
     };
     updateActivePanel('circuits', [...activePanel.circuits, duplicated]);
+  }
+
+  function createEmergencyPanel() {
+    setOptimizationMessage('');
+    const newId = createPanelId('tse');
+    const emgCircuit: Circuit = {
+      id: 1,
+      name: 'Luces y carteles de escape',
+      kind: 'EMG',
+      points: 8,
+      unitVA: 20,
+      phase: tpPanel.supply === 'tri' ? 'L3' : 'L1',
+      powerFactor: 0.95,
+      breaker: 10,
+      conductor: 1.5,
+      lengthM: 24,
+      modules: 2,
+    };
+
+    const emergencyPanel: Panel = {
+      id: newId,
+      name: 'TSE · Tablero de Emergencia',
+      type: 'TS',
+      parentId: tpPanel.id,
+      supply: 'mono',
+      demandFactor: 1,
+      reservePercent: 25,
+      modulesPerRow: 12,
+      architecture: 'balanced',
+      includeDps: false,
+      differentialType: 'A',
+      feederLengthM: 10,
+      feederConductor: 4,
+      feederBreaker: 16,
+      feederPhase: tpPanel.supply === 'tri' ? 'L3' : 'L1',
+      feederWiring: 'classII-conduit',
+      feederConduit:
+        'Cañería independiente F90 exclusiva para emergencia (AEA 718.556.5.2.5 y 718.556.6.3)',
+      circuits: [emgCircuit],
+    };
+
+    // Quitamos los circuitos EMG de los tableros normales para cumplir con AEA 718.556.5.2.12
+    setPanels((current) => [
+      ...current.map((p) => ({
+        ...p,
+        circuits: p.circuits.filter((c) => c.kind !== 'EMG'),
+      })),
+      emergencyPanel,
+    ]);
+    setActivePanelId(newId);
+  }
+
+  function handleEmergencySystemChange(mode: EmergencySystem) {
+    updateProfile('emergencySystem', mode);
+    if (mode === 'centralized') {
+      const hasExclusiveEmg = panels.some(
+        (p) =>
+          p.type === 'TS' &&
+          p.circuits.length > 0 &&
+          p.circuits.every((c) => c.kind === 'EMG'),
+      );
+      if (!hasExclusiveEmg) {
+        createEmergencyPanel();
+      }
+    }
   }
 
   function optimizeProject() {
@@ -4004,10 +4099,7 @@ export default function Home() {
                   id="emergency-system"
                   value={profile.emergencySystem ?? 'centralized'}
                   onChange={(e) =>
-                    updateProfile(
-                      'emergencySystem',
-                      e.target.value as EmergencySystem,
-                    )
+                    handleEmergencySystemChange(e.target.value as EmergencySystem)
                   }
                   className="mt-1 w-full bg-white text-slate-900"
                 >
@@ -4019,16 +4111,111 @@ export default function Home() {
                   </NativeSelectOption>
                 </NativeSelect>
               </label>
-              {profile.emergencySystem === 'autonomous' ? (
-                <p className="mt-1.5 text-[11px] text-amber-900">
-                  ℹ️ <strong>Equipos autónomos:</strong> Se alimentan directamente desde los circuitos de iluminación normal (IUG) del sector que protegen. No se exige circuito EMG exclusivo en el tablero ni Tablero Principal de Emergencia (AEA 718.556.5.2.2 y 718.556.6.1.9).
-                </p>
-              ) : (
-                <p className="mt-1.5 text-[11px] text-amber-900">
-                  ℹ️ <strong>Circuito centralizado:</strong> Requiere al menos un circuito tipo EMG en el tablero con protección diferencial independiente (AEA 718.556.2).
-                </p>
-              )}
             </div>
+            {profile.emergencySystem === 'autonomous' ? (
+              <div className="mt-2.5 rounded-xl border border-sky-300 bg-sky-50/90 p-3 text-xs text-sky-950">
+                <p className="font-semibold text-sky-900">
+                  💡 Exención reglamentaria (AEA 718.556.5.2.2 y 718.556.6.1.9):
+                </p>
+                <p className="mt-1 text-sky-800 leading-relaxed">
+                  Al adoptar equipos autónomos con batería incorporada (IRAM-AADL J 2027), la instalación queda <strong>eximida de poseer Tablero de Emergencia exclusivo y cañerías independientes</strong>. Los cargadores se alimentan directamente desde los circuitos de iluminación normal (IUG) del sector.
+                </p>
+              </div>
+            ) : (
+              <div className="mt-2.5 rounded-xl border border-amber-300 bg-amber-50/90 p-3 text-xs text-amber-950">
+                <p className="font-semibold text-amber-900">
+                  🏛️ Exigencias del sistema centralizado (AEA 718.556.5.2.2, 718.556.5.2.12 y Ord. 72/83):
+                </p>
+                <ul className="mt-1 list-disc pl-4 space-y-0.5 text-amber-800 leading-relaxed">
+                  <li><strong>Tablero exclusivo:</strong> Prohibido compartir el mismo tablero con circuitos normales, aun en cubicles separados (718.556.5.2.12). Exige Tablero de Emergencia (TSE) físicamente independiente.</li>
+                  <li><strong>Canalizaciones exclusivas:</strong> Cañerías y conductos 100 % independientes, sin compartir caños ni cajas de paso con cargas normales (718.556.6.1.3 y Ord. 72/83 Art. III.2.22.8).</li>
+                  <li><strong>Corte Bomberos:</strong> Interruptor general de corte para bomberos con cartel rojo a ≤ 5 m del acceso principal (718.556.5.2.3).</li>
+                </ul>
+              </div>
+            )}
+
+            {profile.emergencySystem === 'centralized' && (
+              emgCircuitInfo ? (
+                emgCircuitInfo.isMixed ? (
+                  <div className="mt-2.5 flex flex-col gap-2 rounded-xl border border-amber-400 bg-amber-100/95 p-3 text-xs text-amber-950">
+                    <div className="flex items-start gap-2">
+                      <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-700" />
+                      <div>
+                        <p className="font-semibold text-amber-900">
+                          Infracción AEA 718.556.5.2.12: Gabinete compartido en {emgCircuitInfo.panel.name}
+                        </p>
+                        <p className="mt-0.5 text-amber-800 leading-relaxed">
+                          El circuito centralizado de emergencia está dentro del mismo tablero que los circuitos normales. La reglamentación exige un <strong>Tablero de Emergencia (TSE) físicamente separado</strong>.
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-2 pt-1">
+                      <Button
+                        type="button"
+                        size="sm"
+                        className="bg-amber-700 hover:bg-amber-800 text-white font-medium shadow-sm"
+                        onClick={createEmergencyPanel}
+                      >
+                        Separar y crear Tablero de Emergencia (TSE) exclusivo
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="bg-white text-amber-950 border-amber-400 hover:bg-amber-50"
+                        onClick={() => handleEmergencySystemChange('autonomous')}
+                      >
+                        Cambiar a Luminarias Autónomas (exentas de tablero)
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-2.5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 rounded-xl border border-emerald-300 bg-emerald-50/90 p-3 text-xs text-emerald-950">
+                    <div className="flex items-start gap-2">
+                      <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-700" />
+                      <div>
+                        <p className="font-semibold text-emerald-900">
+                          Tablero de Emergencia exclusivo (TSE) conforme a AEA 718.556.5.2.12
+                        </p>
+                        <p className="mt-0.5 text-emerald-800">
+                          Ubicado en <strong>{emgCircuitInfo.panel.name}</strong> · C{emgCircuitInfo.circuitNumber}: {emgCircuitInfo.circuit.name} (TM {emgCircuitInfo.circuit.breaker} A · cable {emgCircuitInfo.circuit.conductor} mm² · {emgCircuitInfo.circuit.phase}). Gabinete y cañería independientes de la instalación normal.
+                        </p>
+                      </div>
+                    </div>
+                    {activePanel.id !== emgCircuitInfo.panel.id && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="mt-1 sm:mt-0 shrink-0 bg-white text-emerald-900 border-emerald-300 hover:bg-emerald-100"
+                        onClick={() => setActivePanelId(emgCircuitInfo.panel.id)}
+                      >
+                        Ir a {emgCircuitInfo.panel.name}
+                      </Button>
+                    )}
+                  </div>
+                )
+              ) : (
+                <div className="mt-2.5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5 rounded-xl border border-amber-400 bg-amber-100/90 p-3 text-xs text-amber-950">
+                  <div>
+                    <p className="font-semibold text-amber-900">
+                      ⚠️ No se encontró ningún circuito ni tablero de emergencia
+                    </p>
+                    <p className="mt-0.5 text-amber-800">
+                      El sistema centralizado exige un Tablero Seccional de Emergencia (TSE) físicamente independiente (AEA 718.556.5.2.12).
+                    </p>
+                  </div>
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="shrink-0 bg-amber-600 hover:bg-amber-700 text-white font-medium shadow-sm"
+                    onClick={createEmergencyPanel}
+                  >
+                    + Crear Tablero de Emergencia (TSE) exclusivo
+                  </Button>
+                </div>
+              )
+            )}
             <div className="mt-3 grid gap-3 sm:grid-cols-[180px_1fr]">
               <label htmlFor="emergency-hours" className="text-xs font-medium">
                 Autonomía (horas)

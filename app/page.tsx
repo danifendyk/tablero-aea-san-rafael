@@ -40,6 +40,15 @@ import {
   NativeSelectOption,
 } from '@/components/ui/native-select';
 import { Separator } from '@/components/ui/separator';
+import { MixedCircuitEditor } from '@/components/mixed-circuit-editor';
+import {
+  circuitApparentPower,
+  circuitPointCount,
+  circuitLoadDescription,
+  mixedCircuitFields,
+  mixedCircuitIssues,
+  type MixedLoad,
+} from '@/lib/circuit-loads';
 import {
   accumulatedVoltageDrop,
   activePower,
@@ -57,6 +66,7 @@ import {
   voltageDropCriteria,
   AEA_CONDUCTOR_REFERENCE_URL,
   STANDARD_BREAKERS,
+  CIRCUIT_BREAKERS,
   type FeederDrop,
   type AmpacitySettings,
 } from '@/lib/electrical';
@@ -92,7 +102,7 @@ import { validateProjectStructure } from '@/lib/project-schema';
 
 export type Supply = 'mono' | 'tri';
 export type Phase = 'L1' | 'L2' | 'L3' | '3Φ';
-export type CircuitKind = 'IUG' | 'TUG' | 'TUE' | 'EMG' | 'FM';
+export type CircuitKind = 'IUG' | 'TUG' | 'TUE' | 'EMG' | 'FM' | 'MIX';
 export type Architecture =
   | 'essential'
   | 'balanced'
@@ -148,6 +158,7 @@ export type Circuit = {
   modules: number;
   ampacity?: AmpacitySettings;
   conduit?: string;
+  mixedLoads?: MixedLoad[];
 };
 
 export type CircuitTemplate = Omit<Circuit, 'id' | 'name' | 'phase'> & {
@@ -329,6 +340,33 @@ const PRICE_SOURCES = [
 ];
 
 const TEMPLATES: Record<CircuitKind, CircuitTemplate> = {
+  MIX: {
+    label: 'Mixto · iluminación y tomacorrientes',
+    shortName: 'Mixto',
+    kind: 'MIX',
+    ...mixedCircuitFields([
+      {
+        name: 'Iluminación',
+        kind: 'lighting',
+        points: 6,
+        unitPower: 20,
+        unit: 'W',
+        powerFactor: 0.9,
+      },
+      {
+        name: 'Tomacorrientes',
+        kind: 'socket',
+        points: 1,
+        unitPower: 220,
+        unit: 'VA',
+        powerFactor: 1,
+      },
+    ]),
+    breaker: 15,
+    conductor: 2.5,
+    lengthM: 20,
+    modules: 2,
+  },
   IUG: {
     label: 'Iluminación general',
     shortName: 'Iluminación',
@@ -479,7 +517,8 @@ const INITIAL_PANELS: Panel[] = [
     feederBreaker: 32,
     feederPhase: '3Φ',
     feederWiring: 'classII-underground',
-    feederConduit: 'Cable IRAM 2178 en tendido subterráneo; verificar instalación y envolventes Clase II.',
+    feederConduit:
+      'Cable IRAM 2178 en tendido subterráneo; verificar instalación y envolventes Clase II.',
     circuits: INITIAL_CIRCUITS_TP,
   },
 ];
@@ -582,7 +621,26 @@ function architectureOccupiedModules(
 }
 
 function circuitPower(circuit: Circuit) {
-  return Math.max(0, circuit.points) * Math.max(0, circuit.unitVA);
+  return circuitApparentPower(circuit);
+}
+
+function changeCircuitKind(circuit: Circuit, kind: CircuitKind): Circuit {
+  if (kind !== 'MIX') return { ...circuit, kind };
+  const mixedLoads = circuit.mixedLoads ?? [
+    {
+      name: circuit.name,
+      kind:
+        circuit.kind === 'IUG' || circuit.kind === 'EMG'
+          ? ('lighting' as const)
+          : ('socket' as const),
+      points: circuit.points,
+      unitPower: circuit.unitVA,
+      unit: 'VA' as const,
+      powerFactor: circuit.powerFactor,
+    },
+  ];
+  // Preserve existing loads and ratings: diagnostics surface any incompatibility.
+  return { ...circuit, kind, ...mixedCircuitFields(mixedLoads) };
 }
 
 function circuitCurrent(circuit: Circuit, supply: Supply) {
@@ -701,8 +759,9 @@ function feederWiringLabel(panel: Panel) {
 }
 
 function panelDifferentialCount(panel: Panel) {
-  return differentialGroups(panel).length +
-    (tpDifferentialDevice(panel) ? 1 : 0);
+  return (
+    differentialGroups(panel).length + (tpDifferentialDevice(panel) ? 1 : 0)
+  );
 }
 
 function normalizePrices(value: unknown): PriceCatalog {
@@ -767,7 +826,7 @@ function normalizeProfile(value: unknown): ProjectProfile {
       String(raw.emergencySystem),
     )
       ? (raw.emergencySystem as EmergencySystem)
-      : INITIAL_PROFILE.emergencySystem ?? 'centralized',
+      : (INITIAL_PROFILE.emergencySystem ?? 'centralized'),
     interiorCableStandard: ['iram62267', 'other'].includes(
       String(raw.interiorCableStandard),
     )
@@ -804,7 +863,9 @@ function normalizeCircuit(
   supply: Supply,
 ): Circuit {
   const raw = isRecord(value) ? value : {};
-  const kind = ['IUG', 'TUG', 'TUE', 'EMG', 'FM'].includes(String(raw.kind))
+  const kind = ['IUG', 'TUG', 'TUE', 'EMG', 'FM', 'MIX'].includes(
+    String(raw.kind),
+  )
     ? (raw.kind as CircuitKind)
     : 'IUG';
   const template = TEMPLATES[kind];
@@ -823,6 +884,22 @@ function normalizeCircuit(
     ? requestedConductor
     : template.conductor;
 
+  const mixedLoads = Array.isArray(raw.mixedLoads)
+    ? raw.mixedLoads.map((entry: unknown) => {
+        const load = isRecord(entry) ? entry : {};
+        return {
+          name: typeof load.name === 'string' ? load.name.slice(0, 200) : '',
+          kind:
+            load.kind === 'socket'
+              ? ('socket' as const)
+              : ('lighting' as const),
+          points: Math.round(finiteNumber(load.points, 0, 0, 10000)),
+          unitPower: finiteNumber(load.unitPower, 0, 0, 1e9),
+          unit: load.unit === 'W' ? ('W' as const) : ('VA' as const),
+          powerFactor: finiteNumber(load.powerFactor, 1, 0.1, 1),
+        };
+      })
+    : undefined;
   return {
     id: safeCircuitId(raw.id, index + 1),
     name:
@@ -843,12 +920,22 @@ function normalizeCircuit(
     }),
     ampacity: normalizeAmpacity(raw.ampacity),
     conduit: typeof raw.conduit === 'string' ? raw.conduit.slice(0, 300) : '',
+    ...(mixedLoads ? { mixedLoads } : {}),
+    ...(kind === 'MIX' ? mixedCircuitFields(mixedLoads ?? []) : {}),
   };
 }
 
 function normalizePanels(value: unknown): Panel[] | null {
   if (!Array.isArray(value) || value.length === 0) return null;
-  if (value.some((entry) => !isRecord(entry) || !Array.isArray(entry.circuits) || entry.circuits.some((circuit: unknown) => !isRecord(circuit)))) return null;
+  if (
+    value.some(
+      (entry) =>
+        !isRecord(entry) ||
+        !Array.isArray(entry.circuits) ||
+        entry.circuits.some((circuit: unknown) => !isRecord(circuit)),
+    )
+  )
+    return null;
   const records = value as Record<string, unknown>[];
   const tpRecords = records.filter((item) => item.type === 'TP');
   if (tpRecords.length !== 1) return null;
@@ -862,7 +949,11 @@ function normalizePanels(value: unknown): Panel[] | null {
     while (usedIds.has(id)) id = `${id}-${panelIndex + 1}`;
     usedIds.add(id);
     const supply: Supply = raw.supply === 'mono' ? 'mono' : 'tri';
-    const circuits = normalizeCircuitIds((raw.circuits as unknown[]).map((circuit, index) => normalizeCircuit(circuit, index, supply)));
+    const circuits = normalizeCircuitIds(
+      (raw.circuits as unknown[]).map((circuit, index) =>
+        normalizeCircuit(circuit, index, supply),
+      ),
+    );
     const feederPhase: Phase =
       supply === 'tri'
         ? '3Φ'
@@ -922,9 +1013,7 @@ function normalizePanels(value: unknown): Panel[] | null {
             ? 6
             : undefined,
       feederBreaker:
-        type === 'TS'
-          ? finiteNumber(raw.feederBreaker, 32, 1)
-          : undefined,
+        type === 'TS' ? finiteNumber(raw.feederBreaker, 32, 1) : undefined,
       feederPhase: type === 'TS' ? feederPhase : undefined,
       feederAmpacity:
         type === 'TS' ? normalizeAmpacity(raw.feederAmpacity) : undefined,
@@ -934,12 +1023,9 @@ function normalizePanels(value: unknown): Panel[] | null {
           : '',
       feederWiring:
         type === 'TS' &&
-        [
-          'classII-underground',
-          'classII-conduit',
-          'other',
-          'pending',
-        ].includes(String(raw.feederWiring))
+        ['classII-underground', 'classII-conduit', 'other', 'pending'].includes(
+          String(raw.feederWiring),
+        )
           ? (raw.feederWiring as FeederWiring)
           : type === 'TS'
             ? 'pending'
@@ -971,233 +1057,263 @@ function normalizeProject(value: unknown, legacy = false) {
   const result = validateProjectStructure(value, { legacy });
   if (!result.ok) throw new Error(result.error);
   const data = result.data;
-  const sourcePanels = legacy ? [{ ...INITIAL_PANELS[0], ...data, id: 'tp', type: 'TP', parentId: null }] : data.panels;
+  const sourcePanels = legacy
+    ? [{ ...INITIAL_PANELS[0], ...data, id: 'tp', type: 'TP', parentId: null }]
+    : data.panels;
   const panels = normalizePanels(sourcePanels);
   if (!panels) throw new Error('Proyecto sin TP válido');
   return {
     panels,
     profile: normalizeProfile(data.profile),
     prices: normalizePrices(data.prices),
-    projectName: typeof data.projectName === 'string' && data.projectName.trim() ? data.projectName.trim() : 'Proyecto importado',
-    experienceMode: (data.experienceMode === 'technical' ? 'technical' : 'guided') as ExperienceMode,
-    activePanelId: panels.some((panel) => panel.id === data.activePanelId) ? String(data.activePanelId) : panels[0].id,
+    projectName:
+      typeof data.projectName === 'string' && data.projectName.trim()
+        ? data.projectName.trim()
+        : 'Proyecto importado',
+    experienceMode: (data.experienceMode === 'technical'
+      ? 'technical'
+      : 'guided') as ExperienceMode,
+    activePanelId: panels.some((panel) => panel.id === data.activePanelId)
+      ? String(data.activePanelId)
+      : panels[0].id,
   };
 }
 
-function ratingLabel(value: number | null | undefined) { return value == null ? 'Sin dimensionar' : `${value} A`; }
-
-function diagnosePanel(activePanel: Panel, calculations: PanelCalculation, panels: Panel[], panelCalculations: Map<string, PanelCalculation>) {
-  const tpPanel = panels.find((panel) => panel.type === 'TP') ?? activePanel;
-    const messages: string[] = [];
-    activePanel.circuits.forEach((circuit, index) => {
-      const circuitNumber = index + 1;
-      if (
-        (circuit.kind === 'IUG' || circuit.kind === 'TUG') &&
-        circuit.points > 15
-      ) {
-        messages.push(
-          `C${circuitNumber}: supera el criterio conservador de 15 bocas.`,
-        );
-      }
-      if (circuit.kind === 'TUE' && circuit.points > 12) {
-        messages.push(
-          `C${circuitNumber}: supera el límite reglamentario de 12 bocas para TUE (AEA 771, Tabla 771.13.I).`,
-        );
-      }
-      if (circuitCurrent(circuit, activePanel.supply) > circuit.breaker) {
-        messages.push(
-          `C${circuitNumber}: la corriente estimada supera la protección seleccionada.`,
-        );
-      }
-      const minimum = circuitRequirements(circuit.kind).minimumSectionMm2;
-      if (minimum !== null && circuit.conductor < minimum) messages.push(`C${circuitNumber}: sección ${circuit.conductor} mm² inferior al mínimo de ${minimum} mm² para ${circuit.kind}; revisar el circuito.`);
-      const cableCapacity = conductorAmpacity(
-        circuit.conductor,
-        circuit.phase === '3Φ',
-        circuit.ampacity,
-      );
-      if (!cableCapacity) {
-        messages.push(
-          `C${circuitNumber}: no hay capacidad preliminar para la sección seleccionada.`,
-        );
-      } else if (circuit.breaker > cableCapacity) {
-        messages.push(
-          `C${circuitNumber}: la térmica de ${circuit.breaker} A supera Iz preliminar ${cableCapacity} A; revisar sección y protección.`,
-        );
-      }
-      const circuitDropPercent = voltageDrop(
-        circuit,
-        activePanel.supply,
-      ).percent;
-      const totalDropPercent =
-        circuitDropPercent +
-        (activePanel.type === 'TS' ? calculations.feederDrop.percent : 0);
-      const criteria = voltageDropCriteria(activePanel.type, circuit.kind);
-      const terminalLimit = criteria.terminalLimitPercent;
-      const totalLimit = criteria.totalLimitPercent;
-      if (circuitDropPercent > terminalLimit) {
-        messages.push(
-          `C${circuitNumber}: caída del circuito ${circuitDropPercent.toFixed(1)} %; supera el criterio de diseño de ${terminalLimit} % desde el ${activePanel.type}.`,
-        );
-      }
-      if (circuitDropPercent > 2)
-        messages.push(
-          `C${circuitNumber}: además supera el 2 % indicado para cables de circuitos por la Ord. 72/83, III.2.9.4. Confirmar el criterio municipal del expediente.`,
-        );
-      if (totalDropPercent > totalLimit) {
-        messages.push(
-          `C${circuitNumber}: caída total estimada ${totalDropPercent.toFixed(1)} % (circuito + alimentador); supera ${totalLimit} %.`,
-        );
-      }
-    });
-
-    const feeders =
-      activePanel.type === 'TS'
-        ? [activePanel]
-        : panels.filter(
-            (panel) => panel.type === 'TS' && panel.parentId === activePanel.id,
-          );
-    for (const feeder of feeders) {
-      const feederCalculation = panelCalculations.get(feeder.id);
-      if (feederCalculation)
-        messages.push(
-          ...reviewFeeder(feeder, feederCalculation).issues.map(
-            (issue) => `Alimentador a ${feeder.name}: ${issue}`,
-          ),
-        );
-    }
-
-    if (activePanel.type === 'TS') {
-      const feederBreaker = activePanel.feederBreaker ?? 32;
-      const maxTerminalBreaker = activePanel.circuits.reduce(
-        (maximum, circuit) => Math.max(maximum, circuit.breaker),
-        0,
-      );
-      if (feederBreaker < maxTerminalBreaker) {
-        messages.push(
-          `Alimentador: revisar selectividad; su térmica de ${feederBreaker} A es menor que una protección terminal de ${maxTerminalBreaker} A.`,
-        );
-      }
-      if (tpPanel.supply === 'mono' && activePanel.supply === 'tri') {
-        messages.push(
-          'Incompatibilidad: un TP monofásico no puede alimentar un TS trifásico.',
-        );
-      }
-      if (
-        activePanel.supply === 'mono' &&
-        tpPanel.supply === 'tri' &&
-        !['L1', 'L2', 'L3'].includes(String(activePanel.feederPhase))
-      ) {
-        messages.push(
-          'Alimentador monofásico: seleccionar la fase L1, L2 o L3 del TP.',
-        );
-      }
-    }
-
-    if (calculations.imbalance > 0.2) {
-      messages.push('El desbalance de fases estimado supera el 20 %.');
-    }
-    if (calculations.mainBreaker === null) {
-      messages.push(
-        'Cabecera sin dimensionar: demanda o protección requerida fuera del rango modelado (125 A), o datos de alimentador incompletos.',
-      );
-    }
-    return messages;
+function ratingLabel(value: number | null | undefined) {
+  return value == null ? 'Sin dimensionar' : `${value} A`;
 }
 
-function diagnoseProject(panels: Panel[], profile: ProjectProfile, isPublicVenue: boolean) {
+function diagnosePanel(
+  activePanel: Panel,
+  calculations: PanelCalculation,
+  panels: Panel[],
+  panelCalculations: Map<string, PanelCalculation>,
+) {
+  const tpPanel = panels.find((panel) => panel.type === 'TP') ?? activePanel;
   const messages: string[] = [];
-    const tp = panels.find((panel) => panel.type === 'TP');
-    const sectionalPanels = tp
-      ? panels.filter(
-          (panel) => panel.type === 'TS' && panel.parentId === tp.id,
-        )
-      : [];
-    if (profile.breakingCapacityKa < profile.prospectiveShortCircuitKa) {
-      messages.push(
-        'El poder de corte declarado es menor que la corriente de cortocircuito presunta.',
-      );
-    }
-    if (profile.groundResistanceOhm > 10) {
-      messages.push(
-        'La resistencia de puesta a tierra supera 10 Ω, máximo indicado por la Ordenanza 72/83.',
-      );
-    }
-    const isAutonomousEmergency = profile.emergencySystem === 'autonomous';
+  activePanel.circuits.forEach((circuit, index) => {
+    const circuitNumber = index + 1;
+    messages.push(
+      ...mixedCircuitIssues(circuit).map(
+        (issue) => `C${circuitNumber}: ${issue}`,
+      ),
+    );
     if (
-      isPublicVenue &&
-      !isAutonomousEmergency &&
-      !panels.some((panel) =>
-        panel.circuits.some((circuit) => circuit.kind === 'EMG'),
-      )
+      (circuit.kind === 'IUG' || circuit.kind === 'TUG') &&
+      circuit.points > 15
     ) {
       messages.push(
-        'El proyecto de pública concurrencia no tiene ningún circuito de iluminación de emergencia (o seleccione modalidad de equipos autónomos si corresponde).',
+        `C${circuitNumber}: supera el criterio conservador de 15 bocas.`,
+      );
+    }
+    if (circuit.kind === 'TUE' && circuit.points > 12) {
+      messages.push(
+        `C${circuitNumber}: supera el límite reglamentario de 12 bocas para TUE (AEA 771, Tabla 771.13.I).`,
+      );
+    }
+    if (circuitCurrent(circuit, activePanel.supply) > circuit.breaker) {
+      messages.push(
+        `C${circuitNumber}: la corriente estimada supera la protección seleccionada.`,
+      );
+    }
+    const minimum = circuitRequirements(circuit.kind).minimumSectionMm2;
+    if (minimum !== null && circuit.conductor < minimum)
+      messages.push(
+        `C${circuitNumber}: sección ${circuit.conductor} mm² inferior al mínimo de ${minimum} mm² para ${circuit.kind}; revisar el circuito.`,
+      );
+    const cableCapacity = conductorAmpacity(
+      circuit.conductor,
+      circuit.phase === '3Φ',
+      circuit.ampacity,
+    );
+    if (!cableCapacity) {
+      messages.push(
+        `C${circuitNumber}: no hay capacidad preliminar para la sección seleccionada.`,
+      );
+    } else if (circuit.breaker > cableCapacity) {
+      messages.push(
+        `C${circuitNumber}: la térmica de ${circuit.breaker} A supera Iz preliminar ${cableCapacity} A; revisar sección y protección.`,
+      );
+    }
+    const circuitDropPercent = voltageDrop(circuit, activePanel.supply).percent;
+    const totalDropPercent =
+      circuitDropPercent +
+      (activePanel.type === 'TS' ? calculations.feederDrop.percent : 0);
+    const criteria = voltageDropCriteria(activePanel.type, circuit.kind);
+    const terminalLimit = criteria.terminalLimitPercent;
+    const totalLimit = criteria.totalLimitPercent;
+    if (circuitDropPercent > terminalLimit) {
+      messages.push(
+        `C${circuitNumber}: caída del circuito ${circuitDropPercent.toFixed(1)} %; supera el criterio de diseño de ${terminalLimit} % desde el ${activePanel.type}.`,
+      );
+    }
+    if (circuitDropPercent > 2)
+      messages.push(
+        `C${circuitNumber}: además supera el 2 % indicado para cables de circuitos por la Ord. 72/83, III.2.9.4. Confirmar el criterio municipal del expediente.`,
+      );
+    if (activePanel.type === 'TS' && totalDropPercent > totalLimit) {
+      messages.push(
+        `C${circuitNumber}: caída total estimada ${totalDropPercent.toFixed(1)} % (circuito + alimentador); supera ${totalLimit} %.`,
+      );
+    }
+  });
+
+  const feeders =
+    activePanel.type === 'TS'
+      ? [activePanel]
+      : panels.filter(
+          (panel) => panel.type === 'TS' && panel.parentId === activePanel.id,
+        );
+  for (const feeder of feeders) {
+    const feederCalculation = panelCalculations.get(feeder.id);
+    if (feederCalculation)
+      messages.push(
+        ...reviewFeeder(feeder, feederCalculation).issues.map(
+          (issue) => `Alimentador a ${feeder.name}: ${issue}`,
+        ),
+      );
+  }
+
+  if (activePanel.type === 'TS') {
+    const feederBreaker = activePanel.feederBreaker ?? 32;
+    const maxTerminalBreaker = activePanel.circuits.reduce(
+      (maximum, circuit) => Math.max(maximum, circuit.breaker),
+      0,
+    );
+    if (feederBreaker < maxTerminalBreaker) {
+      messages.push(
+        `Alimentador: revisar selectividad; su térmica de ${feederBreaker} A es menor que una protección terminal de ${maxTerminalBreaker} A.`,
+      );
+    }
+    if (tpPanel.supply === 'mono' && activePanel.supply === 'tri') {
+      messages.push(
+        'Incompatibilidad: un TP monofásico no puede alimentar un TS trifásico.',
       );
     }
     if (
-      isPublicVenue &&
-      isAutonomousEmergency &&
-      !panels.some((panel) =>
-        panel.circuits.some((circuit) => circuit.kind === 'IUG'),
-      )
+      activePanel.supply === 'mono' &&
+      tpPanel.supply === 'tri' &&
+      !['L1', 'L2', 'L3'].includes(String(activePanel.feederPhase))
     ) {
       messages.push(
-        'Emergencia autónoma: falta al menos un circuito de iluminación normal (IUG) para alimentar los cargadores de las luminarias autónomas.',
+        'Alimentador monofásico: seleccionar la fase L1, L2 o L3 del TP.',
       );
     }
-    if (isPublicVenue && !isAutonomousEmergency) {
-      const mixedPanels = panels.filter(
-        (panel) =>
-          panel.circuits.some((c) => c.kind === 'EMG') &&
-          panel.circuits.some((c) => c.kind !== 'EMG'),
-      );
-      for (const panel of mixedPanels) {
-        messages.push(
-          `${panel.name}: comparte circuitos normales y de emergencia centralizada en el mismo gabinete. Prohibido por AEA 718.556.5.2.12 (el sistema centralizado exige un Tablero de Emergencia TSE físicamente independiente y cañerías exclusivas). Para evitar el tablero y canalizaciones exclusivos, adopte Luminarias Autónomas (AEA 718.556.5.2.2).`,
-        );
-      }
-    }
-    if (isPublicVenue) {
-      if (profile.interiorCableStandard !== 'iram62267')
-        messages.push(
-          'Pública concurrencia: falta declarar cables interiores LSOH de baja emisión de humos y libres de halógenos (IRAM 62267) o justificar otra especificación con el profesional y la inspección.',
-        );
-      if (tp?.circuits.length)
-        messages.push(
-          'El TP del pilar conserva circuitos terminales. Para continuidad de servicio, revisar su traslado a un tablero interior con diferenciales sectorizados.',
-        );
-      for (const panel of panels.filter(
-        (item) => item.architecture === 'residential' && item.circuits.length,
-      )) {
-        messages.push(
-          `${panel.name}: arquitectura domiciliaria de ID único en pública concurrencia. No separa iluminación/tomas ni emergencia; revisar AEA 718 y Ordenanza 72/83. No se considera una solución validada para este salón.`,
-        );
-      }
-    }
-    if (tp && sectionalPanels.length) {
-      const tpMode = panelTpDifferentialMode(tp);
-      const allFeedersClassII = sectionalPanels.every(isClassIIFeeder);
-      if (tpMode === 'instant30')
-        messages.push(
-          'Riesgo de corte total: un diferencial instantáneo de 30 mA en el TP queda aguas arriba de los diferenciales interiores y puede apagar toda la instalación. Revisar selectividad y exigencias de la autoridad.',
-        );
-      if (tpMode === 'none' && !allFeedersClassII)
-        messages.push(
-          'TP sin diferencial general: al menos una línea seccional no tiene condición Clase II documentada. Confirmar protección contra contactos indirectos y criterio de la autoridad.',
-        );
-      if (tpMode === 'selective300')
-        messages.push(
-          'TP con diferencial selectivo de 300 mA: documentar curvas, tiempos y coordinación con los diferenciales de 30 mA aguas abajo; la etiqueta Tipo S no demuestra selectividad por sí sola.',
-        );
-    }
-    if (isPublicVenue && !emergencyAutonomyDeclared(profile))
+  }
+
+  if (calculations.imbalance > 0.2) {
+    messages.push('El desbalance de fases estimado supera el 20 %.');
+  }
+  if (calculations.mainBreaker === null) {
+    messages.push(
+      'Cabecera sin dimensionar: demanda o protección requerida fuera del rango modelado (125 A), o datos de alimentador incompletos.',
+    );
+  }
+  return messages;
+}
+
+function diagnoseProject(
+  panels: Panel[],
+  profile: ProjectProfile,
+  isPublicVenue: boolean,
+) {
+  const messages: string[] = [];
+  const tp = panels.find((panel) => panel.type === 'TP');
+  const sectionalPanels = tp
+    ? panels.filter((panel) => panel.type === 'TS' && panel.parentId === tp.id)
+    : [];
+  if (profile.breakingCapacityKa < profile.prospectiveShortCircuitKa) {
+    messages.push(
+      'El poder de corte declarado es menor que la corriente de cortocircuito presunta.',
+    );
+  }
+  if (profile.groundResistanceOhm > 10) {
+    messages.push(
+      'La resistencia de puesta a tierra supera 10 Ω, máximo indicado por la Ordenanza 72/83.',
+    );
+  }
+  const isAutonomousEmergency = profile.emergencySystem === 'autonomous';
+  if (
+    isPublicVenue &&
+    !isAutonomousEmergency &&
+    !panels.some((panel) =>
+      panel.circuits.some((circuit) => circuit.kind === 'EMG'),
+    )
+  ) {
+    messages.push(
+      'El proyecto de pública concurrencia no tiene ningún circuito de iluminación de emergencia (o seleccione modalidad de equipos autónomos si corresponde).',
+    );
+  }
+  if (
+    isPublicVenue &&
+    isAutonomousEmergency &&
+    !panels.some((panel) =>
+      panel.circuits.some(
+        (circuit) =>
+          circuit.kind === 'IUG' ||
+          (circuit.kind === 'MIX' &&
+            circuit.mixedLoads?.some(
+              (load) => load.kind === 'lighting' && load.points > 0,
+            )),
+      ),
+    )
+  ) {
+    messages.push(
+      'Emergencia autónoma: falta al menos un circuito de iluminación normal (IUG o mixto con iluminación) para alimentar los cargadores de las luminarias autónomas.',
+    );
+  }
+  if (isPublicVenue && !isAutonomousEmergency) {
+    const mixedPanels = panels.filter(
+      (panel) =>
+        panel.circuits.some((c) => c.kind === 'EMG') &&
+        panel.circuits.some((c) => c.kind !== 'EMG'),
+    );
+    for (const panel of mixedPanels) {
       messages.push(
-        isAutonomousEmergency
-          ? 'Emergencia autónoma: falta declarar autonomía ≥2 h y ficha técnica de los bloques autónomos (IRAM-AADL J 2027).'
-          : 'Emergencia: falta declarar autonomía ≥2 h y una referencia de ensayo/ficha. Un circuito EMG no demuestra autonomía ni iluminancia.',
+        `${panel.name}: comparte circuitos normales y de emergencia centralizada en el mismo gabinete. Prohibido por AEA 718.556.5.2.12 (el sistema centralizado exige un Tablero de Emergencia TSE físicamente independiente y cañerías exclusivas). Para evitar el tablero y canalizaciones exclusivos, adopte Luminarias Autónomas (AEA 718.556.5.2.2).`,
       );
-    return messages;
+    }
+  }
+  if (isPublicVenue) {
+    if (profile.interiorCableStandard !== 'iram62267')
+      messages.push(
+        'Pública concurrencia: falta declarar cables interiores LSOH de baja emisión de humos y libres de halógenos (IRAM 62267) o justificar otra especificación con el profesional y la inspección.',
+      );
+    if (tp?.circuits.length)
+      messages.push(
+        'El TP del pilar conserva circuitos terminales. Para continuidad de servicio, revisar su traslado a un tablero interior con diferenciales sectorizados.',
+      );
+    for (const panel of panels.filter(
+      (item) => item.architecture === 'residential' && item.circuits.length,
+    )) {
+      messages.push(
+        `${panel.name}: arquitectura domiciliaria de ID único en pública concurrencia. No separa iluminación/tomas ni emergencia; revisar AEA 718 y Ordenanza 72/83. No se considera una solución validada para este salón.`,
+      );
+    }
+  }
+  if (tp && sectionalPanels.length) {
+    const tpMode = panelTpDifferentialMode(tp);
+    const allFeedersClassII = sectionalPanels.every(isClassIIFeeder);
+    if (tpMode === 'instant30')
+      messages.push(
+        'Riesgo de corte total: un diferencial instantáneo de 30 mA en el TP queda aguas arriba de los diferenciales interiores y puede apagar toda la instalación. Revisar selectividad y exigencias de la autoridad.',
+      );
+    if (tpMode === 'none' && !allFeedersClassII)
+      messages.push(
+        'TP sin diferencial general: al menos una línea seccional no tiene condición Clase II documentada. Confirmar protección contra contactos indirectos y criterio de la autoridad.',
+      );
+    if (tpMode === 'selective300')
+      messages.push(
+        'TP con diferencial selectivo de 300 mA: documentar curvas, tiempos y coordinación con los diferenciales de 30 mA aguas abajo; la etiqueta Tipo S no demuestra selectividad por sí sola.',
+      );
+  }
+  if (isPublicVenue && !emergencyAutonomyDeclared(profile))
+    messages.push(
+      isAutonomousEmergency
+        ? 'Emergencia autónoma: falta declarar autonomía ≥2 h y ficha técnica de los bloques autónomos (IRAM-AADL J 2027).'
+        : 'Emergencia: falta declarar autonomía ≥2 h y una referencia de ensayo/ficha. Un circuito EMG no demuestra autonomía ni iluminancia.',
+    );
+  return messages;
 }
 
 function findProjectEmergencyCircuit(panels: Panel[]) {
@@ -1235,7 +1351,9 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const storageSnapshotRef = useRef<ProjectStorageSnapshot | null>(null);
   const navigationRef = useRef({ activePanelId, experienceMode });
-  useEffect(() => { navigationRef.current = { activePanelId, experienceMode }; }, [activePanelId, experienceMode]);
+  useEffect(() => {
+    navigationRef.current = { activePanelId, experienceMode };
+  }, [activePanelId, experienceMode]);
 
   function applyProject(project: ReturnType<typeof normalizeProject>) {
     setPanels(project.panels);
@@ -1247,16 +1365,28 @@ export default function Home() {
   }
 
   function reloadSavedProject() {
-    if (!window.confirm('Se descartarán los cambios de esta pestaña. Exportá primero el JSON si querés conservarlos. ¿Cargar el proyecto guardado?')) return;
+    if (
+      !window.confirm(
+        'Se descartarán los cambios de esta pestaña. Exportá primero el JSON si querés conservarlos. ¿Cargar el proyecto guardado?',
+      )
+    )
+      return;
     const stored = readStoredProject(() => window.localStorage);
     try {
-      if (stored.error || !stored.data) throw new Error(stored.error ?? 'No hay proyecto guardado.');
+      if (stored.error || !stored.data)
+        throw new Error(stored.error ?? 'No hay proyecto guardado.');
       const project = normalizeProject(stored.data, stored.legacy);
       storageSnapshotRef.current = stored.snapshot;
       applyProject(project);
       setPersistenceError(null);
       setStorageBlocked(false);
-    } catch (error) { setPersistenceError(error instanceof Error ? error.message : 'No se pudo cargar el proyecto.'); }
+    } catch (error) {
+      setPersistenceError(
+        error instanceof Error
+          ? error.message
+          : 'No se pudo cargar el proyecto.',
+      );
+    }
   }
 
   // Active panel helper
@@ -1282,8 +1412,11 @@ export default function Home() {
     let error = stored.error;
     let restored: ReturnType<typeof normalizeProject> | null = null;
     if (stored.data) {
-      try { restored = normalizeProject(stored.data, stored.legacy); }
-      catch (failure) { error = `Guardado inválido; no se sobrescribió. ${failure instanceof Error ? failure.message : ''} Exportá una copia antes de reemplazarlo.`; }
+      try {
+        restored = normalizeProject(stored.data, stored.legacy);
+      } catch (failure) {
+        error = `Guardado inválido; no se sobrescribió. ${failure instanceof Error ? failure.message : ''} Exportá una copia antes de reemplazarlo.`;
+      }
     }
     queueMicrotask(() => {
       if (restored) applyProject(restored);
@@ -1307,9 +1440,18 @@ export default function Home() {
     let cancelled = false;
     const save = () => {
       if (cancelled) return;
-      const result = saveStoredProjectIfUnchanged(() => window.localStorage, {
-        version: '3.0', ...navigationRef.current, profile, projectName, panels, prices,
-      }, storageSnapshotRef.current);
+      const result = saveStoredProjectIfUnchanged(
+        () => window.localStorage,
+        {
+          version: '3.0',
+          ...navigationRef.current,
+          profile,
+          projectName,
+          panels,
+          prices,
+        },
+        storageSnapshotRef.current,
+      );
       if (result.ok) storageSnapshotRef.current = result.snapshot;
       queueMicrotask(() => {
         if (cancelled) return;
@@ -1317,20 +1459,39 @@ export default function Home() {
         if (!result.ok) setStorageBlocked(true);
       });
     };
-    if (navigator.locks) void navigator.locks.request(STORAGE_KEY, save).catch(() => {
-      if (!cancelled) { setPersistenceError('No se pudo bloquear el guardado. Exportá el JSON para conservar los cambios.'); setStorageBlocked(true); }
-    });
+    if (navigator.locks)
+      void navigator.locks.request(STORAGE_KEY, save).catch(() => {
+        if (!cancelled) {
+          setPersistenceError(
+            'No se pudo bloquear el guardado. Exportá el JSON para conservar los cambios.',
+          );
+          setStorageBlocked(true);
+        }
+      });
     else save();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [panels, persistenceReady, prices, profile, projectName, storageBlocked]);
 
   useEffect(() => {
     const onStorage = (event: StorageEvent) => {
-      if (event.key !== null && event.key !== STORAGE_KEY && event.key !== LEGACY_STORAGE_KEY) return;
+      if (
+        event.key !== null &&
+        event.key !== STORAGE_KEY &&
+        event.key !== LEGACY_STORAGE_KEY
+      )
+        return;
       const latest = readStoredProject(() => window.localStorage);
-      if (JSON.stringify(latest.snapshot) === JSON.stringify(storageSnapshotRef.current)) return;
+      if (
+        JSON.stringify(latest.snapshot) ===
+        JSON.stringify(storageSnapshotRef.current)
+      )
+        return;
       setStorageBlocked(true);
-      setPersistenceError('Otra pestaña cambió el proyecto guardado. El guardado automático está pausado. Exportá los cambios de esta pestaña o cargá la versión guardada.');
+      setPersistenceError(
+        'Otra pestaña cambió el proyecto guardado. El guardado automático está pausado. Exportá los cambios de esta pestaña o cargá la versión guardada.',
+      );
     };
     window.addEventListener('storage', onStorage);
     return () => window.removeEventListener('storage', onStorage);
@@ -1603,7 +1764,12 @@ export default function Home() {
           )
         : 0;
       const maxBranchBreaker = Math.max(maxOutgoingBreaker, maxFeederBreaker);
-      const head = selectHeadDevice({ type: panel.type, current: mainCurrent, maxBranchBreaker, feederBreaker: panel.feederBreaker });
+      const head = selectHeadDevice({
+        type: panel.type,
+        current: mainCurrent,
+        maxBranchBreaker,
+        feederBreaker: panel.feederBreaker,
+      });
       const currentBasedBreaker = head.currentBasedRating;
       const mainBreaker = head.rating;
       const includeDps = panelHasDps(panel);
@@ -1728,10 +1894,43 @@ export default function Home() {
   const areaPerPerson =
     profile.occupancy > 0 ? projectArea / profile.occupancy : 0;
 
-  const projectDiagnostics = useMemo(() => diagnoseProject(panels, profile, isPublicVenue), [panels, profile, isPublicVenue]);
-  const panelDiagnostics = useMemo(() => new Map(panels.map((panel) => [panel.id, diagnosePanel(panel, panelCalculations.get(panel.id)!, panels, panelCalculations)])), [panels, panelCalculations]);
-  const warnings = useMemo(() => [...(panelDiagnostics.get(activePanel.id) ?? []), ...projectDiagnostics], [activePanel.id, panelDiagnostics, projectDiagnostics]);
-  const projectWarnings = useMemo(() => [...projectDiagnostics, ...panels.flatMap((panel) => (panelDiagnostics.get(panel.id) ?? []).map((message) => `${panel.name}: ${message}`))], [panels, panelDiagnostics, projectDiagnostics]);
+  const projectDiagnostics = useMemo(
+    () => diagnoseProject(panels, profile, isPublicVenue),
+    [panels, profile, isPublicVenue],
+  );
+  const panelDiagnostics = useMemo(
+    () =>
+      new Map(
+        panels.map((panel) => [
+          panel.id,
+          diagnosePanel(
+            panel,
+            panelCalculations.get(panel.id)!,
+            panels,
+            panelCalculations,
+          ),
+        ]),
+      ),
+    [panels, panelCalculations],
+  );
+  const warnings = useMemo(
+    () => [
+      ...(panelDiagnostics.get(activePanel.id) ?? []),
+      ...projectDiagnostics,
+    ],
+    [activePanel.id, panelDiagnostics, projectDiagnostics],
+  );
+  const projectWarnings = useMemo(
+    () => [
+      ...projectDiagnostics,
+      ...panels.flatMap((panel) =>
+        (panelDiagnostics.get(panel.id) ?? []).map(
+          (message) => `${panel.name}: ${message}`,
+        ),
+      ),
+    ],
+    [panels, panelDiagnostics, projectDiagnostics],
+  );
 
   const emgCircuitInfo = findProjectEmergencyCircuit(panels);
 
@@ -2086,7 +2285,8 @@ export default function Home() {
             supply: config.supply,
             architecture: config.architecture,
             differentialType: config.differentialType,
-            feederPhase: config.supply === 'tri' ? ('3Φ' as Phase) : ('L1' as Phase),
+            feederPhase:
+              config.supply === 'tri' ? ('3Φ' as Phase) : ('L1' as Phase),
             feederWiring: 'classII-conduit' as FeederWiring,
             circuits: nextCircuits.map((circuit) => ({
               ...circuit,
@@ -2167,7 +2367,14 @@ export default function Home() {
       'circuits',
       activePanel.circuits.map((circuit) => {
         if (circuit.id !== id) return circuit;
-        const next = { ...circuit, [key]: value };
+        const next =
+          key === 'kind'
+            ? changeCircuitKind(circuit, value as CircuitKind)
+            : { ...circuit, [key]: value };
+        if (next.kind === 'MIX' && key === 'mixedLoads')
+          Object.assign(next, mixedCircuitFields(value as MixedLoad[]));
+        if (key === 'points')
+          next.points = Math.round(finiteNumber(value, circuit.points, 0));
         if (
           (key === 'conductor' || key === 'phase') &&
           value !== circuit[key] &&
@@ -2200,13 +2407,15 @@ export default function Home() {
       conductor: template.conductor,
       lengthM: template.lengthM,
       modules: template.modules,
+      ...(template.mixedLoads
+        ? { mixedLoads: structuredClone(template.mixedLoads) }
+        : {}),
     };
     updateActivePanel('circuits', [...activePanel.circuits, newCircuit]);
   }
 
   function duplicateCircuit(circuit: Circuit) {
-    const newId =
-      nextCircuitId(activePanel.circuits.map((item) => item.id));
+    const newId = nextCircuitId(activePanel.circuits.map((item) => item.id));
     const duplicated: Circuit = {
       ...circuit,
       id: newId,
@@ -2290,11 +2499,20 @@ export default function Home() {
         circuit.phase === '3Φ',
         circuit.ampacity,
       );
-      const selected = selectPreliminaryBreaker(
+      let selected = selectPreliminaryBreaker(
         current,
         capacity ?? NaN,
         circuit.breaker,
+        circuit.kind === 'MIX'
+          ? CIRCUIT_BREAKERS.filter((rating) => rating <= 15)
+          : CIRCUIT_BREAKERS,
       );
+      if (circuit.kind === 'MIX' && selected !== null && selected > 15)
+        selected = null;
+      if (circuit.kind === 'MIX' && circuitPower(circuit) / 220 > 6)
+        pending.push(
+          `C${index + 1}: el mixto supera 6 A; revisar o separar sus cargas`,
+        );
       if (selected === null) {
         pending.push(
           `C${index + 1}: sin térmica compatible con Ib ${formatNumber(current)} A e Iz preliminar ${capacity ?? 'desconocida'} A; revisar carga y cable`,
@@ -2316,8 +2534,20 @@ export default function Home() {
   }
 
   function resetProject() {
-    if (!window.confirm('¿Restablecer el proyecto? Se reemplazarán todos los tableros, circuitos y precios. Exportá un JSON antes si querés conservarlos.')) return;
-    applyProject({ panels: INITIAL_PANELS, profile: INITIAL_PROFILE, prices: DEFAULT_PRICES, projectName: 'IGLESIA · SALÓN 24 × 10 m', experienceMode, activePanelId: 'ts1' });
+    if (
+      !window.confirm(
+        '¿Restablecer el proyecto? Se reemplazarán todos los tableros, circuitos y precios. Exportá un JSON antes si querés conservarlos.',
+      )
+    )
+      return;
+    applyProject({
+      panels: INITIAL_PANELS,
+      profile: INITIAL_PROFILE,
+      prices: DEFAULT_PRICES,
+      projectName: 'IGLESIA · SALÓN 24 × 10 m',
+      experienceMode,
+      activePanelId: 'ts1',
+    });
     setOptimizationMessage('Proyecto restablecido.');
   }
 
@@ -2351,9 +2581,15 @@ export default function Home() {
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
-        const project = normalizeProject(JSON.parse(e.target?.result as string));
+        const project = normalizeProject(
+          JSON.parse(e.target?.result as string),
+        );
         applyProject(project);
-        setOptimizationMessage(storageBlocked ? 'Proyecto importado en memoria. El guardado sigue pausado; exportá el JSON para conservarlo.' : 'Proyecto importado correctamente.');
+        setOptimizationMessage(
+          storageBlocked
+            ? 'Proyecto importado en memoria. El guardado sigue pausado; exportá el JSON para conservarlo.'
+            : 'Proyecto importado correctamente.',
+        );
       } catch (error) {
         alert(
           `Error al leer el proyecto: ${error instanceof Error ? error.message : 'formato inválido'}.`,
@@ -2389,6 +2625,7 @@ export default function Home() {
         'P instalada [W]',
         'Cañería declarada',
         'Especificación de cable / aislación',
+        'Detalle de cargas',
       ],
     ];
     const rounded = (value: number) => Number(value.toFixed(2));
@@ -2421,6 +2658,7 @@ export default function Home() {
               rounded(childCalculation?.activeInstalledW ?? 0),
               child.feederConduit ?? '',
               feederWiringLabel(child),
+              '',
             ]);
           });
       }
@@ -2439,8 +2677,8 @@ export default function Home() {
           `C${index + 1}`,
           c.name,
           c.kind,
-          c.points,
-          c.unitVA,
+          circuitPointCount(c),
+          c.kind === 'MIX' ? '' : c.unitVA,
           power,
           circuitPhaseLabel(panel, c),
           rounded(current),
@@ -2458,6 +2696,7 @@ export default function Home() {
             : profile.interiorCableStandard === 'other'
               ? 'Otra especificación declarada'
               : 'Pendiente',
+          circuitLoadDescription(c),
         ]);
       });
     });
@@ -2582,7 +2821,12 @@ export default function Home() {
           >
             <span>{persistenceError}</span>
             {storageBlocked && (
-              <Button type="button" size="sm" variant="outline" onClick={reloadSavedProject}>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={reloadSavedProject}
+              >
                 Cargar versión guardada
               </Button>
             )}
@@ -2700,8 +2944,11 @@ export default function Home() {
                           {calc.occupiedModules} M
                         </p>
                       )}
-                      <p className={`text-[9px] ${isActive ? 'text-slate-800' : 'text-slate-400'}`}>
-                        {(panelDiagnostics.get(p.id)?.length ?? 0) + projectDiagnostics.length}{' '}
+                      <p
+                        className={`text-[9px] ${isActive ? 'text-slate-800' : 'text-slate-400'}`}
+                      >
+                        {(panelDiagnostics.get(p.id)?.length ?? 0) +
+                          projectDiagnostics.length}{' '}
                         alertas en este tablero
                       </p>
                     </div>
@@ -3000,7 +3247,10 @@ export default function Home() {
                     onChange={(val) => updateActivePanel('feederLengthM', val)}
                   />
                   <div className="space-y-1.5">
-                    <Label htmlFor="feeder-section" className="text-xs text-muted-foreground">
+                    <Label
+                      htmlFor="feeder-section"
+                      className="text-xs text-muted-foreground"
+                    >
                       Sección alimentador
                     </Label>
                     <NativeSelect
@@ -3022,7 +3272,10 @@ export default function Home() {
                     </NativeSelect>
                   </div>
                   <div className="space-y-1.5">
-                    <Label htmlFor="feeder-breaker" className="text-xs text-muted-foreground">
+                    <Label
+                      htmlFor="feeder-breaker"
+                      className="text-xs text-muted-foreground"
+                    >
                       Térmica en el TP para este alimentador
                     </Label>
                     <NativeSelect
@@ -3044,7 +3297,10 @@ export default function Home() {
                     </NativeSelect>
                   </div>
                   <div className="space-y-1.5">
-                    <Label htmlFor="feeder-phase" className="text-xs text-muted-foreground">
+                    <Label
+                      htmlFor="feeder-phase"
+                      className="text-xs text-muted-foreground"
+                    >
                       Fase tomada del TP
                     </Label>
                     <NativeSelect
@@ -3331,7 +3587,10 @@ export default function Home() {
                 </div>
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor="tp-differential-mode" className="text-sm text-sky-100">
+                <Label
+                  htmlFor="tp-differential-mode"
+                  className="text-sm text-sky-100"
+                >
                   Decisión de proyecto
                 </Label>
                 <NativeSelect
@@ -3376,7 +3635,8 @@ export default function Home() {
                 className={
                   panelTpDifferentialMode(activePanel) === 'instant30'
                     ? 'border-red-300 bg-red-50 text-red-900'
-                    : childPanels.length > 0 && childPanels.every(isClassIIFeeder)
+                    : childPanels.length > 0 &&
+                        childPanels.every(isClassIIFeeder)
                       ? 'border-emerald-300 bg-emerald-50 text-emerald-900'
                       : 'border-amber-300 bg-amber-50 text-amber-900'
                 }
@@ -3392,83 +3652,86 @@ export default function Home() {
         )}
 
         {(activePanel.type !== 'TP' || activePanel.circuits.length > 0) && (
-        <section className="mb-5 rounded-2xl border bg-card p-4 shadow-sm">
-          <Label
-            htmlFor="architecture-choice"
-            className="text-base font-semibold"
-          >
-            Arquitectura de diferenciales · {activePanel.name}
-          </Label>
-          <NativeSelect
-            id="architecture-choice"
-            className="mt-3 w-full"
-            value={activePanel.architecture}
-            onChange={(event) =>
-              updateActivePanel(
-                'architecture',
-                event.target.value as Architecture,
-              )
-            }
-          >
-            {costOptions
-              .filter((option) => option.id !== 'continuity')
-              .map((option) => (
-                <NativeSelectOption key={option.id} value={option.id}>
-                  {option.title} · {option.differentialCount} disyuntor
-                  {option.differentialCount === 1 ? '' : 'es'}
-                </NativeSelectOption>
-              ))}
-            {activePanel.architecture === 'continuity' && (
-              <NativeSelectOption value="continuity">
-                Legado · ID por circuito (conservado)
-              </NativeSelectOption>
-            )}
-          </NativeSelect>
-          <p className="mt-3 text-sm font-semibold">
-            {selectedCost.differentialCount} diferenciales terminales en este tablero ·{' '}
-            {panels.reduce(
-              (sum, panel) => sum + panelDifferentialCount(panel),
-              0,
-            )}{' '}
-            en el proyecto
-          </p>
-          <p className="mt-1 text-sm">{selectedCost.continuity}</p>
-          <div className="mt-3 flex flex-wrap gap-2">
-            {selectedCost.groups.map((group) => (
-              <span
-                key={group.label}
-                className="rounded-lg border bg-muted/40 px-3 py-2 text-xs"
-              >
-                <strong>{group.label}:</strong>{' '}
-                {group.circuits.join(' · ') || 'reservado, sin circuitos'}
-              </span>
-            ))}
-          </div>
-          <p className="mt-3 text-xs text-muted-foreground">
-            La elección corresponde a este tablero, no reemplaza las opciones de
-            los demás TP/TS. Grupos reservados incluidos en módulos y precio.
-            Sin circuitos propios: 0 ID terminales; la protección del
-            alimentador se verifica aparte. Asignación según tipo
-            IUG/TUG/TUE/FM/EMG, no según nombre.
-          </p>
-          {isPublicVenue && activePanel.architecture === 'residential' && (
-            <p
-              role="alert"
-              className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm font-semibold text-amber-950"
+          <section className="mb-5 rounded-2xl border bg-card p-4 shadow-sm">
+            <Label
+              htmlFor="architecture-choice"
+              className="text-base font-semibold"
             >
-              Atención: opción domiciliaria en salón de pública concurrencia. Un
-              único ID corta también la emergencia si está conectada al tablero.
-              Elegí una arquitectura con EMG independiente y verificá el
-              proyecto; esta opción no se presenta como cumplimiento AEA 718.
+              Arquitectura de diferenciales · {activePanel.name}
+            </Label>
+            <NativeSelect
+              id="architecture-choice"
+              className="mt-3 w-full"
+              value={activePanel.architecture}
+              onChange={(event) =>
+                updateActivePanel(
+                  'architecture',
+                  event.target.value as Architecture,
+                )
+              }
+            >
+              {costOptions
+                .filter((option) => option.id !== 'continuity')
+                .map((option) => (
+                  <NativeSelectOption key={option.id} value={option.id}>
+                    {option.title} · {option.differentialCount} disyuntor
+                    {option.differentialCount === 1 ? '' : 'es'}
+                  </NativeSelectOption>
+                ))}
+              {activePanel.architecture === 'continuity' && (
+                <NativeSelectOption value="continuity">
+                  Legado · ID por circuito (conservado)
+                </NativeSelectOption>
+              )}
+            </NativeSelect>
+            <p className="mt-3 text-sm font-semibold">
+              {selectedCost.differentialCount} diferenciales terminales en este
+              tablero ·{' '}
+              {panels.reduce(
+                (sum, panel) => sum + panelDifferentialCount(panel),
+                0,
+              )}{' '}
+              en el proyecto
             </p>
-          )}
-          {activePanel.architecture === 'continuity' && (
-            <p className="mt-3 text-xs text-amber-800">
-              Configuración anterior conservada sin quitar equipos. Elegir una
-              de las tres opciones reemplazará la agrupación de este tablero.
+            <p className="mt-1 text-sm">{selectedCost.continuity}</p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {selectedCost.groups.map((group) => (
+                <span
+                  key={group.label}
+                  className="rounded-lg border bg-muted/40 px-3 py-2 text-xs"
+                >
+                  <strong>{group.label}:</strong>{' '}
+                  {group.circuits.join(' · ') || 'reservado, sin circuitos'}
+                </span>
+              ))}
+            </div>
+            <p className="mt-3 text-xs text-muted-foreground">
+              La elección corresponde a este tablero, no reemplaza las opciones
+              de los demás TP/TS. Grupos reservados incluidos en módulos y
+              precio. Sin circuitos propios: 0 ID terminales; la protección del
+              alimentador se verifica aparte. Asignación según tipo
+              IUG/TUG/TUE/MIX/FM/EMG, no según nombre. Los mixtos se agrupan con
+              tomas y equipos; una falla de ese grupo también corta sus luces.
             </p>
-          )}
-        </section>
+            {isPublicVenue && activePanel.architecture === 'residential' && (
+              <p
+                role="alert"
+                className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm font-semibold text-amber-950"
+              >
+                Atención: opción domiciliaria en salón de pública concurrencia.
+                Un único ID corta también la emergencia si está conectada al
+                tablero. Elegí una arquitectura con EMG independiente y verificá
+                el proyecto; esta opción no se presenta como cumplimiento AEA
+                718.
+              </p>
+            )}
+            {activePanel.architecture === 'continuity' && (
+              <p className="mt-3 text-xs text-amber-800">
+                Configuración anterior conservada sin quitar equipos. Elegir una
+                de las tres opciones reemplazará la agrupación de este tablero.
+              </p>
+            )}
+          </section>
         )}
 
         {/* Panel Metrics */}
@@ -3549,7 +3812,8 @@ export default function Home() {
                     onClick={() => addCircuit(kind)}
                     title={TEMPLATES[kind].label}
                   >
-                    <Plus data-icon="inline-start" /> {kind}
+                    <Plus data-icon="inline-start" />{' '}
+                    {kind === 'MIX' ? 'Mixto' : kind}
                   </Button>
                 ))}
               </div>
@@ -3654,31 +3918,46 @@ export default function Home() {
                             {(Object.keys(TEMPLATES) as CircuitKind[]).map(
                               (kind) => (
                                 <NativeSelectOption key={kind} value={kind}>
-                                  {kind}
+                                  {kind === 'MIX' ? 'MIX · Mixto' : kind}
                                 </NativeSelectOption>
                               ),
                             )}
                           </NativeSelect>
                         </td>
                         <td className="px-2 py-2">
-                          <CompactNumber
-                            label={`Bocas de ${circuit.name}`}
-                            value={circuit.points}
-                            min={1}
-                            onChange={(value) =>
-                              updateCircuit(circuit.id, 'points', value)
-                            }
-                          />
+                          {circuit.kind === 'MIX' ? (
+                            <span className="block text-right font-mono text-xs">
+                              {circuitPointCount(circuit)}
+                            </span>
+                          ) : (
+                            <CompactNumber
+                              label={`Bocas de ${circuit.name}`}
+                              value={circuit.points}
+                              min={1}
+                              onChange={(value) =>
+                                updateCircuit(circuit.id, 'points', value)
+                              }
+                            />
+                          )}
                         </td>
                         <td className="px-2 py-2">
-                          <CompactNumber
-                            label={`VA por boca de ${circuit.name}`}
-                            value={circuit.unitVA}
-                            min={1}
-                            onChange={(value) =>
-                              updateCircuit(circuit.id, 'unitVA', value)
-                            }
-                          />
+                          {circuit.kind === 'MIX' ? (
+                            <a
+                              href={`#mixed-${circuit.id}`}
+                              className="text-xs font-semibold text-sky-700 underline dark:text-sky-300"
+                            >
+                              Editar cargas ↓
+                            </a>
+                          ) : (
+                            <CompactNumber
+                              label={`VA por boca de ${circuit.name}`}
+                              value={circuit.unitVA}
+                              min={1}
+                              onChange={(value) =>
+                                updateCircuit(circuit.id, 'unitVA', value)
+                              }
+                            />
+                          )}
                         </td>
                         <td className="px-2 py-2 text-right font-mono text-xs font-semibold">
                           {formatPower(circuitPower(circuit))}
@@ -3739,11 +4018,15 @@ export default function Home() {
                               )
                             }
                           >
-                            {STANDARD_BREAKERS.map((value) => (
-                              <NativeSelectOption key={value} value={value}>
-                                {value} A
-                              </NativeSelectOption>
-                            ))}
+                            {Array.from(
+                              new Set([...CIRCUIT_BREAKERS, circuit.breaker]),
+                            )
+                              .sort((a, b) => a - b)
+                              .map((value) => (
+                                <NativeSelectOption key={value} value={value}>
+                                  {value} A
+                                </NativeSelectOption>
+                              ))}
                           </NativeSelect>
                         </td>
                         <td className="px-2 py-2">
@@ -3760,11 +4043,13 @@ export default function Home() {
                               )
                             }
                           >
-                            {Object.keys(CONDUCTOR_CAPACITY).map((value) => (
-                              <NativeSelectOption key={value} value={value}>
-                                {value} mm²
-                              </NativeSelectOption>
-                            ))}
+                            {Object.keys(CONDUCTOR_CAPACITY)
+                              .sort((a, b) => Number(a) - Number(b))
+                              .map((value) => (
+                                <NativeSelectOption key={value} value={value}>
+                                  {value} mm²
+                                </NativeSelectOption>
+                              ))}
                           </NativeSelect>
                         </td>
                         {experienceMode === 'technical' && (
@@ -3844,6 +4129,28 @@ export default function Home() {
               </table>
             </div>
 
+            {activePanel.circuits.some((circuit) => circuit.kind === 'MIX') && (
+              <div className="space-y-3 border-t p-4">
+                {activePanel.circuits
+                  .filter((circuit) => circuit.kind === 'MIX')
+                  .map((circuit) => (
+                    <div
+                      key={circuit.id}
+                      id={`mixed-${circuit.id}`}
+                      className="scroll-mt-32"
+                    >
+                      <MixedCircuitEditor
+                        name={circuit.name}
+                        loads={circuit.mixedLoads ?? []}
+                        onChange={(loads) =>
+                          updateCircuit(circuit.id, 'mixedLoads', loads)
+                        }
+                      />
+                    </div>
+                  ))}
+              </div>
+            )}
+
             <div className="border-t bg-muted/20 p-4">
               <p className="mb-3 text-xs leading-relaxed text-muted-foreground">
                 Iz usa la ficha de referencia Cu/PVC en cañería o el valor
@@ -3911,6 +4218,7 @@ export default function Home() {
                 devices={devices}
                 rows={calculations.rows}
                 modulesPerRow={activePanel.modulesPerRow}
+                reservePercent={activePanel.reservePercent}
                 panelType={activePanel.type}
                 hasDps={panelHasDps(activePanel)}
                 hasFeeders={childPanels.length > 0}
@@ -4044,29 +4352,36 @@ export default function Home() {
                   />
                 </div>
                 <div className="mt-3 grid gap-3 sm:grid-cols-[160px_1fr]">
-                  <label htmlFor={`fp-${circuit.id}`} className="text-xs">
-                    Factor de potencia declarado
-                    <Input
-                      id={`fp-${circuit.id}`}
-                      type="number"
-                      min="0.1"
-                      max="1"
-                      step="0.01"
-                      value={circuit.powerFactor}
-                      onChange={(e) =>
-                        updateCircuit(
-                          circuit.id,
-                          'powerFactor',
-                          finiteNumber(
-                            e.target.value,
-                            circuit.powerFactor,
-                            0.1,
-                            1,
-                          ),
-                        )
-                      }
-                    />
-                  </label>
+                  {circuit.kind === 'MIX' ? (
+                    <p className="text-xs text-muted-foreground">
+                      FP equivalente: {formatNumber(circuit.powerFactor, 3)}.
+                      Editá el FP de cada carga en el detalle del mixto.
+                    </p>
+                  ) : (
+                    <label htmlFor={`fp-${circuit.id}`} className="text-xs">
+                      Factor de potencia declarado
+                      <Input
+                        id={`fp-${circuit.id}`}
+                        type="number"
+                        min="0.1"
+                        max="1"
+                        step="0.01"
+                        value={circuit.powerFactor}
+                        onChange={(e) =>
+                          updateCircuit(
+                            circuit.id,
+                            'powerFactor',
+                            finiteNumber(
+                              e.target.value,
+                              circuit.powerFactor,
+                              0.1,
+                              1,
+                            ),
+                          )
+                        }
+                      />
+                    </label>
+                  )}
                   <label htmlFor={`conduit-${circuit.id}`} className="text-xs">
                     Cañería: material, diámetro y referencia
                     <Input
@@ -4089,25 +4404,33 @@ export default function Home() {
           <section className="mt-5 rounded-2xl border border-amber-300 bg-amber-50 p-4 text-amber-950">
             <h2 className="font-semibold">Emergencia · autonomía declarada</h2>
             <p className="mt-1 text-xs">
-              Ord. 72/83, III.2.22 y AEA 718: para locales de pública concurrencia, autonomía mínima
-              de 2 h. Seleccionar la modalidad del sistema y declarar la referencia técnica.
+              Ord. 72/83, III.2.22 y AEA 718: para locales de pública
+              concurrencia, autonomía mínima de 2 h. Seleccionar la modalidad
+              del sistema y declarar la referencia técnica.
             </p>
             <div className="mt-3">
-              <label htmlFor="emergency-system" className="text-xs font-semibold">
+              <label
+                htmlFor="emergency-system"
+                className="text-xs font-semibold"
+              >
                 Modalidad del sistema de emergencia
                 <NativeSelect
                   id="emergency-system"
                   value={profile.emergencySystem ?? 'centralized'}
                   onChange={(e) =>
-                    handleEmergencySystemChange(e.target.value as EmergencySystem)
+                    handleEmergencySystemChange(
+                      e.target.value as EmergencySystem,
+                    )
                   }
                   className="mt-1 w-full bg-white text-slate-900"
                 >
                   <NativeSelectOption value="centralized">
-                    Circuito centralizado de emergencia (circuito EMG dedicado en tablero)
+                    Circuito centralizado de emergencia (circuito EMG dedicado
+                    en tablero)
                   </NativeSelectOption>
                   <NativeSelectOption value="autonomous">
-                    Equipos autónomos con batería (AEA 718.556.5.2.2 / IRAM-AADL J 2027)
+                    Equipos autónomos con batería (AEA 718.556.5.2.2 / IRAM-AADL
+                    J 2027)
                   </NativeSelectOption>
                 </NativeSelect>
               </label>
@@ -4118,34 +4441,63 @@ export default function Home() {
                   💡 Exención reglamentaria (AEA 718.556.5.2.2 y 718.556.6.1.9):
                 </p>
                 <p className="mt-1 text-sky-800 leading-relaxed">
-                  Al adoptar equipos autónomos con batería incorporada (IRAM-AADL J 2027), la instalación queda <strong>eximida de poseer Tablero de Emergencia exclusivo y cañerías independientes</strong>. Los cargadores se alimentan directamente desde los circuitos de iluminación normal (IUG) del sector.
+                  Al adoptar equipos autónomos con batería incorporada
+                  (IRAM-AADL J 2027), la instalación queda{' '}
+                  <strong>
+                    eximida de poseer Tablero de Emergencia exclusivo y cañerías
+                    independientes
+                  </strong>
+                  . Los cargadores se alimentan directamente desde los circuitos
+                  de iluminación normal (IUG) del sector.
                 </p>
               </div>
             ) : (
               <div className="mt-2.5 rounded-xl border border-amber-300 bg-amber-50/90 p-3 text-xs text-amber-950">
                 <p className="font-semibold text-amber-900">
-                  🏛️ Exigencias del sistema centralizado (AEA 718.556.5.2.2, 718.556.5.2.12 y Ord. 72/83):
+                  🏛️ Exigencias del sistema centralizado (AEA 718.556.5.2.2,
+                  718.556.5.2.12 y Ord. 72/83):
                 </p>
                 <ul className="mt-1 list-disc pl-4 space-y-0.5 text-amber-800 leading-relaxed">
-                  <li><strong>Tablero exclusivo:</strong> Prohibido compartir el mismo tablero con circuitos normales, aun en cubicles separados (718.556.5.2.12). Exige Tablero de Emergencia (TSE) físicamente independiente.</li>
-                  <li><strong>Canalizaciones exclusivas:</strong> Cañerías y conductos 100 % independientes, sin compartir caños ni cajas de paso con cargas normales (718.556.6.1.3 y Ord. 72/83 Art. III.2.22.8).</li>
-                  <li><strong>Corte Bomberos:</strong> Interruptor general de corte para bomberos con cartel rojo a ≤ 5 m del acceso principal (718.556.5.2.3).</li>
+                  <li>
+                    <strong>Tablero exclusivo:</strong> Prohibido compartir el
+                    mismo tablero con circuitos normales, aun en cubicles
+                    separados (718.556.5.2.12). Exige Tablero de Emergencia
+                    (TSE) físicamente independiente.
+                  </li>
+                  <li>
+                    <strong>Canalizaciones exclusivas:</strong> Cañerías y
+                    conductos 100 % independientes, sin compartir caños ni cajas
+                    de paso con cargas normales (718.556.6.1.3 y Ord. 72/83 Art.
+                    III.2.22.8).
+                  </li>
+                  <li>
+                    <strong>Corte Bomberos:</strong> Interruptor general de
+                    corte para bomberos con cartel rojo a ≤ 5 m del acceso
+                    principal (718.556.5.2.3).
+                  </li>
                 </ul>
               </div>
             )}
 
-            {profile.emergencySystem === 'centralized' && (
-              emgCircuitInfo ? (
+            {profile.emergencySystem === 'centralized' &&
+              (emgCircuitInfo ? (
                 emgCircuitInfo.isMixed ? (
                   <div className="mt-2.5 flex flex-col gap-2 rounded-xl border border-amber-400 bg-amber-100/95 p-3 text-xs text-amber-950">
                     <div className="flex items-start gap-2">
                       <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-700" />
                       <div>
                         <p className="font-semibold text-amber-900">
-                          Infracción AEA 718.556.5.2.12: Gabinete compartido en {emgCircuitInfo.panel.name}
+                          Infracción AEA 718.556.5.2.12: Gabinete compartido en{' '}
+                          {emgCircuitInfo.panel.name}
                         </p>
                         <p className="mt-0.5 text-amber-800 leading-relaxed">
-                          El circuito centralizado de emergencia está dentro del mismo tablero que los circuitos normales. La reglamentación exige un <strong>Tablero de Emergencia (TSE) físicamente separado</strong>.
+                          El circuito centralizado de emergencia está dentro del
+                          mismo tablero que los circuitos normales. La
+                          reglamentación exige un{' '}
+                          <strong>
+                            Tablero de Emergencia (TSE) físicamente separado
+                          </strong>
+                          .
                         </p>
                       </div>
                     </div>
@@ -4163,7 +4515,9 @@ export default function Home() {
                         size="sm"
                         variant="outline"
                         className="bg-white text-amber-950 border-amber-400 hover:bg-amber-50"
-                        onClick={() => handleEmergencySystemChange('autonomous')}
+                        onClick={() =>
+                          handleEmergencySystemChange('autonomous')
+                        }
                       >
                         Cambiar a Luminarias Autónomas (exentas de tablero)
                       </Button>
@@ -4175,10 +4529,18 @@ export default function Home() {
                       <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-700" />
                       <div>
                         <p className="font-semibold text-emerald-900">
-                          Tablero de Emergencia exclusivo (TSE) conforme a AEA 718.556.5.2.12
+                          Tablero de Emergencia exclusivo (TSE) conforme a AEA
+                          718.556.5.2.12
                         </p>
                         <p className="mt-0.5 text-emerald-800">
-                          Ubicado en <strong>{emgCircuitInfo.panel.name}</strong> · C{emgCircuitInfo.circuitNumber}: {emgCircuitInfo.circuit.name} (TM {emgCircuitInfo.circuit.breaker} A · cable {emgCircuitInfo.circuit.conductor} mm² · {emgCircuitInfo.circuit.phase}). Gabinete y cañería independientes de la instalación normal.
+                          Ubicado en{' '}
+                          <strong>{emgCircuitInfo.panel.name}</strong> · C
+                          {emgCircuitInfo.circuitNumber}:{' '}
+                          {emgCircuitInfo.circuit.name} (TM{' '}
+                          {emgCircuitInfo.circuit.breaker} A · cable{' '}
+                          {emgCircuitInfo.circuit.conductor} mm² ·{' '}
+                          {emgCircuitInfo.circuit.phase}). Gabinete y cañería
+                          independientes de la instalación normal.
                         </p>
                       </div>
                     </div>
@@ -4188,7 +4550,9 @@ export default function Home() {
                         size="sm"
                         variant="outline"
                         className="mt-1 sm:mt-0 shrink-0 bg-white text-emerald-900 border-emerald-300 hover:bg-emerald-100"
-                        onClick={() => setActivePanelId(emgCircuitInfo.panel.id)}
+                        onClick={() =>
+                          setActivePanelId(emgCircuitInfo.panel.id)
+                        }
                       >
                         Ir a {emgCircuitInfo.panel.name}
                       </Button>
@@ -4202,7 +4566,9 @@ export default function Home() {
                       ⚠️ No se encontró ningún circuito ni tablero de emergencia
                     </p>
                     <p className="mt-0.5 text-amber-800">
-                      El sistema centralizado exige un Tablero Seccional de Emergencia (TSE) físicamente independiente (AEA 718.556.5.2.12).
+                      El sistema centralizado exige un Tablero Seccional de
+                      Emergencia (TSE) físicamente independiente (AEA
+                      718.556.5.2.12).
                     </p>
                   </div>
                   <Button
@@ -4214,8 +4580,7 @@ export default function Home() {
                     + Crear Tablero de Emergencia (TSE) exclusivo
                   </Button>
                 </div>
-              )
-            )}
+              ))}
             <div className="mt-3 grid gap-3 sm:grid-cols-[180px_1fr]">
               <label htmlFor="emergency-hours" className="text-xs font-medium">
                 Autonomía (horas)
@@ -4234,7 +4599,10 @@ export default function Home() {
                   }
                 />
               </label>
-              <label htmlFor="emergency-evidence" className="text-xs font-medium">
+              <label
+                htmlFor="emergency-evidence"
+                className="text-xs font-medium"
+              >
                 Referencia de ensayo o ficha técnica
                 <Input
                   id="emergency-evidence"
@@ -4623,12 +4991,13 @@ export default function Home() {
                           </span>
                         </td>
                         <td className="px-3 py-3 font-mono">
-                          {circuit.points} × {circuit.unitVA} ={' '}
+                          {circuitLoadDescription(circuit)} ={' '}
                           {Math.round(circuitPower(circuit))} VA
-                          <br />P = S × FP = {Math.round(
-                            activePower(circuit),
-                          )}{' '}
-                          W
+                          <br />
+                          {circuit.kind === 'MIX'
+                            ? 'P = Σ(Si × FPi)'
+                            : 'P = S × FP'}{' '}
+                          = {Math.round(activePower(circuit))} W
                         </td>
                         <td className="px-3 py-3">
                           <code className="block rounded bg-slate-100 px-2 py-1 text-[10px] text-slate-800 dark:bg-slate-800 dark:text-slate-200">
@@ -5154,7 +5523,9 @@ function ProjectPrintSummary({
               </p>
             )}
 
-            <section className={`mb-3 border p-2 text-[10px] ${printWarnings.length ? 'border-amber-700' : 'border-emerald-700'}`}>
+            <section
+              className={`mb-3 border p-2 text-[10px] ${printWarnings.length ? 'border-amber-700' : 'border-emerald-700'}`}
+            >
               <strong>
                 {printWarnings.length
                   ? `Advertencias del proyecto y de ${panel.name}`
@@ -5162,16 +5533,20 @@ function ProjectPrintSummary({
               </strong>
               {printWarnings.length > 0 && (
                 <ul className="mt-1 list-disc pl-4">
-                  {printWarnings.map((warning) => <li key={warning}>{warning}</li>)}
+                  {printWarnings.map((warning) => (
+                    <li key={warning}>{warning}</li>
+                  ))}
                 </ul>
               )}
               <p className="mt-1">
-                Mínimos de conductores: AEA 90364-7-771, Corrigendum 2 ({AEA_CONDUCTOR_REFERENCE_URL}).
+                Mínimos de conductores: AEA 90364-7-771, Corrigendum 2 (
+                {AEA_CONDUCTOR_REFERENCE_URL}).
               </p>
               {publicVenue && (
                 <>
                   <p className="mt-1">
-                    Cables interiores: {profile.interiorCableStandard === 'iram62267'
+                    Cables interiores:{' '}
+                    {profile.interiorCableStandard === 'iram62267'
                       ? 'LSOH IRAM 62267 declarado; verificar marcación y certificación.'
                       : 'especificación LSOH IRAM 62267 pendiente o no declarada.'}
                   </p>
@@ -5252,8 +5627,15 @@ function ProjectPrintSummary({
                     <td className="border p-1">{circuit.kind}</td>
                     <td className="border p-1">
                       {formatPower(circuitPower(circuit))}
+                      {circuit.kind === 'MIX' && (
+                        <span className="mt-1 block text-[8px]">
+                          {circuitLoadDescription(circuit)}
+                        </span>
+                      )}
                     </td>
-                    <td className="border p-1">{circuitPhaseLabel(panel, circuit)}</td>
+                    <td className="border p-1">
+                      {circuitPhaseLabel(panel, circuit)}
+                    </td>
                     <td className="border p-1">
                       {formatNumber(circuitCurrent(circuit, panel.supply), 1)} /{' '}
                       {circuit.breaker} /{' '}
@@ -5317,6 +5699,7 @@ function ProjectPrintSummary({
                     )}
                     rows={calculation.rows}
                     modulesPerRow={panel.modulesPerRow}
+                    reservePercent={panel.reservePercent}
                     panelType={panel.type}
                     hasDps={panelHasDps(panel)}
                     hasFeeders={children.length > 0}
@@ -5429,6 +5812,13 @@ function NormativeReferenceTables() {
 
   const circuitTypeRows = [
     {
+      kind: 'Mixto · iluminación y tomacorrientes',
+      code: 'MIX',
+      minSection: '2,5 mm²',
+      maxBreaker: '≤15 A y según Ib ≤ In ≤ Iz',
+      dest: 'Hasta 15 bocas combinadas y 6 A de carga total a 220 V. Ord. 72/83, III.2.8.3.3; sección según AEA 771 Corrigendum 2. Verificar encuadre municipal.',
+    },
+    {
       kind: 'Iluminación de Uso General',
       code: 'IUG',
       minSection: '1,5 mm²',
@@ -5508,7 +5898,10 @@ function NormativeReferenceTables() {
             Tablas de Conductores por Amperaje y Secciones Mínimas por Conexión
           </h2>
           <p className="mt-1 max-w-3xl text-xs text-slate-400">
-            Los mínimos se basan en AEA 90364-7-771 Corrigendum 2. Las capacidades Iz son valores de catálogo para Cu/PVC 70 °C y deben reemplazarse por la ficha del cable y las condiciones reales del proyecto.
+            Los mínimos se basan en AEA 90364-7-771 Corrigendum 2. Las
+            capacidades Iz son valores de catálogo para Cu/PVC 70 °C y deben
+            reemplazarse por la ficha del cable y las condiciones reales del
+            proyecto.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -5535,7 +5928,8 @@ function NormativeReferenceTables() {
                 </h3>
               </div>
               <p className="mt-1 text-xs text-muted-foreground">
-                Referencia de producto Cu/PVC 70 °C. No implica que todo cable LS0H sea de 90 °C ni reemplaza la declaración de fabricante.
+                Referencia de producto Cu/PVC 70 °C. No implica que todo cable
+                LS0H sea de 90 °C ni reemplaza la declaración de fabricante.
               </p>
             </div>
             <Badge className="w-fit border border-slate-200 bg-slate-100 text-[11px] text-slate-800 dark:border-slate-800 dark:bg-slate-800 dark:text-slate-200">
@@ -5628,7 +6022,10 @@ function NormativeReferenceTables() {
                 </h3>
               </div>
               <p className="mt-1 text-xs text-muted-foreground">
-                Secciones mínimas según AEA 90364-7-771 Corrigendum 2. Los máximos de puntos y protecciones aquí indicados son criterios conservadores del proyecto cuando no figura una regla normativa verificada.
+                Secciones mínimas según AEA 90364-7-771 Corrigendum 2. Los
+                máximos de puntos y protecciones aquí indicados son criterios
+                conservadores del proyecto cuando no figura una regla normativa
+                verificada.
               </p>
             </div>
             <Badge className="w-fit border border-sky-200 bg-sky-50 text-[11px] text-sky-800 dark:border-sky-900 dark:bg-sky-950/40 dark:text-sky-300">
@@ -5649,7 +6046,10 @@ function NormativeReferenceTables() {
               </thead>
               <tbody className="divide-y">
                 {circuitTypeRows.map((row) => (
-                  <tr key={row.code + row.kind} className="transition-colors hover:bg-muted/30">
+                  <tr
+                    key={row.code + row.kind}
+                    className="transition-colors hover:bg-muted/30"
+                  >
                     <td className="px-3.5 py-2.5 font-semibold text-slate-900 dark:text-slate-100">
                       {row.kind}
                     </td>
@@ -5827,8 +6227,8 @@ function DistributionArchitectureGuide() {
             </div>
           </div>
           <div className="mt-3 rounded-lg border border-sky-400/20 bg-sky-400/10 p-2 text-[11px] text-sky-200">
-            ⚡ <em>Continuidad:</em> Un ID instantáneo de 30 mA en el pilar puede
-            apagar iluminación, audio y climatización a la vez. En pública
+            ⚡ <em>Continuidad:</em> Un ID instantáneo de 30 mA en el pilar
+            puede apagar iluminación, audio y climatización a la vez. En pública
             concurrencia, esa pérdida total de servicio debe evitarse mediante
             arquitectura y coordinación verificadas.
           </div>
@@ -6196,9 +6596,10 @@ function AmpacityEditor({
           </>
         ) : (
           <>
-            <label>
+            <label htmlFor={`${fieldId}-ambient`}>
               Temperatura ambiente
               <NativeSelect
+                id={`${fieldId}-ambient`}
                 className="w-full"
                 value={settings.ambientC ?? 40}
                 onChange={(e) =>
@@ -6212,9 +6613,10 @@ function AmpacityEditor({
                 ))}
               </NativeSelect>
             </label>
-            <label>
+            <label htmlFor={`${fieldId}-grouping`}>
               Circuitos agrupados
               <NativeSelect
+                id={`${fieldId}-grouping`}
                 className="w-full"
                 value={settings.groupedCircuits ?? 1}
                 onChange={(e) =>
@@ -6232,9 +6634,10 @@ function AmpacityEditor({
             </label>
           </>
         )}
-        <label>
+        <label htmlFor={`${fieldId}-temperature`}>
           Temperatura del conductor para ΔV
           <NativeSelect
+            id={`${fieldId}-temperature`}
             className="w-full"
             value={settings.conductorTemperatureC ?? 70}
             onChange={(e) =>
@@ -6297,7 +6700,9 @@ function PriceInput({
   const fieldId = `price-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
   return (
     <div className="space-y-1">
-      <Label htmlFor={fieldId} className="text-[10px] text-muted-foreground">{label}</Label>
+      <Label htmlFor={fieldId} className="text-[10px] text-muted-foreground">
+        {label}
+      </Label>
       <div className="relative">
         <Input
           id={fieldId}
@@ -6382,7 +6787,9 @@ function CompactNumber({
       value={value}
       min={min}
       max={max}
-      onChange={(event) => onChange(Number(event.target.value))}
+      onChange={(event) =>
+        onChange(finiteNumber(event.target.value, value, min ?? 0, max))
+      }
       className="ml-auto w-20 text-right font-mono text-xs"
     />
   );
@@ -6602,6 +7009,7 @@ function PanelFront({
   devices,
   rows,
   modulesPerRow,
+  reservePercent = 20,
   panelType,
   hasDps,
   hasFeeders,
@@ -6611,13 +7019,14 @@ function PanelFront({
   devices: PanelDevice[];
   rows: number;
   modulesPerRow: number;
+  reservePercent?: number;
   panelType: PanelType;
   hasDps: boolean;
   hasFeeders: boolean;
   highlightedCircuitId?: number | null;
   onHoverDevice?: (circuitId: number | undefined) => void;
 }) {
-  const layout = layoutDin(devices, modulesPerRow, 20);
+  const layout = layoutDin(devices, modulesPerRow, reservePercent);
   const hasTpDifferential = devices.some(
     (device) =>
       device.key === 'id-selective-tp' || device.key === 'id-general-tp',
@@ -6725,11 +7134,14 @@ function PanelFront({
         </div>
       ))}
       <details className="din-equipment-list mt-3 rounded-lg border border-slate-400 bg-white/80 p-2 text-xs text-slate-900">
-        <summary className="cursor-pointer font-semibold">Lista accesible de equipos</summary>
+        <summary className="cursor-pointer font-semibold">
+          Lista accesible de equipos
+        </summary>
         <ul className="mt-2 list-disc space-y-1 pl-5">
           {devices.map((device) => (
             <li key={device.key}>
-              {device.label}: {device.fullName} · {device.detail} · {device.span} módulos
+              {device.label}: {device.fullName} · {device.detail} ·{' '}
+              {device.span} módulos
             </li>
           ))}
         </ul>
@@ -6830,9 +7242,7 @@ function SingleLineDiagram({
           <div key={child.id} className="diagram-branch flex items-center py-2">
             <span className="h-0.5 w-6 shrink-0 bg-slate-700" />
             <div className="min-w-0 flex-1 rounded-lg border border-sky-300 bg-sky-50 p-3 text-xs">
-              <strong>
-                Alimentador → {child.name}
-              </strong>
+              <strong>Alimentador → {child.name}</strong>
               <p className="mt-1">
                 TM {child.feederBreaker ?? 32} A ·{' '}
                 {child.supply === 'tri'
@@ -6867,9 +7277,9 @@ function SingleLineDiagram({
                 · {circuit.breaker} A → {circuit.name}
               </strong>
               <p className="mt-1">
-                {circuitPhaseLabel(panel, circuit)} · {circuit.phase === '3Φ' ? '4P' : '2P'} ·{' '}
-                {circuit.conductor} mm² · PE{' '}
-                {protectiveConductorSection(circuit.conductor)} mm² ·{' '}
+                {circuitPhaseLabel(panel, circuit)} ·{' '}
+                {circuit.phase === '3Φ' ? '4P' : '2P'} · {circuit.conductor} mm²
+                · PE {protectiveConductorSection(circuit.conductor)} mm² ·{' '}
                 {circuit.lengthM} m · {formatPower(circuitPower(circuit))}
               </p>
               <p className="mt-1 break-words">

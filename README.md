@@ -4,6 +4,11 @@ Herramienta de predimensionado de tableros eléctricos para proyectos en San Raf
 
 Incluye definición rápida por tipo de proyecto, memoria de cálculo con fórmulas y reemplazo de valores, circuitos editables, caída de tensión, cortocircuito y poder de corte, puesta a tierra, balance de fases, vista frontal DIN, esquemas unifilar y multifilar, control del expediente, comparación de arquitecturas, optimización y costos de referencia.
 
+El tipo **Mixto (MIX)** permite combinar iluminación y tomacorrientes en una
+única salida, con grupos de cargas editables en W o VA y factor de potencia
+individual. Los cálculos, el balance, JSON, CSV y la impresión conservan el
+desglose. Ver [criterios y límites del mixto](docs/mixed-circuits.md).
+
 El preajuste de salón/iglesia separa el TP del pilar y el TS1 interior. El
 diferencial general del TP se decide explícitamente (`sin ID`, `300 mA selectivo
 Tipo S` o `30 mA instantáneo`), mientras los diferenciales terminales de 30 mA

@@ -1,6 +1,15 @@
+import {
+  circuitApparentPower,
+  circuitActivePower,
+  type CircuitLoadInput,
+} from './circuit-loads.ts';
+
 export const STANDARD_BREAKERS = [
   6, 10, 16, 20, 25, 32, 40, 50, 63, 80, 100, 125,
 ];
+export const CIRCUIT_BREAKERS = [...STANDARD_BREAKERS, 15].sort(
+  (a, b) => a - b,
+);
 export const COPPER_RESISTIVITY = 0.018;
 export const COPPER_TEMPERATURE_COEFFICIENT = 0.00393;
 export const DEFAULT_CONDUCTOR_TEMPERATURE_C = 70;
@@ -22,15 +31,18 @@ export type ConductorRequirement = {
  */
 export function circuitRequirements(kind: string): ConductorRequirement {
   const lighting = kind === 'IUG' || kind === 'EMG';
-  const otherKnown = kind === 'TUG' || kind === 'TUE' || kind === 'FM';
+  const otherKnown =
+    kind === 'TUG' || kind === 'TUE' || kind === 'FM' || kind === 'MIX';
   return {
     minimumSectionMm2: lighting ? 1.5 : otherKnown ? 2.5 : null,
     sourceUrl: AEA_CONDUCTOR_REFERENCE_URL,
     basis: lighting
       ? 'AEA 771, tabla 771.13.I: iluminación de uso general; EMG se trata como iluminación a 220 V, con encuadre a verificar.'
-      : otherKnown
-        ? 'AEA 771, tabla 771.13.I: tomacorrientes generales, usos especiales o uso específico distinto de MBTF.'
-        : 'Destino sin encuadre verificado: definir la sección mínima aplicable.',
+      : kind === 'MIX'
+        ? 'AEA 771, tabla 771.13.I: iluminación de uso general que incluye tomacorrientes de uso general; distribución mínima 2,5 mm².'
+        : otherKnown
+          ? 'AEA 771, tabla 771.13.I: tomacorrientes generales, usos especiales o uso específico distinto de MBTF.'
+          : 'Destino sin encuadre verificado: definir la sección mínima aplicable.',
   };
 }
 
@@ -76,7 +88,7 @@ export function voltageDropCriteria(
       panelType === 'TS' ? 'recommended-allocation' : 'total-from-tp',
     totalBasis: motor
       ? 'aea-motors-only'
-      : kind === 'IUG' || kind === 'EMG'
+      : kind === 'IUG' || kind === 'EMG' || kind === 'MIX'
         ? 'aea-lighting'
         : 'project-design',
     sourceUrl: AEA_CONDUCTOR_REFERENCE_URL,
@@ -167,16 +179,8 @@ export function resistanceAtTemperature(
   );
 }
 
-export function activePower(circuit: {
-  points: number;
-  unitVA: number;
-  powerFactor: number;
-}) {
-  return (
-    Math.max(0, circuit.points) *
-    Math.max(0, circuit.unitVA) *
-    Math.min(1, Math.max(0, circuit.powerFactor))
-  );
+export function activePower(circuit: CircuitLoadInput) {
+  return circuitActivePower(circuit);
 }
 
 type Supply = 'mono' | 'tri';
@@ -184,7 +188,7 @@ type SinglePhase = 'L1' | 'L2' | 'L3';
 type Phase = SinglePhase | '3Φ';
 type PhaseLoads = Record<SinglePhase, number>;
 const PHASES: SinglePhase[] = ['L1', 'L2', 'L3'];
-type CircuitLoad = { id: number; points: number; unitVA: number; phase: Phase };
+type CircuitLoad = CircuitLoadInput & { id: number; phase: Phase };
 type PanelLoad<C extends CircuitLoad = CircuitLoad> = {
   id: string;
   type: 'TP' | 'TS';
@@ -196,7 +200,7 @@ type PanelLoad<C extends CircuitLoad = CircuitLoad> = {
 };
 
 function power(circuit: CircuitLoad) {
-  return Math.max(0, circuit.points) * Math.max(0, circuit.unitVA);
+  return circuitApparentPower(circuit);
 }
 
 /** Downstream demand at the TP; feeder phase assignments are never changed. */
@@ -281,6 +285,7 @@ export function selectPreliminaryBreaker(
   current: number,
   capacity: number,
   existing: number,
+  ratings: readonly number[] = STANDARD_BREAKERS,
 ): number | null {
   if (
     !Number.isFinite(current) ||
@@ -289,7 +294,7 @@ export function selectPreliminaryBreaker(
     capacity <= 0
   )
     return null;
-  const feasible = STANDARD_BREAKERS.filter(
+  const feasible = ratings.filter(
     (rating) => rating >= current && rating <= capacity,
   );
   if (feasible.includes(existing)) return existing;

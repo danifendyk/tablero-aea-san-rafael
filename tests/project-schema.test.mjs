@@ -33,6 +33,50 @@ const makeProject = () => ({
   panels: [makePanel()],
 });
 
+test('esquema: mixtos conservan el desglose y rechazan cargas dañadas antes de importar', () => {
+  const data = makeProject();
+  const circuit = data.panels[0].circuits[0];
+  circuit.kind = 'MIX';
+  circuit.mixedLoads = [
+    {
+      name: 'Secamanos',
+      kind: 'socket',
+      points: 2,
+      unitPower: 500,
+      unit: 'W',
+      powerFactor: 1,
+    },
+  ];
+  assert.equal(validateProjectStructure(data).ok, true);
+  for (const patch of [
+    { unit: 'kW' },
+    { kind: 'EMG' },
+    { points: 1.5 },
+    { unitPower: -1 },
+    { powerFactor: 0 },
+    { powerFactor: 1.1 },
+    { unitPower: null },
+  ]) {
+    const invalid = structuredClone(data);
+    Object.assign(invalid.panels[0].circuits[0].mixedLoads[0], patch);
+    assert.equal(
+      validateProjectStructure(invalid).ok,
+      false,
+      JSON.stringify(patch),
+    );
+  }
+  for (const mixedLoads of [
+    undefined,
+    null,
+    {},
+    Array(101).fill(circuit.mixedLoads[0]),
+  ]) {
+    const invalid = structuredClone(data);
+    invalid.panels[0].circuits[0].mixedLoads = mixedLoads;
+    assert.equal(validateProjectStructure(invalid).ok, false);
+  }
+});
+
 test('esquema: export v3 y borrador sin versión mantienen todos sus datos sin mutaciones', () => {
   for (const version of ['3.0', 3, undefined]) {
     const data = makeProject();

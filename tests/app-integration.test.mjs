@@ -61,7 +61,7 @@ test('001: todas las plantillas IUG de código, incluido crear TS, evitan térmi
   assert.ok(count >= 3);
 });
 const appended = `
-export const audit = { normalizePanels, normalizeCircuit, normalizeProject, normalizePrices, normalizeProfile, diagnosePanel, diagnoseProject, INITIAL_PANELS, INITIAL_PROFILE, DEFAULT_PRICES, PanelFront, SingleLineDiagram, MultiLineDiagram, ProjectPrintSummary, PriceInput, AmpacityEditor, FeederReviews, reviewFeeder, emergencyAutonomyDeclared, cabinetFor, circuitCurrent, voltageDrop };
+export const audit = { changeCircuitKind, normalizePanels, normalizeCircuit, normalizeProject, normalizePrices, normalizeProfile, diagnosePanel, diagnoseProject, INITIAL_PANELS, INITIAL_PROFILE, DEFAULT_PRICES, PanelFront, SingleLineDiagram, MultiLineDiagram, ProjectPrintSummary, PriceInput, AmpacityEditor, FeederReviews, reviewFeeder, emergencyAutonomyDeclared, cabinetFor, circuitCurrent, voltageDrop };
 export function calculatePanels(panels) { return (${memoBody('panelCalculations')})(); }
 export function calculateCosts(activePanel, panels, prices) { return (${memoBody('costOptions')})(); }
 export function calculateProjectCosts(panels, prices) { return (${memoBody('projectCostSummary')})(); }
@@ -85,6 +85,27 @@ const ui = {
   Separator: 'hr',
 };
 const customRequire = (name) => {
+  if (name === '@/components/mixed-circuit-editor') {
+    const componentSource = readFileSync(
+      new URL('../components/mixed-circuit-editor.tsx', import.meta.url),
+      'utf8',
+    );
+    const code = ts.transpileModule(componentSource, {
+      compilerOptions: {
+        module: ts.ModuleKind.CommonJS,
+        jsx: ts.JsxEmit.ReactJSX,
+        target: ts.ScriptTarget.ES2022,
+        esModuleInterop: true,
+      },
+    }).outputText;
+    const componentModule = { exports: {} };
+    vm.runInThisContext(`(function(exports,require,module){${code}\n})`)(
+      componentModule.exports,
+      customRequire,
+      componentModule,
+    );
+    return componentModule.exports;
+  }
   if (name.startsWith('@/lib/')) return require(`../lib/${name.slice(6)}.ts`);
   if (name.startsWith('@/components/ui/')) return ui;
   if (name === 'lucide-react') return new Proxy({}, { get: () => 'svg' });
@@ -126,6 +147,146 @@ const makePanel = (extra = {}) => ({
   name: 'TP',
   circuits: [makeCircuit(1)],
   ...extra,
+});
+
+const mixedLoads = () => [
+  {
+    name: 'Luces baños',
+    kind: 'lighting',
+    points: 10,
+    unitPower: 20,
+    unit: 'W',
+    powerFactor: 0.8,
+  },
+  {
+    name: 'Secamanos',
+    kind: 'socket',
+    points: 2,
+    unitPower: 500,
+    unit: 'W',
+    powerFactor: 1,
+  },
+];
+
+test('mixto: normalizar y guardar JSON conserva cada carga y recalcula los agregados', () => {
+  const circuit = makeCircuit(1, {
+    kind: 'MIX',
+    mixedLoads: mixedLoads(),
+    breaker: 15,
+    conductor: 2.5,
+  });
+  close(circuit.unitVA * circuit.points, 1250);
+  assert.equal(circuit.points, 12);
+  close(circuit.powerFactor, 1200 / 1250);
+  const saved = {
+    version: '3.0',
+    projectName: 'Mixto',
+    panels: [makePanel({ circuits: [circuit] })],
+  };
+  const project = app.normalizeProject(JSON.parse(JSON.stringify(saved)));
+  assert.deepEqual(project.panels[0].circuits[0].mixedLoads, mixedLoads());
+  const roundTrip = calculatePanels(project.panels).get('tp');
+  close(roundTrip.installedVA, 1250);
+  close(roundTrip.activeInstalledW, 1200);
+});
+
+test('mixto: TP y TS comparten totales, impresión conserva desglose y avisos', () => {
+  const tp = makePanel({ circuits: [], demandFactor: 1 });
+  const circuit = makeCircuit(1, {
+    kind: 'MIX',
+    mixedLoads: mixedLoads(),
+    breaker: 15,
+    conductor: 2.5,
+    phase: 'L2',
+  });
+  const child = makePanel({
+    id: 'ts1',
+    name: 'TS1',
+    type: 'TS',
+    parentId: 'tp',
+    demandFactor: 0.5,
+    circuits: [circuit],
+  });
+  const panels = [tp, child];
+  const calculations = calculatePanels(panels);
+  close(calculations.get('tp').installedVA, 1250);
+  close(calculations.get('tp').phaseVA.L2, 625);
+  close(app.circuitCurrent(circuit, 'tri'), 1250 / 220);
+  child.circuits[0] = makeCircuit(1, {
+    ...circuit,
+    mixedLoads: [mixedLoads()[0], { ...mixedLoads()[1], unitPower: 600 }],
+    breaker: 20,
+    conductor: 1.5,
+  });
+  const updated = calculatePanels(panels);
+  const warnings = app.diagnosePanel(
+    child,
+    updated.get('ts1'),
+    panels,
+    updated,
+  );
+  assert.ok(warnings.some((w) => w.includes('supera 6 A')));
+  assert.ok(warnings.some((w) => w.includes('protección supera 15 A')));
+  assert.ok(warnings.some((w) => w.includes('mínimo de 2.5')));
+  const printed = html(app.ProjectPrintSummary, {
+    projectName: 'Prueba',
+    panels,
+    calculations: updated,
+    profile: app.INITIAL_PROFILE,
+    costs: calculateProjectCosts(panels, app.DEFAULT_PRICES),
+  });
+  assert.match(printed, /Secamanos: 2 × 600 W/);
+  assert.match(printed, /supera 6 A/);
+  const group = differentialGroups(child).find((item) =>
+    item.circuits.some((c) => c.id === 1),
+  );
+  assert.equal(group.label, 'ID B');
+});
+
+test('mixto: cambiar el tipo conserva carga, calibre y desglose al volver', () => {
+  const original = makeCircuit(1, {
+    kind: 'TUG',
+    points: 2,
+    unitVA: 500,
+    powerFactor: 0.8,
+    breaker: 20,
+  });
+  const mixed = app.changeCircuitKind(original, 'MIX');
+  close(app.circuitCurrent(mixed, 'tri'), app.circuitCurrent(original, 'tri'));
+  assert.equal(mixed.breaker, 20);
+  assert.equal(mixed.mixedLoads[0].kind, 'socket');
+  const toggled = app.changeCircuitKind(
+    app.changeCircuitKind(mixed, 'TUG'),
+    'MIX',
+  );
+  assert.deepEqual(toggled.mixedLoads, mixed.mixedLoads);
+});
+
+test('mixto: editor real se renderiza y la iluminación cuenta para emergencia autónoma', () => {
+  const { MixedCircuitEditor } = customRequire(
+    '@/components/mixed-circuit-editor',
+  );
+  const rendered = html(MixedCircuitEditor, {
+    name: 'C5',
+    loads: mixedLoads(),
+    onChange() {},
+  });
+  assert.match(rendered, /Secamanos/);
+  assert.match(rendered, /1250|1\.250/);
+  assert.match(rendered, /Factor de potencia de C5/);
+  const panel = makePanel({
+    circuits: [makeCircuit(1, { kind: 'MIX', mixedLoads: mixedLoads() })],
+  });
+  const warnings = app.diagnoseProject(
+    [panel],
+    { ...app.INITIAL_PROFILE, emergencySystem: 'autonomous' },
+    true,
+  );
+  assert.ok(
+    !warnings.some((w) =>
+      w.includes('falta al menos un circuito de iluminación normal'),
+    ),
+  );
 });
 
 test('TP/TS: 48,8 A con alimentador de 32 A y 6 mm² se advierte desde ambos tableros y al imprimir', () => {
@@ -749,7 +910,10 @@ test('integración: página completa se renderiza sin navegador ni excepciones',
 
 test('integración: emergencia autónoma no exige EMG pero requiere IUG para cargadores', () => {
   const panelWithIug = makePanel({
-    circuits: [makeCircuit(1, { kind: 'IUG' }), makeCircuit(2, { kind: 'TUG' })],
+    circuits: [
+      makeCircuit(1, { kind: 'IUG' }),
+      makeCircuit(2, { kind: 'TUG' }),
+    ],
   });
   const panelWithoutIug = makePanel({
     circuits: [makeCircuit(1, { kind: 'TUG' })],
@@ -768,17 +932,45 @@ test('integración: emergencia autónoma no exige EMG pero requiere IUG para car
   };
 
   // Centralizado sin EMG -> emite advertencia
-  const diagCentralized = app.diagnoseProject([panelWithIug], profileCentralized, true);
-  assert.ok(diagCentralized.some((w) => w.includes('no tiene ningún circuito de iluminación de emergencia')));
+  const diagCentralized = app.diagnoseProject(
+    [panelWithIug],
+    profileCentralized,
+    true,
+  );
+  assert.ok(
+    diagCentralized.some((w) =>
+      w.includes('no tiene ningún circuito de iluminación de emergencia'),
+    ),
+  );
 
   // Autónomo con IUG -> NO emite advertencia de falta de EMG ni de falta de IUG
-  const diagAutonomous = app.diagnoseProject([panelWithIug], profileAutonomous, true);
-  assert.ok(!diagAutonomous.some((w) => w.includes('no tiene ningún circuito de iluminación de emergencia')));
-  assert.ok(!diagAutonomous.some((w) => w.includes('falta al menos un circuito de iluminación normal (IUG)')));
+  const diagAutonomous = app.diagnoseProject(
+    [panelWithIug],
+    profileAutonomous,
+    true,
+  );
+  assert.ok(
+    !diagAutonomous.some((w) =>
+      w.includes('no tiene ningún circuito de iluminación de emergencia'),
+    ),
+  );
+  assert.ok(
+    !diagAutonomous.some((w) =>
+      w.includes('falta al menos un circuito de iluminación normal'),
+    ),
+  );
 
   // Autónomo sin IUG -> advierte que falta IUG para los cargadores
-  const diagAutonomousNoIug = app.diagnoseProject([panelWithoutIug], profileAutonomous, true);
-  assert.ok(diagAutonomousNoIug.some((w) => w.includes('falta al menos un circuito de iluminación normal (IUG)')));
+  const diagAutonomousNoIug = app.diagnoseProject(
+    [panelWithoutIug],
+    profileAutonomous,
+    true,
+  );
+  assert.ok(
+    diagAutonomousNoIug.some((w) =>
+      w.includes('falta al menos un circuito de iluminación normal'),
+    ),
+  );
 });
 
 test('integración: diagnosePanel alerta si circuito TUE supera 12 bocas (AEA 771)', () => {
@@ -792,7 +984,11 @@ test('integración: diagnosePanel alerta si circuito TUE supera 12 bocas (AEA 77
     [panelWithTue],
     calculations,
   );
-  assert.ok(messages.some((m) => m.includes('supera el límite reglamentario de 12 bocas para TUE')));
+  assert.ok(
+    messages.some((m) =>
+      m.includes('supera el límite reglamentario de 12 bocas para TUE'),
+    ),
+  );
 });
 
 test('integración: AEA 718.556.5.2.12 prohíbe gabinete compartido entre normal y EMG centralizado', () => {
@@ -808,7 +1004,10 @@ test('integración: AEA 718.556.5.2.12 prohíbe gabinete compartido entre normal
   const separatedTs = makePanel({
     id: 'ts1',
     name: 'TS1',
-    circuits: [makeCircuit(1, { kind: 'IUG' }), makeCircuit(2, { kind: 'TUG' })],
+    circuits: [
+      makeCircuit(1, { kind: 'IUG' }),
+      makeCircuit(2, { kind: 'TUG' }),
+    ],
   });
   const exclusiveTse = makePanel({
     id: 'tse',
@@ -827,6 +1026,10 @@ test('integración: AEA 718.556.5.2.12 prohíbe gabinete compartido entre normal
   assert.ok(diagMixed.some((w) => w.includes('718.556.5.2.12')));
 
   // Tableros físicamente separados -> NO advierte infracción a 718.556.5.2.12
-  const diagSeparated = app.diagnoseProject([separatedTs, exclusiveTse], profileCentralized, true);
+  const diagSeparated = app.diagnoseProject(
+    [separatedTs, exclusiveTse],
+    profileCentralized,
+    true,
+  );
   assert.ok(!diagSeparated.some((w) => w.includes('718.556.5.2.12')));
 });

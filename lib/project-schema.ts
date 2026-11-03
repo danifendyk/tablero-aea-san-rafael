@@ -52,7 +52,13 @@ function circuit(value: unknown, path: string, legacy: boolean) {
   // can be regenerated afterwards without discarding or inventing a circuit.
   field(raw, 'id', path, numeric, true);
   field(raw, 'name', path, text, true);
-  field(raw, 'kind', path, oneOf(['IUG', 'TUG', 'TUE', 'EMG', 'FM']), true);
+  field(
+    raw,
+    'kind',
+    path,
+    oneOf(['IUG', 'TUG', 'TUE', 'EMG', 'FM', 'MIX']),
+    true,
+  );
   field(raw, 'phase', path, oneOf(phases), true);
   for (const key of ['points', 'unitVA', 'lengthM'])
     field(raw, key, path, nonnegative, true);
@@ -61,6 +67,35 @@ function circuit(value: unknown, path: string, legacy: boolean) {
   field(raw, 'modules', path, positive, !legacy);
   field(raw, 'conduit', path, text);
   if (raw.ampacity !== undefined) ampacity(raw.ampacity, `${path}.ampacity`);
+  if (raw.kind === 'MIX' || raw.mixedLoads !== undefined) {
+    if (!Array.isArray(raw.mixedLoads) || raw.mixedLoads.length > 100)
+      throw new Error(
+        `${path}.mixedLoads: se esperaba una lista de hasta 100 cargas`,
+      );
+    raw.mixedLoads.forEach((entry, index) => {
+      const loadPath = `${path}.mixedLoads[${index}]`;
+      const load = record(entry, loadPath);
+      field(load, 'name', loadPath, text, true);
+      field(load, 'kind', loadPath, oneOf(['lighting', 'socket']), true);
+      field(
+        load,
+        'points',
+        loadPath,
+        (value) => nonnegative(value) && Number.isSafeInteger(Number(value)),
+        true,
+      );
+      field(load, 'unitPower', loadPath, nonnegative, true);
+      field(load, 'unit', loadPath, oneOf(['VA', 'W']), true);
+      field(
+        load,
+        'powerFactor',
+        loadPath,
+        (value) =>
+          positive(value) && Number(value) >= 0.1 && Number(value) <= 1,
+        true,
+      );
+    });
+  }
 }
 
 function circuits(value: unknown, path: string, legacy: boolean) {
@@ -139,12 +174,7 @@ function profile(value: unknown) {
   ])
     field(raw, key, path, boolean);
   field(raw, 'emergencyEvidence', path, text);
-  field(
-    raw,
-    'emergencySystem',
-    path,
-    oneOf(['centralized', 'autonomous']),
-  );
+  field(raw, 'emergencySystem', path, oneOf(['centralized', 'autonomous']));
   field(
     raw,
     'interiorCableStandard',

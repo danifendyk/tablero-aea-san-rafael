@@ -40,6 +40,15 @@ import {
   NativeSelectOption,
 } from '@/components/ui/native-select';
 import { Separator } from '@/components/ui/separator';
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogTitle,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogCancel,
+  AlertDialogAction,
+} from '@/components/ui/alert-dialog';
 import { MixedCircuitEditor } from '@/components/mixed-circuit-editor';
 import {
   circuitApparentPower,
@@ -67,6 +76,7 @@ import {
   AEA_CONDUCTOR_REFERENCE_URL,
   STANDARD_BREAKERS,
   CIRCUIT_BREAKERS,
+  terminalBreakerLimit,
   type FeederDrop,
   type AmpacitySettings,
 } from '@/lib/electrical';
@@ -99,10 +109,12 @@ import {
   type ProjectStorageSnapshot,
 } from '@/lib/project-data';
 import { validateProjectStructure } from '@/lib/project-schema';
+import { electricalVerification } from '@/lib/project-verification';
+import { separateEmergencyPanels } from '@/lib/emergency-panels';
 
 export type Supply = 'mono' | 'tri';
 export type Phase = 'L1' | 'L2' | 'L3' | '3Φ';
-export type CircuitKind = 'IUG' | 'TUG' | 'TUE' | 'EMG' | 'FM' | 'MIX';
+export type CircuitKind = 'IUG' | 'IUE' | 'TUG' | 'TUE' | 'EMG' | 'FM' | 'MIX';
 export type Architecture =
   | 'essential'
   | 'balanced'
@@ -187,6 +199,8 @@ export type Panel = {
   feederAmpacity?: AmpacitySettings;
   feederConduit?: string;
   feederWiring?: FeederWiring;
+  feederDesignPending?: boolean;
+  emergencyDedicated?: boolean;
 };
 
 export type PanelCalculation = {
@@ -340,6 +354,18 @@ const PRICE_SOURCES = [
 ];
 
 const TEMPLATES: Record<CircuitKind, CircuitTemplate> = {
+  IUE: {
+    label: 'Iluminación de uso especial',
+    shortName: 'Iluminación especial',
+    kind: 'IUE',
+    points: 6,
+    unitVA: 100,
+    powerFactor: 0.95,
+    breaker: 15,
+    conductor: 2.5,
+    lengthM: 24,
+    modules: 2,
+  },
   MIX: {
     label: 'Mixto · iluminación y tomacorrientes',
     shortName: 'Mixto',
@@ -538,6 +564,16 @@ function reviewFeeder(panel: Panel, calculation: PanelCalculation) {
   );
   const current = calculation.mainCurrent;
   const issues: string[] = [];
+  if (panel.feederDesignPending || section <= 0 || breaker <= 0)
+    return {
+      breaker,
+      section,
+      capacity: null,
+      current,
+      issues: [
+        'Alimentador pendiente: definir longitud, sección y protección para las cargas trasladadas.',
+      ],
+    };
   const minimumSection = feederRequirements().minimumSectionMm2;
   if (minimumSection !== null && section < minimumSection)
     issues.push(
@@ -626,11 +662,25 @@ function circuitPower(circuit: Circuit) {
 
 function changeCircuitKind(circuit: Circuit, kind: CircuitKind): Circuit {
   if (kind !== 'MIX') return { ...circuit, kind };
-  const mixedLoads = circuit.mixedLoads ?? [
+  const saved = circuit.mixedLoads
+    ? mixedCircuitFields(circuit.mixedLoads)
+    : null;
+  const equal = (a: number, b: number) =>
+    Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(a), Math.abs(b));
+  const unchanged =
+    saved &&
+    equal(saved.points, circuit.points) &&
+    equal(saved.unitVA, circuit.unitVA) &&
+    equal(saved.powerFactor, circuit.powerFactor);
+  const mixedLoads = (circuit.kind === 'MIX' || unchanged
+    ? circuit.mixedLoads
+    : undefined) ?? [
     {
       name: circuit.name,
       kind:
-        circuit.kind === 'IUG' || circuit.kind === 'EMG'
+        circuit.kind === 'IUG' ||
+        circuit.kind === 'IUE' ||
+        circuit.kind === 'EMG'
           ? ('lighting' as const)
           : ('socket' as const),
       points: circuit.points,
@@ -863,7 +913,7 @@ function normalizeCircuit(
   supply: Supply,
 ): Circuit {
   const raw = isRecord(value) ? value : {};
-  const kind = ['IUG', 'TUG', 'TUE', 'EMG', 'FM', 'MIX'].includes(
+  const kind = ['IUG', 'IUE', 'TUG', 'TUE', 'EMG', 'FM', 'MIX'].includes(
     String(raw.kind),
   )
     ? (raw.kind as CircuitKind)
@@ -880,9 +930,16 @@ function normalizeCircuit(
     template.conductor,
     0.1,
   );
-  const conductor = CONDUCTOR_CAPACITY[requestedConductor]
-    ? requestedConductor
-    : template.conductor;
+  if (!Object.hasOwn(CONDUCTOR_CAPACITY, requestedConductor))
+    throw new Error(
+      `Sección ${requestedConductor} mm² fuera del catálogo admitido; no se reemplazó por otra sección.`,
+    );
+  const conductor = requestedConductor;
+  const ampacity = normalizeAmpacity(raw.ampacity);
+  if (phase !== requestedPhase && ampacity.mode === 'declared') {
+    ampacity.declaredA = 0;
+    ampacity.basis = '';
+  }
 
   const mixedLoads = Array.isArray(raw.mixedLoads)
     ? raw.mixedLoads.map((entry: unknown) => {
@@ -918,7 +975,7 @@ function normalizeCircuit(
       phase,
       modules: finiteNumber(raw.modules, template.modules, 2, 8),
     }),
-    ampacity: normalizeAmpacity(raw.ampacity),
+    ampacity,
     conduit: typeof raw.conduit === 'string' ? raw.conduit.slice(0, 300) : '',
     ...(mixedLoads ? { mixedLoads } : {}),
     ...(kind === 'MIX' ? mixedCircuitFields(mixedLoads ?? []) : {}),
@@ -949,6 +1006,15 @@ function normalizePanels(value: unknown): Panel[] | null {
     while (usedIds.has(id)) id = `${id}-${panelIndex + 1}`;
     usedIds.add(id);
     const supply: Supply = raw.supply === 'mono' ? 'mono' : 'tri';
+    const feederDesignPending = raw.feederDesignPending === true;
+    if (
+      raw.feederConductor !== undefined &&
+      !(feederDesignPending && Number(raw.feederConductor) === 0) &&
+      !Object.hasOwn(CONDUCTOR_CAPACITY, Number(raw.feederConductor))
+    )
+      throw new Error(
+        `Sección del alimentador ${Number(raw.feederConductor)} mm² fuera del catálogo admitido; no se modificó.`,
+      );
     const circuits = normalizeCircuitIds(
       (raw.circuits as unknown[]).map((circuit, index) =>
         normalizeCircuit(circuit, index, supply),
@@ -1005,15 +1071,31 @@ function normalizePanels(value: unknown): Panel[] | null {
           : 'none',
       circuits,
       feederLengthM:
-        type === 'TS' ? finiteNumber(raw.feederLengthM, 15, 1) : undefined,
+        type === 'TS'
+          ? finiteNumber(
+              raw.feederLengthM,
+              feederDesignPending ? 0 : 15,
+              feederDesignPending ? 0 : 1,
+            )
+          : undefined,
       feederConductor:
-        type === 'TS' && CONDUCTOR_CAPACITY[Number(raw.feederConductor)]
+        type === 'TS' &&
+        (CONDUCTOR_CAPACITY[Number(raw.feederConductor)] ||
+          (feederDesignPending && Number(raw.feederConductor) === 0))
           ? Number(raw.feederConductor)
           : type === 'TS'
             ? 6
             : undefined,
       feederBreaker:
-        type === 'TS' ? finiteNumber(raw.feederBreaker, 32, 1) : undefined,
+        type === 'TS'
+          ? finiteNumber(
+              raw.feederBreaker,
+              feederDesignPending ? 0 : 32,
+              feederDesignPending ? 0 : 1,
+            )
+          : undefined,
+      feederDesignPending,
+      emergencyDedicated: raw.emergencyDedicated === true,
       feederPhase: type === 'TS' ? feederPhase : undefined,
       feederAmpacity:
         type === 'TS' ? normalizeAmpacity(raw.feederAmpacity) : undefined,
@@ -1080,7 +1162,11 @@ function normalizeProject(value: unknown, legacy = false) {
 }
 
 function ratingLabel(value: number | null | undefined) {
-  return value == null ? 'Sin dimensionar' : `${value} A`;
+  return value == null || value <= 0 ? 'Sin dimensionar' : `${value} A`;
+}
+
+function positiveLabel(value: number | undefined, unit: string) {
+  return value && value > 0 ? `${value} ${unit}` : 'Pendiente';
 }
 
 function diagnosePanel(
@@ -1111,6 +1197,17 @@ function diagnosePanel(
         `C${circuitNumber}: supera el límite reglamentario de 12 bocas para TUE (AEA 771, Tabla 771.13.I).`,
       );
     }
+    if (circuit.kind === 'IUE' && circuit.points > 12)
+      messages.push(
+        `C${circuitNumber}: supera el criterio de diseño de 12 bocas para IUE; revisar el encuadre de iluminación especial.`,
+      );
+    if (
+      (circuit.kind === 'IUG' || circuit.kind === 'IUE') &&
+      circuit.breaker > 15
+    )
+      messages.push(
+        `C${circuitNumber}: iluminación exclusiva: protección superior a 15 A según el criterio municipal de la Ord. 72/83, III.2.8.3.4. Revisar el expediente.`,
+      );
     if (circuitCurrent(circuit, activePanel.supply) > circuit.breaker) {
       messages.push(
         `C${circuitNumber}: la corriente estimada supera la protección seleccionada.`,
@@ -1180,7 +1277,7 @@ function diagnosePanel(
       (maximum, circuit) => Math.max(maximum, circuit.breaker),
       0,
     );
-    if (feederBreaker < maxTerminalBreaker) {
+    if (feederBreaker > 0 && feederBreaker < maxTerminalBreaker) {
       messages.push(
         `Alimentador: revisar selectividad; su térmica de ${feederBreaker} A es menor que una protección terminal de ${maxTerminalBreaker} A.`,
       );
@@ -1219,6 +1316,15 @@ function diagnoseProject(
 ) {
   const messages: string[] = [];
   const tp = panels.find((panel) => panel.type === 'TP');
+  const verification = electricalVerification(profile);
+  if (!verification.groundPresent)
+    messages.push(
+      'Puesta a tierra pendiente: ingresar una resistencia positiva válida; cero no acredita un dato de medición.',
+    );
+  if (!verification.faultPresent)
+    messages.push(
+      'Cortocircuito y poder de corte pendientes: ingresar Ik y poder de corte positivos válidos.',
+    );
   const sectionalPanels = tp
     ? panels.filter((panel) => panel.type === 'TS' && panel.parentId === tp.id)
     : [];
@@ -1251,6 +1357,7 @@ function diagnoseProject(
       panel.circuits.some(
         (circuit) =>
           circuit.kind === 'IUG' ||
+          circuit.kind === 'IUE' ||
           (circuit.kind === 'MIX' &&
             circuit.mixedLoads?.some(
               (load) => load.kind === 'lighting' && load.points > 0,
@@ -1317,10 +1424,22 @@ function diagnoseProject(
 }
 
 function findProjectEmergencyCircuit(panels: Panel[]) {
-  for (const p of panels) {
+  const ordered = [...panels].sort(
+    (a, b) =>
+      Number(
+        b.circuits.some((c) => c.kind === 'EMG') &&
+          (b.type === 'TP' || b.circuits.some((c) => c.kind !== 'EMG')),
+      ) -
+      Number(
+        a.circuits.some((c) => c.kind === 'EMG') &&
+          (a.type === 'TP' || a.circuits.some((c) => c.kind !== 'EMG')),
+      ),
+  );
+  for (const p of ordered) {
     const idx = p.circuits.findIndex((c) => c.kind === 'EMG');
     if (idx !== -1) {
-      const isMixed = p.circuits.some((c) => c.kind !== 'EMG');
+      const isMixed =
+        p.type === 'TP' || p.circuits.some((c) => c.kind !== 'EMG');
       return {
         panel: p,
         circuit: p.circuits[idx],
@@ -1341,6 +1460,10 @@ export default function Home() {
   const [activePanelId, setActivePanelId] = useState<string>('ts1');
   const [prices, setPrices] = useState<PriceCatalog>(DEFAULT_PRICES);
   const [optimizationMessage, setOptimizationMessage] = useState('');
+  const [pendingPreset, setPendingPreset] = useState<Exclude<
+    ProjectPreset,
+    'custom'
+  > | null>(null);
   const [persistenceReady, setPersistenceReady] = useState(false);
   const [persistenceError, setPersistenceError] = useState<string | null>(null);
   const [storageBlocked, setStorageBlocked] = useState(false);
@@ -1509,6 +1632,13 @@ export default function Home() {
       current.map((p) => {
         if (p.id !== activePanel.id) return p;
         const next = { ...p, [key]: value };
+        if (
+          next.feederDesignPending &&
+          (next.feederLengthM ?? 0) > 0 &&
+          (next.feederConductor ?? 0) > 0 &&
+          (next.feederBreaker ?? 0) > 0
+        )
+          next.feederDesignPending = false;
         if (
           key === 'feederConductor' &&
           value !== p.feederConductor &&
@@ -2161,17 +2291,20 @@ export default function Home() {
       {
         group: 'Ordenanza 72/83',
         label: 'Puesta a tierra ≤ 10 Ω',
-        ready: profile.groundResistanceOhm <= 10,
-        action:
-          profile.groundResistanceOhm <= 10
+        ready: electricalVerification(profile).groundReady,
+        action: !electricalVerification(profile).groundPresent
+          ? 'Pendiente: ingresar una resistencia positiva válida.'
+          : profile.groundResistanceOhm <= 10
             ? `${profile.groundResistanceOhm} Ω declarado`
             : 'Supera el límite de 10 Ω',
       },
       {
         group: 'AEA 90364-7-771/718',
         label: 'Poder de corte declarado ≥ Ik declarada',
-        ready: profile.breakingCapacityKa >= profile.prospectiveShortCircuitKa,
-        action: `${profile.breakingCapacityKa} kA adoptado / ${profile.prospectiveShortCircuitKa} kA presunto. Comparación de datos ingresados; falta respaldar Ik y la selección del equipo.`,
+        ready: electricalVerification(profile).faultReady,
+        action: electricalVerification(profile).faultPresent
+          ? `${profile.breakingCapacityKa} kA adoptado / ${profile.prospectiveShortCircuitKa} kA presunto. Comparación de datos ingresados; falta respaldar Ik y la selección del equipo.`
+          : 'Pendiente: ingresar Ik y poder de corte positivos válidos.',
       },
       {
         group: 'Expediente municipal',
@@ -2207,11 +2340,16 @@ export default function Home() {
     setProfile((current) => normalizeProfile({ ...current, [key]: value }));
   }
 
-  function applyPreset(preset: ProjectPreset) {
+  function applyPreset(preset: ProjectPreset, confirmed = false) {
     if (preset === 'custom') {
       updateProfile('preset', preset);
       return;
     }
+    if (!confirmed) {
+      setPendingPreset(preset);
+      return;
+    }
+    setPendingPreset(null);
     const nextCircuits = projectCircuits(preset);
     const existingInterior = panels.find((panel) => panel.type === 'TS');
     const interiorId = existingInterior?.id ?? createPanelId('ts');
@@ -2425,67 +2563,22 @@ export default function Home() {
   }
 
   function createEmergencyPanel() {
-    setOptimizationMessage('');
-    const newId = createPanelId('tse');
-    const emgCircuit: Circuit = {
-      id: 1,
-      name: 'Luces y carteles de escape',
-      kind: 'EMG',
-      points: 8,
-      unitVA: 20,
-      phase: tpPanel.supply === 'tri' ? 'L3' : 'L1',
-      powerFactor: 0.95,
-      breaker: 10,
-      conductor: 1.5,
-      lengthM: 24,
-      modules: 2,
-    };
-
-    const emergencyPanel: Panel = {
-      id: newId,
-      name: 'TSE · Tablero de Emergencia',
-      type: 'TS',
-      parentId: tpPanel.id,
-      supply: 'mono',
-      demandFactor: 1,
-      reservePercent: 25,
-      modulesPerRow: 12,
-      architecture: 'balanced',
-      includeDps: false,
-      differentialType: 'A',
-      feederLengthM: 10,
-      feederConductor: 4,
-      feederBreaker: 16,
-      feederPhase: tpPanel.supply === 'tri' ? 'L3' : 'L1',
-      feederWiring: 'classII-conduit',
-      feederConduit:
-        'Cañería independiente F90 exclusiva para emergencia (AEA 718.556.5.2.5 y 718.556.6.3)',
-      circuits: [emgCircuit],
-    };
-
-    // Quitamos los circuitos EMG de los tableros normales para cumplir con AEA 718.556.5.2.12
-    setPanels((current) => [
-      ...current.map((p) => ({
-        ...p,
-        circuits: p.circuits.filter((c) => c.kind !== 'EMG'),
-      })),
-      emergencyPanel,
-    ]);
-    setActivePanelId(newId);
+    const result = separateEmergencyPanels(panels, () => createPanelId('tse'));
+    setPanels(result.panels);
+    setActivePanelId(result.activePanelId);
+    setOptimizationMessage(
+      result.movedCircuits
+        ? `${result.movedCircuits === 1 ? 'Se trasladó 1 circuito real' : `Se trasladaron ${result.movedCircuits} circuitos reales`} a ${result.createdCount} TSE, conservando cargas, fases, cables y protecciones. Definí los nuevos alimentadores y canalizaciones.`
+        : result.createdCount
+          ? 'TSE vacío creado: agregá las cargas reales y definí su alimentador y canalización.'
+          : 'Los circuitos de emergencia ya están separados en tableros exclusivos.',
+    );
   }
 
   function handleEmergencySystemChange(mode: EmergencySystem) {
     updateProfile('emergencySystem', mode);
     if (mode === 'centralized') {
-      const hasExclusiveEmg = panels.some(
-        (p) =>
-          p.type === 'TS' &&
-          p.circuits.length > 0 &&
-          p.circuits.every((c) => c.kind === 'EMG'),
-      );
-      if (!hasExclusiveEmg) {
-        createEmergencyPanel();
-      }
+      createEmergencyPanel();
     }
   }
 
@@ -2499,16 +2592,14 @@ export default function Home() {
         circuit.phase === '3Φ',
         circuit.ampacity,
       );
-      let selected = selectPreliminaryBreaker(
+      const selected = selectPreliminaryBreaker(
         current,
         capacity ?? NaN,
         circuit.breaker,
-        circuit.kind === 'MIX'
-          ? CIRCUIT_BREAKERS.filter((rating) => rating <= 15)
-          : CIRCUIT_BREAKERS,
+        CIRCUIT_BREAKERS.filter(
+          (rating) => rating <= terminalBreakerLimit(circuit.kind),
+        ),
       );
-      if (circuit.kind === 'MIX' && selected !== null && selected > 15)
-        selected = null;
       if (circuit.kind === 'MIX' && circuitPower(circuit) / 220 > 6)
         pending.push(
           `C${index + 1}: el mixto supera 6 A; revisar o separar sus cargas`,
@@ -2732,6 +2823,39 @@ export default function Home() {
 
   return (
     <main className="min-h-screen bg-background text-foreground">
+      <AlertDialog
+        open={pendingPreset !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingPreset(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogTitle>
+            ¿Aplicar el preajuste{' '}
+            {pendingPreset === 'hall'
+              ? 'Salón'
+              : pendingPreset === 'commercial'
+                ? 'Comercio'
+                : 'Vivienda'}
+            ?
+          </AlertDialogTitle>
+          <AlertDialogDescription>
+            Se reemplazarán los circuitos del TP y del primer TS, y cambiarán
+            los datos generales y el suministro. Exportá el JSON antes si querés
+            conservar el proyecto actual.
+          </AlertDialogDescription>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancelar</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (pendingPreset) applyPreset(pendingPreset, true);
+              }}
+            >
+              Aplicar preajuste
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       {/* Hidden file input for JSON import */}
       <input
         ref={fileInputRef}
@@ -2797,6 +2921,8 @@ export default function Home() {
               size="sm"
               className="text-slate-300 hover:bg-white/10 hover:text-white"
               onClick={resetProject}
+              aria-label="Restablecer proyecto"
+              title="Restablecer proyecto"
             >
               <RotateCcw data-icon="inline-start" />
               <span className="hidden sm:inline">Restablecer</span>
@@ -3234,8 +3360,9 @@ export default function Home() {
                     </div>
                   </div>
                   <Badge className="border-sky-300 bg-white text-sky-900">
-                    ΔV Alimentador: {calculations.feederDrop.percent.toFixed(2)}{' '}
-                    % ({calculations.feederDrop.volts.toFixed(1)} V)
+                    {activePanel.feederDesignPending
+                      ? 'Alimentador pendiente de dimensionar'
+                      : `ΔV Alimentador: ${calculations.feederDrop.percent.toFixed(2)} % (${calculations.feederDrop.volts.toFixed(1)} V)`}
                   </Badge>
                 </div>
                 <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -3243,7 +3370,7 @@ export default function Home() {
                     label="Longitud alimentador"
                     value={activePanel.feederLengthM ?? 15}
                     suffix="m"
-                    min={1}
+                    min={activePanel.feederDesignPending ? 0 : 1}
                     onChange={(val) => updateActivePanel('feederLengthM', val)}
                   />
                   <div className="space-y-1.5">
@@ -3264,7 +3391,12 @@ export default function Home() {
                         )
                       }
                     >
-                      {[4, 6, 10, 16, 25, 35].map((val) => (
+                      {activePanel.feederDesignPending && (
+                        <NativeSelectOption value={0}>
+                          Definir sección…
+                        </NativeSelectOption>
+                      )}
+                      {[1.5, 2.5, 4, 6, 10, 16, 25, 35].map((val) => (
                         <NativeSelectOption key={val} value={val}>
                           {val} mm²
                         </NativeSelectOption>
@@ -3289,6 +3421,11 @@ export default function Home() {
                         )
                       }
                     >
+                      {activePanel.feederDesignPending && (
+                        <NativeSelectOption value={0}>
+                          Definir protección…
+                        </NativeSelectOption>
+                      )}
                       {STANDARD_BREAKERS.map((val) => (
                         <NativeSelectOption key={val} value={val}>
                           {val} A ({activePanel.supply === 'tri' ? '4P' : '2P'})
@@ -3710,8 +3847,9 @@ export default function Home() {
               de los demás TP/TS. Grupos reservados incluidos en módulos y
               precio. Sin circuitos propios: 0 ID terminales; la protección del
               alimentador se verifica aparte. Asignación según tipo
-              IUG/TUG/TUE/MIX/FM/EMG, no según nombre. Los mixtos se agrupan con
-              tomas y equipos; una falla de ese grupo también corta sus luces.
+              IUG/IUE/TUG/TUE/MIX/FM/EMG, no según nombre. Los mixtos se agrupan
+              con tomas y equipos; una falla de ese grupo también corta sus
+              luces.
             </p>
             {isPublicVenue && activePanel.architecture === 'residential' && (
               <p
@@ -4529,8 +4667,7 @@ export default function Home() {
                       <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-700" />
                       <div>
                         <p className="font-semibold text-emerald-900">
-                          Tablero de Emergencia exclusivo (TSE) conforme a AEA
-                          718.556.5.2.12
+                          Circuitos de emergencia separados en el modelo
                         </p>
                         <p className="mt-0.5 text-emerald-800">
                           Ubicado en{' '}
@@ -4539,8 +4676,9 @@ export default function Home() {
                           {emgCircuitInfo.circuit.name} (TM{' '}
                           {emgCircuitInfo.circuit.breaker} A · cable{' '}
                           {emgCircuitInfo.circuit.conductor} mm² ·{' '}
-                          {emgCircuitInfo.circuit.phase}). Gabinete y cañería
-                          independientes de la instalación normal.
+                          {emgCircuitInfo.circuit.phase}). Verificá el gabinete,
+                          alimentador y canalización independientes en la
+                          instalación.
                         </p>
                       </div>
                     </div>
@@ -4917,8 +5055,16 @@ export default function Home() {
                     ? 'ΔVsec = √3 × Rθ × L × Ib; ΔV% = 100 × ΔVsec / 380'
                     : 'ΔVsec = 2 × Rθ × L × Ib; ΔV% = 100 × ΔVsec / 220'
                 }
-                substitution={`${formatNumber(calculations.feederDrop.factor, 3)} × ${formatNumber(calculations.feederDrop.resistanceOhmM, 6)} Ω/m × ${activePanel.feederLengthM ?? 15} m × ${formatNumber(calculations.mainCurrent, 2)} A; % = 100 × ${formatNumber(calculations.feederDrop.volts, 3)} / ${calculations.feederDrop.referenceVoltage}`}
-                result={`${formatNumber(calculations.feederDrop.volts, 2)} V · ${formatNumber(calculations.feederDrop.percent, 2)} %`}
+                substitution={
+                  activePanel.feederDesignPending
+                    ? 'Definir longitud, sección y protección del alimentador.'
+                    : `${formatNumber(calculations.feederDrop.factor, 3)} × ${formatNumber(calculations.feederDrop.resistanceOhmM, 6)} Ω/m × ${activePanel.feederLengthM ?? 15} m × ${formatNumber(calculations.mainCurrent, 2)} A; % = 100 × ${formatNumber(calculations.feederDrop.volts, 3)} / ${calculations.feederDrop.referenceVoltage}`
+                }
+                result={
+                  activePanel.feederDesignPending
+                    ? 'Pendiente'
+                    : `${formatNumber(calculations.feederDrop.volts, 2)} V · ${formatNumber(calculations.feederDrop.percent, 2)} %`
+                }
                 note={`${calculations.feederDrop.model === 'mixed-estimate' ? 'TS trifásico con cargas monofásicas: estimación fase-neutro usando la fase más cargada y neutro de igual sección. No es un cálculo fasorial del desequilibrio.' : calculations.feederDrop.model === 'balanced-three-phase' ? 'Modelo trifásico equilibrado, referencia entre fases.' : 'Modelo fase-neutro, conductor de ida y retorno de igual sección.'} Comparar Ib ${formatNumber(calculations.mainCurrent, 2)} A, In ${activePanel.feederBreaker ?? 32} A e Iz preliminar ${conductorAmpacity(activePanel.feederConductor ?? 6, activePanel.supply === 'tri', activePanel.feederAmpacity) ?? 'pendiente'} A. Rθ a ${calculations.feederDrop.temperatureC} °C. Criterio de diseño: ΔVsec ≤ 1 %.`}
               />
             )}
@@ -5505,8 +5651,9 @@ function ProjectPrintSummary({
             {panel.type === 'TS' && (
               <p className="mb-3 border border-sky-700 p-2 text-[10px]">
                 <strong>Alimentador desde TP:</strong> TM{' '}
-                {panel.feederBreaker ?? 32} A · {panel.feederConductor ?? 6} mm²
-                · {panel.feederLengthM ?? 15} m ·{' '}
+                {ratingLabel(panel.feederBreaker)} ·{' '}
+                {positiveLabel(panel.feederConductor, 'mm²')}·{' '}
+                {positiveLabel(panel.feederLengthM, 'm')} ·{' '}
                 {panel.feederPhase ?? (panel.supply === 'tri' ? '3Φ' : 'L1')} ·
                 ΔV {formatNumber(calculation?.feederDrop.percent ?? 0, 2)} % ·{' '}
                 {feederWiringLabel(panel)}
@@ -5580,11 +5727,11 @@ function ProjectPrintSummary({
                       <tr key={child.id}>
                         <td className="border p-1">{child.name}</td>
                         <td className="border p-1">
-                          {child.feederBreaker ?? 32} A
+                          {ratingLabel(child.feederBreaker)}
                         </td>
                         <td className="border p-1">
-                          {child.feederConductor ?? 6} mm² ·{' '}
-                          {child.feederLengthM ?? 15} m
+                          {positiveLabel(child.feederConductor, 'mm²')} ·{' '}
+                          {positiveLabel(child.feederLengthM, 'm')}
                         </td>
                         <td className="border p-1">
                           {child.feederPhase ??
@@ -5822,8 +5969,8 @@ function NormativeReferenceTables() {
       kind: 'Iluminación de Uso General',
       code: 'IUG',
       minSection: '1,5 mm²',
-      maxBreaker: 'Según Ib ≤ In ≤ Iz',
-      dest: 'Bocas fijas de iluminación y tomas de servicio exclusivos de luminarias (máx. 15 bocas).',
+      maxBreaker: '≤15 A y según Ib ≤ In ≤ Iz',
+      dest: 'Bocas fijas de iluminación y tomas de servicio exclusivos de luminarias. Criterio conservador: 15 bocas; Ord. 72/83 III.2.8.3.4: 20 bocas y 15 A.',
     },
     {
       kind: 'Tomacorrientes de Uso General',
@@ -5836,8 +5983,8 @@ function NormativeReferenceTables() {
       kind: 'Iluminación de Uso Especial',
       code: 'IUE',
       minSection: '2,5 mm²',
-      maxBreaker: 'Según Ib ≤ In ≤ Iz',
-      dest: 'Iluminación a la intemperie o potencias unitarias elevadas por boca (máx. 12 bocas).',
+      maxBreaker: '≤15 A y según Ib ≤ In ≤ Iz',
+      dest: 'Iluminación a la intemperie o potencias unitarias elevadas por boca. Criterio de diseño: 12 bocas; verificar encuadre municipal de iluminación exclusiva.',
     },
     {
       kind: 'Tomacorrientes de Uso Especial',
@@ -6964,10 +7111,12 @@ function FeederReviews({
               </div>
               <div>
                 <dt>Térmica en TP · In</dt>
-                <dd className="font-mono font-bold">{review.breaker} A</dd>
+                <dd className="font-mono font-bold">
+                  {ratingLabel(review.breaker)}
+                </dd>
               </div>
               <div>
-                <dt>Cable {review.section} mm² · Iz</dt>
+                <dt>Cable {positiveLabel(review.section, 'mm²')} · Iz</dt>
                 <dd className="font-mono font-bold">
                   {review.capacity === null
                     ? 'Pendiente'
@@ -7244,12 +7393,12 @@ function SingleLineDiagram({
             <div className="min-w-0 flex-1 rounded-lg border border-sky-300 bg-sky-50 p-3 text-xs">
               <strong>Alimentador → {child.name}</strong>
               <p className="mt-1">
-                TM {child.feederBreaker ?? 32} A ·{' '}
+                TM {ratingLabel(child.feederBreaker)} ·{' '}
                 {child.supply === 'tri'
                   ? '4P · 3Φ'
                   : `2P · ${child.feederPhase ?? 'L1'}`}{' '}
-                · {child.feederConductor ?? 6} mm² · {child.feederLengthM ?? 15}{' '}
-                m
+                · {positiveLabel(child.feederConductor, 'mm²')} ·{' '}
+                {positiveLabel(child.feederLengthM, 'm')}
               </p>
               <p className="mt-1">{feederWiringLabel(child)}</p>
               <p className="mt-1 break-words">
@@ -7317,7 +7466,7 @@ function MultiLineDiagram({
       key: child.id,
       id: undefined as number | undefined,
       title: `A${index + 1} → ${child.name}`,
-      protection: `TM ${child.feederBreaker ?? 32} A en TP`,
+      protection: `TM ${ratingLabel(child.feederBreaker)} en TP`,
       phase: child.supply === 'tri' ? '3Φ' : (child.feederPhase ?? 'L1'),
       section: child.feederConductor ?? 6,
       length: child.feederLengthM ?? 15,
@@ -7386,20 +7535,23 @@ function MultiLineDiagram({
               </td>
               <td className="p-3">
                 <ConductorLine
-                  label={`N · ${row.section} mm²`}
+                  label={`N · ${positiveLabel(row.section, 'mm²')}`}
                   color="#38bdf8"
                 />
               </td>
               <td className="p-3">
                 <ConductorLine
-                  label={`PE · ${protectiveConductorSection(row.section)} mm²`}
+                  label={`PE · ${row.section > 0 ? `${protectiveConductorSection(row.section)} mm²` : 'Pendiente'}`}
                   color="repeating-linear-gradient(90deg, #15803d 0 8px, #facc15 8px 16px)"
                 />
               </td>
               <td className="p-3">
                 <p>
                   {formatPower(row.power)}{' '}
-                  {row.feeder ? '(demanda)' : '(instalada)'} · {row.length} m
+                  {row.feeder ? '(demanda)' : '(instalada)'} ·{' '}
+                  {row.feeder
+                    ? positiveLabel(row.length, 'm')
+                    : `${row.length} m`}
                 </p>
                 <p>
                   ΔV {row.feeder ? 'seccional' : 'total'}{' '}
@@ -7442,7 +7594,7 @@ function PhaseConductorLines({
       {phases.map((name) => (
         <ConductorLine
           key={name}
-          label={`${name} · ${section} mm²`}
+          label={`${name} · ${positiveLabel(section, 'mm²')}`}
           color={PHASE_CONDUCTOR_COLORS[name]}
         />
       ))}

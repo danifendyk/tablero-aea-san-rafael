@@ -10,6 +10,9 @@ export const STANDARD_BREAKERS = [
 export const CIRCUIT_BREAKERS = [...STANDARD_BREAKERS, 15].sort(
   (a, b) => a - b,
 );
+export function terminalBreakerLimit(kind: string) {
+  return kind === 'IUG' || kind === 'IUE' || kind === 'MIX' ? 15 : Infinity;
+}
 export const COPPER_RESISTIVITY = 0.018;
 export const COPPER_TEMPERATURE_COEFFICIENT = 0.00393;
 export const DEFAULT_CONDUCTOR_TEMPERATURE_C = 70;
@@ -32,7 +35,11 @@ export type ConductorRequirement = {
 export function circuitRequirements(kind: string): ConductorRequirement {
   const lighting = kind === 'IUG' || kind === 'EMG';
   const otherKnown =
-    kind === 'TUG' || kind === 'TUE' || kind === 'FM' || kind === 'MIX';
+    kind === 'TUG' ||
+    kind === 'TUE' ||
+    kind === 'IUE' ||
+    kind === 'FM' ||
+    kind === 'MIX';
   return {
     minimumSectionMm2: lighting ? 1.5 : otherKnown ? 2.5 : null,
     sourceUrl: AEA_CONDUCTOR_REFERENCE_URL,
@@ -88,7 +95,7 @@ export function voltageDropCriteria(
       panelType === 'TS' ? 'recommended-allocation' : 'total-from-tp',
     totalBasis: motor
       ? 'aea-motors-only'
-      : kind === 'IUG' || kind === 'EMG' || kind === 'MIX'
+      : kind === 'IUG' || kind === 'IUE' || kind === 'EMG' || kind === 'MIX'
         ? 'aea-lighting'
         : 'project-design',
     sourceUrl: AEA_CONDUCTOR_REFERENCE_URL,

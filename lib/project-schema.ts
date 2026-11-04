@@ -1,4 +1,15 @@
+import { PRELIMINARY_CONDUCTOR_CAPACITY } from './electrical.ts';
+
 type ProjectRecord = Record<string, unknown>;
+
+function supportedSection(value: unknown, path: string, pending = false) {
+  const section = Number(value);
+  if (pending && section === 0) return;
+  if (!Object.hasOwn(PRELIMINARY_CONDUCTOR_CAPACITY, section))
+    throw new Error(
+      `${path}: sección ${String(value)} mm² fuera del catálogo admitido; no se reemplazó por otra sección.`,
+    );
+}
 
 export type ProjectStructureResult =
   | { ok: true; data: ProjectRecord }
@@ -56,7 +67,7 @@ function circuit(value: unknown, path: string, legacy: boolean) {
     raw,
     'kind',
     path,
-    oneOf(['IUG', 'TUG', 'TUE', 'EMG', 'FM', 'MIX']),
+    oneOf(['IUG', 'IUE', 'TUG', 'TUE', 'EMG', 'FM', 'MIX']),
     true,
   );
   field(raw, 'phase', path, oneOf(phases), true);
@@ -64,6 +75,7 @@ function circuit(value: unknown, path: string, legacy: boolean) {
     field(raw, key, path, nonnegative, true);
   for (const key of ['powerFactor', 'breaker', 'conductor'])
     field(raw, key, path, positive, true);
+  supportedSection(raw.conductor, `${path}.conductor`);
   field(raw, 'modules', path, positive, !legacy);
   field(raw, 'conduit', path, text);
   if (raw.ampacity !== undefined) ampacity(raw.ampacity, `${path}.ampacity`);
@@ -136,13 +148,41 @@ function panel(value: unknown, path: string) {
     path,
     oneOf(['classII-underground', 'classII-conduit', 'other', 'pending']),
   );
+  field(raw, 'feederDesignPending', path, boolean);
+  field(raw, 'emergencyDedicated', path, boolean);
   for (const key of ['feederLengthM', 'feederConductor', 'feederBreaker'])
-    field(raw, key, path, positive);
+    field(
+      raw,
+      key,
+      path,
+      raw.feederDesignPending === true ? nonnegative : positive,
+    );
+  if (raw.feederConductor !== undefined)
+    supportedSection(
+      raw.feederConductor,
+      `${path}.feederConductor`,
+      raw.feederDesignPending === true,
+    );
   field(raw, 'feederPhase', path, oneOf(phases));
+  if (
+    raw.type === 'TS' &&
+    raw.feederPhase !== undefined &&
+    (raw.supply === 'tri' ? raw.feederPhase !== '3Φ' : raw.feederPhase === '3Φ')
+  )
+    throw new Error(
+      `${path}.feederPhase: fase incompatible con el suministro; no se modificó.`,
+    );
   field(raw, 'feederConduit', path, text);
   if (raw.feederAmpacity !== undefined)
     ampacity(raw.feederAmpacity, `${path}.feederAmpacity`);
   circuits(raw.circuits, `${path}.circuits`, false);
+  if (
+    raw.supply === 'mono' &&
+    (raw.circuits as ProjectRecord[]).some((entry) => entry.phase !== 'L1')
+  )
+    throw new Error(
+      `${path}: un tablero monofásico requiere circuitos en L1 local; no se cambiaron las fases importadas.`,
+    );
   return raw;
 }
 
@@ -219,6 +259,13 @@ export function validateProjectStructure(
       field(raw, 'modulesPerRow', 'proyecto', positive);
       field(raw, 'architecture', 'proyecto', oneOf(architectures));
       circuits(raw.circuits, 'proyecto.circuits', true);
+      if (
+        raw.supply === 'mono' &&
+        (raw.circuits as ProjectRecord[]).some((entry) => entry.phase !== 'L1')
+      )
+        throw new Error(
+          'Un tablero monofásico requiere circuitos en L1 local; no se cambiaron las fases importadas.',
+        );
     } else {
       if (!Array.isArray(raw.panels) || raw.panels.length === 0)
         throw new Error('proyecto.panels: se esperaba al menos un tablero');
@@ -233,6 +280,23 @@ export function validateProjectStructure(
         if (ids.has(id))
           throw new Error(`Identificador de tablero duplicado: ${id}`);
         ids.add(id);
+        if (
+          roots[0].supply === 'mono' &&
+          entry.type === 'TS' &&
+          entry.supply === 'tri'
+        )
+          throw new Error(
+            `El tablero ${id} es trifásico y su TP es monofásico; no se convirtió el suministro.`,
+          );
+        if (
+          roots[0].supply === 'mono' &&
+          entry.type === 'TS' &&
+          entry.feederPhase !== undefined &&
+          entry.feederPhase !== 'L1'
+        )
+          throw new Error(
+            `El alimentador de ${id} requiere L1 desde el TP monofásico; no se cambió la fase importada.`,
+          );
         if (
           entry.type === 'TS' &&
           typeof entry.parentId === 'string' &&

@@ -121,14 +121,18 @@ export function differentialGroups(panel: PanelShape) {
     groups.push({
       key: 'ID A',
       label: 'ID A',
-      circuits: normal.filter((circuit) => circuit.kind === 'IUG'),
+      circuits: normal.filter(
+        (circuit) => circuit.kind === 'IUG' || circuit.kind === 'IUE',
+      ),
       span,
       emergency: false,
     });
     groups.push({
       key: 'ID B',
       label: 'ID B',
-      circuits: normal.filter((circuit) => circuit.kind !== 'IUG'),
+      circuits: normal.filter(
+        (circuit) => circuit.kind !== 'IUG' && circuit.kind !== 'IUE',
+      ),
       span,
       emergency: false,
     });
@@ -218,7 +222,7 @@ export function buildPanelDevices(
       key: `feeder-${child.id}`,
       label: `Alim. ${child.name}`,
       fullName: `Alimentador a ${child.name}`,
-      detail: `${child.feederBreaker ?? 32} A · ${child.supply === 'tri' ? '4P' : `2P ${child.feederPhase ?? 'L1'}`}`,
+      detail: `${(child.feederBreaker ?? 32) > 0 ? `${child.feederBreaker ?? 32} A` : 'Pendiente'} · ${child.supply === 'tri' ? '4P' : `2P ${child.feederPhase ?? 'L1'}`}`,
       span: child.supply === 'tri' ? 4 : 2,
       className: 'device-feeder',
     });

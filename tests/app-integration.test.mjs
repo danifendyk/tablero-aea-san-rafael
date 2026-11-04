@@ -11,6 +11,7 @@ import {
   layoutDin,
   differentialGroups,
 } from '../lib/panel-layout.ts';
+import { separateEmergencyPanels } from '../lib/emergency-panels.ts';
 
 // Execute the actual page's pure functions and memo bodies, without a browser or
 // duplicating its electrical logic. Only UI primitives/icons are replaced.
@@ -37,6 +38,17 @@ function memoBody(name) {
   assert.ok(callback, `No se encontró ${name}`);
   return callback;
 }
+function functionText(name) {
+  let found;
+  function visit(node) {
+    if (ts.isFunctionDeclaration(node) && node.name?.getText(ast) === name)
+      found = node.getText(ast);
+    ts.forEachChild(node, visit);
+  }
+  visit(ast);
+  assert.ok(found, name);
+  return found;
+}
 
 test('001: todas las plantillas IUG de código, incluido crear TS, evitan térmica de 16 A con 1,5 mm²', () => {
   let count = 0;
@@ -61,11 +73,32 @@ test('001: todas las plantillas IUG de código, incluido crear TS, evitan térmi
   assert.ok(count >= 3);
 });
 const appended = `
-export const audit = { changeCircuitKind, normalizePanels, normalizeCircuit, normalizeProject, normalizePrices, normalizeProfile, diagnosePanel, diagnoseProject, INITIAL_PANELS, INITIAL_PROFILE, DEFAULT_PRICES, PanelFront, SingleLineDiagram, MultiLineDiagram, ProjectPrintSummary, PriceInput, AmpacityEditor, FeederReviews, reviewFeeder, emergencyAutonomyDeclared, cabinetFor, circuitCurrent, voltageDrop };
+export const audit = { changeCircuitKind, normalizePanels, normalizeCircuit, normalizeProject, normalizePrices, normalizeProfile, diagnosePanel, diagnoseProject, INITIAL_PANELS, INITIAL_PROFILE, DEFAULT_PRICES, TEMPLATES, findProjectEmergencyCircuit, PanelFront, SingleLineDiagram, MultiLineDiagram, ProjectPrintSummary, PriceInput, AmpacityEditor, FeederReviews, reviewFeeder, emergencyAutonomyDeclared, cabinetFor, circuitCurrent, voltageDrop };
 export function calculatePanels(panels) { return (${memoBody('panelCalculations')})(); }
 export function calculateCosts(activePanel, panels, prices) { return (${memoBody('costOptions')})(); }
 export function calculateProjectCosts(panels, prices) { return (${memoBody('projectCostSummary')})(); }
 export function calculateWarnings(activePanel, calculations, tpPanel, panels, profile, isPublicVenue) { const panelCalculations = calculatePanels(panels); return [...diagnosePanel(activePanel, calculations, panels, panelCalculations), ...diagnoseProject(panels, profile, isPublicVenue)]; }
+export function calculateCompliance(profile, isPublicVenue) { return (${memoBody('complianceItems')})(); }
+export function applyPresetAction(panels, profile, preset, accept) {
+  const tpPanel = panels.find(p => p.type === 'TP');
+  let result = panels, nextProfile = profile, confirmations = [], changes = 0;
+  const setPendingPreset = preset => { if (preset) confirmations.push(preset); };
+  const updateProfile = (key, value) => { nextProfile = {...nextProfile, [key]: value}; changes++; };
+  const setPanels = value => { result = typeof value === 'function' ? value(result) : value; changes++; };
+  const setProfile = fn => { nextProfile = fn(nextProfile); changes++; };
+  const setProjectName = () => { changes++; };
+  const setActivePanelId = () => { changes++; };
+  const setOptimizationMessage = () => {};
+  ${functionText('applyPreset')}
+  applyPreset(preset); if (accept && preset !== 'custom') applyPreset(preset, true); return {panels:result, profile:nextProfile, confirmations, changes};
+}
+export function optimizeAction(activePanel, panels) {
+  let result = activePanel.circuits, message;
+  const updateActivePanel = (key, value) => { if (key === 'circuits') result = value; };
+  const setOptimizationMessage = text => { message = text; };
+  ${functionText('optimizeProject')}
+  optimizeProject(); return {circuits:result, message};
+}
 `;
 const compiled = ts.transpileModule(source + appended, {
   compilerOptions: {
@@ -83,6 +116,13 @@ const ui = {
   Button: 'button',
   Badge: 'span',
   Separator: 'hr',
+  AlertDialog: () => null,
+  AlertDialogContent: 'div',
+  AlertDialogTitle: 'h2',
+  AlertDialogDescription: 'p',
+  AlertDialogFooter: 'div',
+  AlertDialogCancel: 'button',
+  AlertDialogAction: 'button',
 };
 const customRequire = (name) => {
   if (name === '@/components/mixed-circuit-editor') {
@@ -121,6 +161,9 @@ const {
   calculateCosts,
   calculateProjectCosts,
   calculateWarnings,
+  calculateCompliance,
+  applyPresetAction,
+  optimizeAction,
 } = pageModule.exports;
 const html = (Component, props) =>
   renderToStaticMarkup(React.createElement(Component, props));
@@ -167,6 +210,291 @@ const mixedLoads = () => [
     powerFactor: 1,
   },
 ];
+
+test('auditoría R01: importar sección no admitida o suministro incompatible rechaza sin mutar datos', () => {
+  const circuit = makeCircuit(1, {
+    conductor: 2.5,
+    ampacity: { mode: 'declared', declaredA: 120, basis: 'Cable real' },
+  });
+  const base = { version: '3.0', panels: [makePanel({ circuits: [circuit] })] };
+  for (const change of [
+    (data) => {
+      data.panels[0].circuits[0].conductor = 50;
+    },
+    (data) => {
+      data.panels.push(
+        makePanel({
+          id: 'ts',
+          type: 'TS',
+          parentId: 'tp',
+          feederConductor: 50,
+          circuits: [],
+        }),
+      );
+    },
+    (data) => {
+      data.panels[0].supply = 'mono';
+      data.panels[0].circuits[0].phase = '3Φ';
+    },
+    (data) => {
+      data.panels[0].supply = 'mono';
+      data.panels.push(
+        makePanel({ id: 'ts', type: 'TS', parentId: 'tp', supply: 'tri' }),
+      );
+    },
+    (data) => {
+      data.panels.push(
+        makePanel({
+          id: 'ts',
+          type: 'TS',
+          parentId: 'tp',
+          supply: 'tri',
+          feederPhase: 'L1',
+        }),
+      );
+    },
+    (data) => {
+      data.panels.push(
+        makePanel({
+          id: 'ts',
+          type: 'TS',
+          parentId: 'tp',
+          supply: 'mono',
+          feederPhase: '3Φ',
+        }),
+      );
+    },
+  ]) {
+    const input = clone(base);
+    change(input);
+    const before = clone(input);
+    assert.throws(() => app.normalizeProject(input));
+    assert.deepEqual(input, before);
+  }
+});
+
+test('auditoría R02: separar varios orígenes conserva cada circuito EMG, su fase y sus valores', () => {
+  const emg = makeCircuit(7, {
+    name: 'Emergencia real',
+    kind: 'EMG',
+    points: 30,
+    unitVA: 60,
+    breaker: 16,
+    conductor: 2.5,
+    lengthM: 35,
+  });
+  const triEmg = makeCircuit(7, { kind: 'EMG', phase: 'L3', modules: 2 });
+  const tp = makePanel({ circuits: [] });
+  const mono = makePanel({
+    id: 'mono',
+    type: 'TS',
+    parentId: 'tp',
+    supply: 'mono',
+    feederPhase: 'L2',
+    circuits: [emg, makeCircuit(2)],
+  });
+  const tri = makePanel({
+    id: 'tri',
+    type: 'TS',
+    parentId: 'tp',
+    circuits: [triEmg, makeCircuit(2)],
+  });
+  const exclusive = makePanel({
+    id: 'exclusive',
+    type: 'TS',
+    parentId: 'tp',
+    circuits: [makeCircuit(1, { kind: 'EMG' })],
+  });
+  const original = [tp, mono, tri, exclusive],
+    before = clone(original);
+  let id = 0;
+  const result = separateEmergencyPanels(original, () => `tse-${++id}`);
+  assert.deepEqual(original, before);
+  assert.equal(result.createdCount, 2);
+  assert.equal(result.movedCircuits, 2);
+  assert.deepEqual(
+    result.panels.find((p) => p.id === 'exclusive'),
+    exclusive,
+  );
+  const monoTse = result.panels.find((p) => p.id === 'tse-1');
+  assert.deepEqual(monoTse.circuits, [emg]);
+  assert.equal(monoTse.feederPhase, 'L2');
+  assert.equal(monoTse.supply, 'mono');
+  assert.deepEqual(result.panels.find((p) => p.id === 'tse-2').circuits, [
+    triEmg,
+  ]);
+  const calculations = calculatePanels(result.panels);
+  close(calculations.get('tse-1').installedVA, 1800);
+  assert.match(
+    app.reviewFeeder(monoTse, calculations.get(monoTse.id)).issues.join(' '),
+    /pendiente/,
+  );
+  const restored = app.normalizeProject({
+    version: '3.0',
+    panels: clone(result.panels),
+  });
+  const restoredTse = restored.panels.find((p) => p.id === 'tse-1');
+  assert.equal(restoredTse.feederConductor, 0);
+  assert.equal(restoredTse.feederBreaker, 0);
+  assert.equal(restoredTse.feederDesignPending, true);
+  assert.equal(restoredTse.emergencyDedicated, true);
+  assert.deepEqual(
+    separateEmergencyPanels(result.panels, () => {
+      throw Error('No debe duplicarse');
+    }).panels,
+    result.panels,
+  );
+  const print = html(app.ProjectPrintSummary, {
+    projectName: 'Emergencia',
+    panels: result.panels,
+    calculations,
+  });
+  assert.match(print, /Alimentador pendiente/);
+  assert.match(print, /Emergencia real/);
+});
+
+test('auditoría R02: sin cargas reales crea un TSE vacío e idempotente; EMG del TP se traslada', () => {
+  const tp = makePanel({ circuits: [] });
+  const empty = separateEmergencyPanels([tp], () => 'empty');
+  assert.equal(empty.panels[1].circuits.length, 0);
+  assert.equal(
+    separateEmergencyPanels(empty.panels, () => 'duplicate').createdCount,
+    0,
+  );
+  const emg = makeCircuit(1, { kind: 'EMG', phase: 'L2' });
+  const moved = separateEmergencyPanels(
+    [makePanel({ circuits: [emg] })],
+    () => 'tse',
+  );
+  assert.deepEqual(moved.panels[1].circuits, [emg]);
+  assert.equal(moved.panels[0].circuits.length, 0);
+});
+
+test('auditoría R02: un TSE ya existente no oculta otra emergencia dentro de un tablero normal', () => {
+  const exclusive = makePanel({
+    id: 'exclusive',
+    type: 'TS',
+    circuits: [makeCircuit(1, { kind: 'EMG' })],
+  });
+  const shared = makePanel({
+    id: 'shared',
+    type: 'TS',
+    circuits: [makeCircuit(1, { kind: 'EMG' }), makeCircuit(2)],
+  });
+  assert.equal(
+    app.findProjectEmergencyCircuit([exclusive, shared]).panel.id,
+    'shared',
+  );
+});
+
+test('auditoría R03: al volver a MIX las ediciones posteriores de TUG reemplazan el desglose antiguo', () => {
+  const original = makeCircuit(1, { kind: 'MIX', mixedLoads: mixedLoads() });
+  const socket = {
+    ...app.changeCircuitKind(original, 'TUG'),
+    points: 2,
+    unitVA: 1000,
+    powerFactor: 0.8,
+  };
+  const returned = app.changeCircuitKind(socket, 'MIX');
+  const panel = makePanel({ circuits: [returned] });
+  close(calculatePanels([panel]).get('tp').installedVA, 2000);
+  assert.equal(returned.points, 2);
+  assert.equal(returned.powerFactor, 0.8);
+  assert.equal(returned.mixedLoads.length, 1);
+  assert.equal(returned.mixedLoads[0].unitPower, 1000);
+});
+
+test('auditoría R04: cancelar un preajuste no cambia ningún dato; aceptar aplica y personalizado no reemplaza', () => {
+  const panels = clone(app.INITIAL_PANELS),
+    profile = clone(app.INITIAL_PROFILE);
+  const before = clone(panels);
+  for (const preset of ['hall', 'commercial', 'residential']) {
+    const canceled = applyPresetAction(panels, profile, preset, false);
+    assert.equal(canceled.changes, 0);
+    assert.deepEqual(canceled.panels, before);
+    assert.deepEqual(canceled.confirmations, [preset]);
+    const accepted = applyPresetAction(panels, profile, preset, true);
+    assert.ok(accepted.changes > 0);
+    assert.equal(accepted.confirmations.length, 1);
+    assert.equal(accepted.profile.preset, preset);
+    assert.doesNotThrow(() =>
+      app.normalizeProject({
+        version: '3.0',
+        panels: accepted.panels,
+        profile: accepted.profile,
+      }),
+    );
+  }
+  const custom = applyPresetAction(panels, profile, 'custom', false);
+  assert.equal(custom.confirmations.length, 0);
+  assert.deepEqual(custom.panels, before);
+  assert.deepEqual(panels, before);
+});
+
+test('auditoría R05: RA, Ik y poder de corte cero nunca aparecen como verificados', () => {
+  const fields = [
+    'groundResistanceOhm',
+    'prospectiveShortCircuitKa',
+    'breakingCapacityKa',
+  ];
+  for (const key of fields) {
+    const profile = {
+      ...app.INITIAL_PROFILE,
+      groundResistanceOhm: 5,
+      prospectiveShortCircuitKa: 3,
+      breakingCapacityKa: 6,
+      [key]: 0,
+    };
+    const item = calculateCompliance(profile, false).find((item) =>
+      key === 'groundResistanceOhm'
+        ? /Puesta/.test(item.label)
+        : /Poder/.test(item.label),
+    );
+    assert.equal(item.ready, false);
+    assert.match(item.action, /Pendiente/);
+    assert.ok(
+      app
+        .diagnoseProject([makePanel()], profile, false)
+        .some((message) => /falta|pendiente/i.test(message)),
+    );
+  }
+});
+
+test('auditoría R06/R07: iluminación advierte >15 A y optimiza dentro del límite; IUE persiste y se agrupa con luces', () => {
+  for (const kind of ['IUG', 'IUE']) {
+    const panel = makePanel({
+      circuits: [
+        makeCircuit(1, { kind, breaker: 20, conductor: 2.5, unitVA: 100 }),
+      ],
+    });
+    const calc = calculatePanels([panel]);
+    assert.match(
+      app.diagnosePanel(panel, calc.get('tp'), [panel], calc).join(' '),
+      /iluminación exclusiva.*15 A/,
+    );
+    const optimized = optimizeAction(panel, [panel]);
+    assert.ok(optimized.circuits[0].breaker <= 15);
+    const restored = app.normalizeProject({ version: '3.0', panels: [panel] });
+    assert.equal(restored.panels[0].circuits[0].kind, kind);
+  }
+  assert.equal(app.TEMPLATES.IUE.conductor, 2.5);
+  const grouped = differentialGroups(
+    makePanel({
+      architecture: 'balanced',
+      circuits: [
+        makeCircuit(1, { kind: 'IUE' }),
+        makeCircuit(2, { kind: 'TUG' }),
+      ],
+    }),
+  );
+  assert.ok(
+    grouped.some(
+      (g) =>
+        g.circuits.some((c) => c.kind === 'IUE') &&
+        !g.circuits.some((c) => c.kind === 'TUG'),
+    ),
+  );
+});
 
 test('mixto: normalizar y guardar JSON conserva cada carga y recalcula los agregados', () => {
   const circuit = makeCircuit(1, {
